@@ -260,6 +260,95 @@ class AppCompiler {
   private styleErrors: string[] = [];
   private styleWarnings: string[] = [];
 
+  // ---- overlay allocation of frame-local temporaries -----------------------
+  // Materialized view chains and string scratch used to be either permanent
+  // statics (a `vt` lives forever for one call's worth of work) or C-stack
+  // locals (21-33 B frames on the cc65/sdcc software stack). Both are wrong
+  // for the 8-bit targets: statics never share, stack frames cost code and
+  // cycles on every access. Instead every temporary is tagged with the
+  // generated function that owns it; two temporaries may share one static
+  // slot unless their owners can be live at the same time — same owner, or
+  // one owner reachable from the other in the static call graph (helpers,
+  // computed accessors, keymap actions). The subset forbids recursion and
+  // nothing runs from interrupts, so reachability is the whole story.
+  // Placeholders are substituted with colored slot names at emit time.
+  private ovlTemps: { id: number; kind: "view" | "sb"; owner: string }[] = [];
+  private ovlEdges = new Map<string, Set<string>>(); // caller -> callees
+  private ovlOwnerStack: string[] = [];
+  private unitCounter = 0;
+
+  private ovlOwner(): string {
+    return this.ovlOwnerStack[this.ovlOwnerStack.length - 1] ?? "app_init";
+  }
+
+  private withOwner<T>(owner: string, build: () => T): T {
+    this.ovlOwnerStack.push(owner);
+    try {
+      return build();
+    } finally {
+      this.ovlOwnerStack.pop();
+    }
+  }
+
+  private allocTemp(kind: "view" | "sb"): string {
+    const id = this.ovlTemps.length;
+    this.ovlTemps.push({ id, kind, owner: this.ovlOwner() });
+    return `@OVL${id}@`;
+  }
+
+  private ovlCall(callee: string): void {
+    const caller = this.ovlOwner();
+    if (caller === callee) return;
+    let set = this.ovlEdges.get(caller);
+    if (!set) this.ovlEdges.set(caller, (set = new Set()));
+    set.add(callee);
+  }
+
+  /** Color temporaries into shared static slots; returns decls + name map. */
+  private ovlAssign(): { decls: string[]; names: Map<number, string>; slotBytes: number } {
+    // transitive reachability over owners
+    const reach = new Map<string, Set<string>>();
+    const reaches = (from: string, to: string): boolean => {
+      let r = reach.get(from);
+      if (!r) {
+        r = new Set();
+        reach.set(from, r);
+        const walk = (o: string) => {
+          for (const callee of this.ovlEdges.get(o) ?? []) {
+            if (!r!.has(callee)) {
+              r!.add(callee);
+              walk(callee);
+            }
+          }
+        };
+        walk(from);
+      }
+      return r.has(to);
+    };
+    const interferes = (a: { owner: string }, b: { owner: string }): boolean =>
+      a.owner === b.owner || reaches(a.owner, b.owner) || reaches(b.owner, a.owner);
+
+    const names = new Map<number, string>();
+    const decls: string[] = [];
+    let slotBytes = 0;
+    for (const kind of ["view", "sb"] as const) {
+      const temps = this.ovlTemps.filter((t) => t.kind === kind);
+      const slots: { name: string; members: { owner: string }[] }[] = [];
+      for (const t of temps) {
+        let slot = slots.find((s) => s.members.every((m) => !interferes(t, m)));
+        if (!slot) {
+          slot = { name: `ovl_${kind}${slots.length}`, members: [] };
+          slots.push(slot);
+          decls.push(`static ${kind === "view" ? "vp_view" : "vp_sb"} ${slot.name};`);
+          slotBytes += kind === "view" ? 1 + this.target.poolCap : 1 + this.target.strCap;
+        }
+        slot.members.push(t);
+        names.set(t.id, slot.name);
+      }
+    }
+    return { decls, names, slotBytes };
+  }
+
   constructor(
     private sf: ts.SourceFile,
     private title: string,
@@ -637,13 +726,13 @@ class AppCompiler {
 
   private compileActionArrow(cName: string, arrow: ts.ArrowFunction): void {
     const saved = new Map(this.scope);
-    const { decls, body } = this.withHoist((out) => {
+    const { decls, body } = this.withOwner(cName, () => this.withHoist((out) => {
       if (ts.isBlock(arrow.body)) {
         for (const stmt of arrow.body.statements) this.compileStmt(stmt, out, "  ");
       } else {
         this.compileExprStmt(arrow.body, out, "  ");
       }
-    });
+    }));
     this.scope = saved;
     this.bodies.push(`static void ${cName}(void) {\n${[...decls, ...body].join("\n")}\n}\n`);
   }
@@ -653,7 +742,10 @@ class AppCompiler {
     e = this.unparen(e);
     if (ts.isIdentifier(e)) {
       const b = this.scope.get(e.text);
-      return b?.kind === "keymap" ? `KM_${b.name}` : null;
+      if (b?.kind !== "keymap") return null;
+      // indirect dispatch: the caller may enter any action in this table
+      for (const cName of b.entries.values()) this.ovlCall(cName);
+      return `KM_${b.name}`;
     }
     if (ts.isConditionalExpression(e)) {
       const a = this.compileKeymapExpr(e.whenTrue, out, ind);
@@ -713,7 +805,7 @@ class AppCompiler {
 
     const index = this.computeds.length;
     let binding!: ComputedBinding;
-    const hoisted = this.withHoist((lines) => {
+    const hoisted = this.withOwner(`c_${name}_update`, () => this.withHoist((lines) => {
     if (this.isViewExpr(body)) {
       const maxLen = this.viewMaxLen(body);
       binding = { kind: "computed", name, index, valTy: this.viewTyOf(body), deps, maxLen };
@@ -732,7 +824,7 @@ class AppCompiler {
       };
       lines.push(`  c_${name}_v = ${val.c};`);
     }
-    });
+    }));
     const lines = [...hoisted.decls, ...hoisted.body];
     this.curDeps = prevDeps;
 
@@ -992,16 +1084,16 @@ class AppCompiler {
       }
       if (b?.kind === "computed" && b.valTy.k === "view") {
         for (const d of b.deps) this.depRef(d);
+        this.ovlCall(`c_${b.name}_update`);
         const v = this.tmp("v");
         this.declare(`const vp_view *${v};`);
         out.push(`${ind}${v} = c_${b.name}();`);
         return { len: `${v}->len`, at: (i) => `${v}->idx[${i}]` };
       }
     }
-    // nested filter/slice chain: materialize into a temp view
+    // nested filter/slice chain: materialize into an overlay temp view
     if (ts.isCallExpression(e)) {
-      const v = this.tmp("vt");
-      this.decls.push(`static vp_view ${v};`);
+      const v = this.allocTemp("view");
       this.compileViewInto(e, v, out, ind);
       return { len: `${v}.len`, at: (i) => `${v}.idx[${i}]` };
     }
@@ -1060,6 +1152,7 @@ class AppCompiler {
       }
       if (b?.kind === "computed") {
         for (const d of b.deps) this.depRef(d);
+        this.ovlCall(`c_${base}_update`);
         if (b.valTy.k === "num") return { c: `c_${base}()`, ty: NUM };
         if (b.valTy.k === "obj") return { c: `c_${base}()`, ty: b.valTy };
         this.err(e, "view computeds can only be used through list operations");
@@ -1205,6 +1298,7 @@ class AppCompiler {
         });
         this.emitFn(b);
         for (const d of b.deps) this.depRef(d);
+        this.ovlCall(`fn_${b.name}`);
         return { c: `fn_${b.name}(${args.join(", ")})`, ty: { k: "void" } };
       }
     }
@@ -1264,7 +1358,8 @@ class AppCompiler {
       const b = e.arguments[1]
         ? this.compileExpr(e.arguments[1], out, ind)
         : { c: `(s32)(${srcV.c})->len`, ty: NUM };
-      out.push(`${ind}{ vp_sb sl; vp_sb_slice(&sl, ${srcV.c}, ${a.c}, ${b.c}); vp_sb_sb(&${sb}, &sl); }`);
+      const sl = this.allocTemp("sb");
+      out.push(`${ind}{ vp_sb_slice(&${sl}, ${srcV.c}, ${a.c}, ${b.c}); vp_sb_sb(&${sb}, &${sl}); }`);
       return;
     }
     const v = this.compileExpr(e, out, ind);
@@ -1453,8 +1548,8 @@ class AppCompiler {
         return;
       }
       if (b.refTy === "str") {
-        const tmp = this.tmp("sb");
-        out.push(`${ind}{ vp_sb ${tmp}; vp_sb_reset(&${tmp});`);
+        const tmp = this.allocTemp("sb");
+        out.push(`${ind}{ vp_sb_reset(&${tmp});`);
         this.compileStringInto(rhs, tmp, out, ind + "  ");
         out.push(`${ind}  if (vp_sb_assign(&g_${b.name}, &${tmp})) ${this.markCode(b.name)};`);
         out.push(`${ind}}`);
@@ -1468,9 +1563,9 @@ class AppCompiler {
           this.err(rhs, "list refs can only be assigned a filter/slice view");
         if (this.viewListRef(this.unparen(rhs)) !== b.name)
           this.err(rhs, "list assignment must derive from the same list");
-        const nv = this.tmp("nv");
+        const nv = this.allocTemp("view");
         const k = this.tmp("k");
-        out.push(`${ind}{ vp_view ${nv}; u8 ${k};`);
+        out.push(`${ind}{ u8 ${k};`);
         this.compileViewInto(this.unparen(rhs), nv, out, ind + "  ");
         out.push(`${ind}  for (${k} = 0; ${k} < ${nv}.len; ${k}++) *(g_${b.name} + (u16)${k}) = *(g_${b.name} + (u16)(${nv}.idx[${k}]));`);
         out.push(`${ind}  g_${b.name}_len = ${nv}.len;`);
@@ -1514,8 +1609,8 @@ class AppCompiler {
       const field = iface.fields.find((f) => f.name === (propNode.name as ts.Identifier).text);
       if (!field) this.err(propNode, `no field ${propNode.name.getText(this.sf)} on ${iface.name}`);
       if (field.ty === "str") {
-        const tmp = this.tmp("sb");
-        out.push(`${ind}  { vp_sb ${tmp}; vp_sb_reset(&${tmp});`);
+        const tmp = this.allocTemp("sb");
+        out.push(`${ind}  { vp_sb_reset(&${tmp});`);
         this.compileStringInto(propNode.initializer, tmp, out, ind + "    ");
         out.push(`${ind}    vp_sb_assign(&np->${field.name}, &${tmp}); }`);
       } else {
@@ -1551,10 +1646,10 @@ class AppCompiler {
     const prevDeps = this.curDeps;
     this.curDeps = b.deps;
     const saved = new Map(this.scope);
-    const { decls, body } = this.withHoist((out) => {
+    const { decls, body } = this.withOwner(`fn_${b.name}`, () => this.withHoist((out) => {
       for (const p of b.params) this.scope.set(p, { kind: "local", cName: `p_${p}`, ty: NUM });
       for (const stmt of b.decl.body!.statements) this.compileStmt(stmt, out, "  ");
-    });
+    }));
     this.scope = saved;
     this.curDeps = prevDeps;
     const sig = b.params.length ? b.params.map((p) => `s32 p_${p}`).join(", ") : "void";
@@ -1811,9 +1906,13 @@ class AppCompiler {
     const deps = new Set<string>();
     const prev = this.curDeps;
     this.curDeps = deps;
-    const { decls, body } = this.withHoist((out) => {
-      this.compileRowPaint(src, String(y), out, "  ");
-    });
+    // each unit is its own overlay owner: merged units run sequentially
+    // inside one effect, so their temps may share slots
+    const { decls, body } = this.withOwner(`unit${this.unitCounter++}`, () =>
+      this.withHoist((out) => {
+        this.compileRowPaint(src, String(y), out, "  ");
+      }),
+    );
     this.curDeps = prev;
     this.propsCtx = prevCtx;
     return { span: [y, y + 1], deps, decls, body, isStatic: deps.size === 0 };
@@ -1836,7 +1935,7 @@ class AppCompiler {
     const prev = this.curDeps;
     this.curDeps = deps;
     let y = 0;
-    const { decls, body } = this.withHoist((out) => {
+    const { decls, body } = this.withOwner(`unit${this.unitCounter++}`, () => this.withHoist((out) => {
       const cond = this.compileExpr(e.condition, out, "  ");
       const { src, ctx } = this.resolveRenderable(whenTrue);
       const prevCtx = this.propsCtx;
@@ -1846,7 +1945,7 @@ class AppCompiler {
       this.compileRowPaint(src, String(y), out, "    ");
       out.push(`  }`);
       this.propsCtx = prevCtx;
-    });
+    }));
     this.curDeps = prev;
     return { span: [y, y + 1], deps, decls, body, isStatic: false };
   }
@@ -1873,7 +1972,7 @@ class AppCompiler {
     this.curDeps = deps;
     let yBase = 0;
     let maxLenOut = 0;
-    const { decls, body } = this.withHoist((body) => {
+    const { decls, body } = this.withOwner(`unit${this.unitCounter++}`, () => this.withHoist((body) => {
     const src = this.viewSource(viewExpr, body, "  ");
     const listRef = this.viewListRef(viewExpr);
     const iface = this.viewIface(viewExpr);
@@ -1905,7 +2004,7 @@ class AppCompiler {
     body.push(`  } }`);
     yBase = yBaseInner;
     maxLenOut = maxLen;
-    });
+    }));
     this.curDeps = prev;
 
     const span: [number, number] = [yBase, Math.min(this.target.height, yBase + maxLenOut)];
@@ -1939,13 +2038,13 @@ class AppCompiler {
       if (!param) this.err(this.handler, "onButton arrow needs a (b) param");
       this.scope.set(param, { kind: "local", cName: "b_arg", ty: NUM });
       const handlerArrow = this.handler;
-      const { decls, body } = this.withHoist((out) => {
+      const { decls, body } = this.withOwner("app_on_button", () => this.withHoist((out) => {
         if (ts.isBlock(handlerArrow.body)) {
           for (const stmt of handlerArrow.body.statements) this.compileStmt(stmt, out, "  ");
         } else {
           this.compileExprStmt(handlerArrow.body, out, "  ");
         }
-      });
+      }));
       handlerOut = [...decls, ...body];
       this.scope = saved;
     }
@@ -1962,13 +2061,13 @@ class AppCompiler {
         cName: "axis_delta_arg",
         ty: NUM,
       });
-      const { decls, body } = this.withHoist((out) => {
+      const { decls, body } = this.withOwner(`vp_axis_handler_${axis}`, () => this.withHoist((out) => {
         if (ts.isBlock(handler.body)) {
           for (const stmt of handler.body.statements) this.compileStmt(stmt, out, "  ");
         } else {
           this.compileExprStmt(handler.body, out, "  ");
         }
-      });
+      }));
       axisHandlerFns.push(
         `static void vp_axis_handler_${axis}(s32 axis_delta_arg) {\n${[...decls, ...body].join("\n")}\n}`,
       );
@@ -2045,6 +2144,10 @@ class AppCompiler {
         dbgOff += 4;
       }
     }
+
+    // ---- overlay slot coloring (all bodies are emitted by now) ----
+    const ovl = this.ovlAssign();
+    if (ovl.decls.length) this.decls.push(...ovl.decls);
 
     // ---- assemble C ----
     const c: string[] = [];
@@ -2222,12 +2325,13 @@ class AppCompiler {
           : pairCount;
     const planLines = [
       `state RAM: ${scalarBytes} B scalars/strings + ${poolBytes} B pools + ${viewBytes} B computed views`,
+      `overlay RAM: ${ovl.slotBytes} B in ${ovl.decls.length} shared slots (${this.ovlTemps.length} frame-local temps off the C stack)`,
       `reactive tables: ${this.refs.length} dirty bits, ${this.computeds.length} validity bits, ${effects.length} effects`,
       `ROM data: ${romStrings} B strings + ${fontBytes} B font + ${styleBytes} B style data`,
     ];
 
     return {
-      c: c.join("\n"),
+      c: c.join("\n").replace(/@OVL(\d+)@/g, (_m, id) => ovl.names.get(Number(id))!),
       title: this.title,
       graph: graphLines.join("\n"),
       plan: planLines.join("\n"),
