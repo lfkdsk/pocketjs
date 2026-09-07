@@ -148,6 +148,8 @@ export async function buildGbRom(app: CompiledApp, outRom: string): Promise<{ ro
   const outDir = dirname(outRom);
   const genDir = join(outDir, "gen-gb");
   await $`mkdir -p ${genDir}`.quiet();
+  // A failed rebuild must not leave the previous ROM looking current.
+  await rm(outRom, { force: true });
   const genC = join(genDir, "gen_app.c");
   await Bun.write(genC, app.c);
 
@@ -185,17 +187,19 @@ export async function buildGbRom(app: CompiledApp, outRom: string): Promise<{ ro
     }
     if (result.value.exitCode !== 0) {
       const stderr = result.value.stderr.toString().trim();
-      return [{ rel, detail: stderr || `sdcc exited ${result.value.exitCode}` }];
+      const stdout = result.value.stdout.toString().trim();
+      return [{ rel, detail: stderr || stdout || `sdcc exited ${result.value.exitCode}` }];
     }
     return [];
   });
   if (failures.length > 0) {
-    const [{ rel, detail }] = failures;
+    await Promise.all(failures.map(({ rel }) => rm(join(genDir, rel), { force: true })));
+    const [{ rel }] = failures;
     const alsoFailed = failures.slice(1).map(({ rel: other }) => other);
     throw new Error(
       `sdcc failed compiling ${rel} for target gb${
         alsoFailed.length > 0 ? ` (${alsoFailed.join(", ")} also failed)` : ""
-      }\n${detail.trimEnd()}`,
+      }\n${failures.map((failure) => `${failure.rel}: ${failure.detail.trimEnd()}`).join("\n")}`,
     );
   }
 

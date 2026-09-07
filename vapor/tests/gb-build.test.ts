@@ -108,13 +108,18 @@ describe("GB build: three sdcc translation units", () => {
   for (const [i, unit] of UNITS.entries()) {
     test(`a failure in ${unit} fails the build and names the unit`, async () => {
       const dir = join(OUT, `fail-${unit}`);
-      const result = await build(dir, { VP_SDCC_FAIL: unit });
+      const result = await build(dir, {
+        VP_SDCC_FAIL: unit,
+        // Exercise both common diagnostic streams: gen_app stands in for an
+        // sdcc wrapper that reports its failure on stdout.
+        ...(unit === "gen_app.c" ? { VP_SDCC_FAIL_STDOUT: unit } : {}),
+      });
 
       expect(result.ok).toBe(false);
       expect(result.message).toContain(RELS[i]);
       expect(result.message).toContain("target gb");
-      // sdcc's own stderr survives into the message, or the failure is
-      // undiagnosable from a build log alone.
+      // sdcc's own diagnostic survives into the message, whether the tool or
+      // wrapper writes it to stderr or stdout.
       expect(result.message).toContain(`injected failure for ${unit}`);
       // The failing unit produced nothing, and the build stopped before
       // makebin/rgbfix could write a ROM.
@@ -123,28 +128,54 @@ describe("GB build: three sdcc translation units", () => {
     }, 60_000);
   }
 
-  test("a unit that fails on a rebuild does not let the previous .rel be linked", async () => {
+  test("a unit that fails on a rebuild removes stale and partial outputs", async () => {
     const dir = join(OUT, "stale");
     const rel = join(dir, "gen-gb", RELS[2]);
+    const rom = join(dir, "todo.gb");
 
     const first = await build(dir);
     expect(first.ok).toBe(true);
     expect(first.romBytes).toBe(32768);
     expect((await readFile(rel)).length).toBeGreaterThan(0);
 
-    const second = await build(dir, { VP_SDCC_FAIL: UNITS[2] });
+    const second = await build(dir, {
+      VP_SDCC_FAIL: UNITS[2],
+      // Some compiler versions or wrappers can truncate/write -o before
+      // returning nonzero; that partial output must not replace the stale one.
+      VP_SDCC_FAIL_OUTPUT: "1",
+    });
     expect(second.ok).toBe(false);
-    // The good .rel from the first build is gone rather than silently reused.
+    // Neither the old ROM nor a stale/partial .rel can masquerade as output
+    // from the failed rebuild.
     expect(existsSync(rel)).toBe(false);
+    expect(existsSync(rom)).toBe(false);
   }, 120_000);
 
   test("all three units failing at once reports one unit and mentions the others", async () => {
-    const result = await build(join(OUT, "fail-all"), { VP_SDCC_FAIL: UNITS.join(",") });
+    const result = await build(join(OUT, "fail-all"), {
+      VP_SDCC_FAIL: UNITS.join(","),
+      // Complete in reverse link order. The diagnostic must still use link
+      // order, rather than whichever subprocess happens to exit first.
+      VP_SDCC_DELAY_VAPOR_CORE: "0.4",
+      VP_SDCC_DELAY_VAPOR_GB: "0.2",
+    });
 
     expect(result.ok).toBe(false);
+    expect(
+      result.runs
+        .filter((r) => (UNITS as readonly string[]).includes(r.unit))
+        .sort((a, b) => a.end - b.end)
+        .map((r) => r.unit),
+    ).toEqual([...UNITS].reverse());
     // Reported in link order, so one build breakage reads the same way every
     // run regardless of which process happened to exit first.
     expect(result.message).toContain(`sdcc failed compiling ${RELS[0]} for target gb`);
     expect(result.message).toContain(`${RELS[1]}, ${RELS[2]} also failed`);
+    const detailOffsets = RELS.map((rel) => result.message!.indexOf(`${rel}:`));
+    expect(detailOffsets.every((offset) => offset >= 0)).toBe(true);
+    expect(detailOffsets).toEqual([...detailOffsets].sort((a, b) => a - b));
+    for (const unit of UNITS) {
+      expect(result.message).toContain(`injected failure for ${unit}`);
+    }
   }, 60_000);
 });
