@@ -278,3 +278,132 @@ arm-none-eabi-nm --print-size --size-sort --radix=d /tmp/t405/runA/todo-gba/gen-
   it belongs to a codegen scout, not this one.
 - **`main` = 568 B and `eff_1` = 424 B** — the largest code symbols. Effect-level redundancy is
   another scout's metric scope and was deliberately not pursued.
+
+---
+
+# Builder: candidate 1 implemented — compact GBA font data (task 415)
+
+- Base commit: `9ca1785` (this report's scout commit). Branch: `fleet/93f58b98a624/task-415`.
+- Changed: `vapor/compiler/compile.ts`, `vapor/runtime/gba/vapor_gba.c`, `vapor/runtime/vapor.h`,
+  new test `vapor/tests/gba-font.test.ts`. Not pushed, no PR.
+
+## 7.1 What changed
+
+`emitTargetData`'s `gba` case now calls `emitFont1bpp()` — the same 760 B emitter ESP32 and Playdate
+already used — and `upload_font()` in `vapor/runtime/gba/vapor_gba.c:54` expands each 1bpp row byte
+into two `u16` of 4bpp tile data (`INK`=1 for a set bit, `PAPER`=2 for a clear one) while writing
+VRAM, which it already looped over. The old 4bpp emitter body is kept as the exported
+`gbaFontTileBytes()` (`compile.ts:2360`): nothing emits it, it is the reference encoding the
+regression test compares real VRAM against. The memory plan now prices the GBA font at `95*8`, so
+GB and NES are the only targets still charged `95*32`.
+
+## 7.2 Measured before/after — 5 runs each, raw bytes and sha256
+
+`findings/measure-artifact-size.sh` unchanged, run 5× per side
+(`OUT_BASE=/tmp/t415-before` / `/tmp/t415-after`). All 5 runs on each side were byte- and
+hash-identical, so a single row represents each.
+
+| artifact | before | after | saved | % |
+|---|---|---|---|---|
+| `todo.gba` | **9356** | **7160** | **2196 B** | **23.47%** |
+| `playdate-six-button.gba` | **6420** | **4224** | **2196 B** | **34.21%** |
+
+sha256 (full):
+
+```
+before  08094dab8463cf53dd724d82ca062773c3201ba25230cfc826e7510a3ac9d601  todo.gba
+after   0919b8d260e7811d84c56db3fcd54d6bbf6ac63d1e4afab0c76263375764519a  todo.gba
+before  f91dbf138166ab8e97c0b2d58478a3f87b8331c3ac0e8e0a7a5912db68e47a9c  playdate-six-button.gba
+after   dd21bff90fe5609b3e44cf575d2db2c0b0305dd31cb6ee57510f5f47f8d0ece5  playdate-six-button.gba
+```
+
+The saving reconciles in the symbol table rather than being a link artifact —
+`arm-none-eabi-nm --print-size --radix=d` on the todo ELF:
+
+```
+before  00003040 T vp_font_tiles     00000568 T main
+after   00000760 T vp_font_tiles     00000652 T main
+```
+
+2280 B of table removed minus 84 B of expansion code in `main` = **2196 B**, exactly the ROM delta,
+and constant across both examples as predicted. The scout's prototype estimated 2172 B; the shipped
+change saves 24 B more.
+
+## 7.3 The 3040 VRAM bytes are byte-identical — read off real hardware
+
+Not a TS reimplementation of the C (that would only mirror the same logic). The test boots the ROM
+in headless libmgba and dumps the font charblock, `D font 0x6000020 3040`:
+
+```
+dumped bytes: 3040
+sha256: 955a983b91e6d17850078e239baa9a88cbd93787e790d4029819ba82fe3a605c
+```
+
+The old `vp_font_tiles` array, parsed out of the pre-change `gen_app.c`, hashes to the **same**
+`955a983b91e6…`. Every one of the 3040 bytes the GBA sees is unchanged, so no rendered cell can
+differ.
+
+## 7.4 Correction to the scout: GBA parity does not cover glyph pixels
+
+The scout listed as risk mitigation that "the GBA parity rig reads VRAM directly … so any expansion
+bug fails loudly". **That is wrong, and it matters.** The GBA rig's probe is
+`vram: { addr: 0x6004000, … }` (`vapor/tests/parity.test.ts:59`) — screenblock 8, i.e. tile
+*indices* and palette banks. Font pixels live in charblock 0 at `0x6000020` and are never read.
+
+Demonstrated by mutation: with `upload_font`'s two halfword stores swapped (`*dst++ = hi; *dst++ = lo;`),
+so every glyph's pixel columns are transposed, **`bun test vapor/tests/parity.test.ts` still reports
+6 pass / 0 fail.** Hence the new test file, which is the only coverage of this surface.
+
+`vapor/tests/gba-font.test.ts` — 3 tests:
+
+1. the emitted `vp_font_tiles` is exactly `FONT8.flat()` (760 B) and the plan says `760 B font`;
+2. all 3040 bytes dumped from booted-hardware VRAM equal `gbaFontTileBytes()`;
+3. every one of the 95×8×8 pixels is ink(1)/paper(2) per the `FONT8` bit, walked independently of
+   `gbaFontTileBytes()` so a bug in that reference cannot hide a bug in the runtime.
+
+Mutation-tested (each reverted after):
+
+| mutation | new test | GBA parity |
+|---|---|---|
+| ink/paper swapped (`? 2 : 1`) | 2 of 3 fail | — |
+| high nibbles dropped (`lo, lo`) | 2 of 3 fail | — |
+| halfword order swapped (`hi, lo`) | 2 of 3 fail | **6 pass — blind** |
+
+## 7.5 Test and parity results
+
+```bash
+export MGBA_PREFIX=/tmp/mgba-prefix
+export CC65_LIB=/home/linuxbrew/.linuxbrew/share/cc65/lib/none.lib
+bun test vapor/tests/
+```
+
+**74 pass / 0 fail / 7405 expect() calls, 8 files** — run twice, identical. That is the 71/71 §1.1
+baseline plus this file's 3. `bun test vapor/tests/parity.test.ts` alone: **6 pass / 0 fail**, i.e.
+GBA, GB **and NES** parity are green (NES needs the `CC65_LIB` override of §1.1; it was not skipped).
+`vapor/tests/oracle.test.ts` green as part of the 74.
+
+Pre-existing and unrelated: `bun run vapor:check` exits 1 on the meowbit board's `VB103` chord
+warnings. Verified identical on a stashed clean tree, so it is not from this change.
+
+## 7.6 Other targets provably untouched
+
+Generated C was hashed per target/example before and after. Only the two `gba` rows moved
+(font 3040 → 760 B); `gb`, `nes`, `esp32`, `playdate` C is **byte-identical**, and `nesFontBytes()`
+still returns 3040 B hashing to `53885964cecd6b08`. At the artifact level, all four non-GBA ROMs
+compare equal with `cmp`:
+
+```
+IDENTICAL  todo.gb  todo.nes  playdate-six-button.gb  playdate-six-button.nes
+```
+
+GB/NES occupancy figures also unmoved (todo GB 11383, NES 9162; six-button 8933 / 5933).
+
+## 7.7 Still not measured
+
+- **Boot cost.** The expansion is 760 iterations of shift/mask before the first frame, replacing a
+  1520-halfword copy. Still not cycle-counted — parity passes, which bounds it below the rigs' boot
+  margins (GBA `A 5` frames), but no number was taken.
+- **ESP32/Playdate ROM sizes** — no SDK on this host, as before. Neither is affected: both already
+  emitted 1bpp and their C is byte-identical.
+- Candidates 2 (GB font) and 3 (GBA sparse palettes) are untouched and still open. Candidate 3 now
+  conflicts slightly less: it touches `vp_palettes`, which this change left alone.
