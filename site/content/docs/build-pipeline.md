@@ -106,9 +106,16 @@ For a bounded protocol, list its complete supplement instead:
 "runtimeText": { "charset": "custom", "extraChars": "€←→" }
 ```
 
-The build detects reachable `svcPoll` access and the `input.text`, `input.ime`,
-`host.clipboard`, and `text.glyphs.runtime` capabilities. **A detected runtime
-text source without `app.runtimeText` fails the build.**
+The build detects reachable `svcPoll` member access and destructuring, including
+renamed, nested, and default-value patterns. A string-literal bracket such as
+`ops["svcPoll"]` is the same explicit access. **Every non-literal computed key
+used to access or destructure `getOps()` or a same-file local variable initialized
+from it is treated as runtime text**, without resolving identifiers that happen
+to hold a constant key. The compiler otherwise cannot determine which host
+operation the key selects. Other literal keys do not trigger that rule. The
+build also detects the `input.text`,
+`input.ime`, `host.clipboard`, and `text.glyphs.runtime` capabilities. **A
+detected runtime text source without `app.runtimeText` fails the build.**
 
 ### Output naming
 

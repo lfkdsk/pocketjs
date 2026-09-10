@@ -103,6 +103,7 @@ test("host-service text requires an explicit manifest charset", () => {
   const output = result.stdout.toString() + result.stderr.toString();
   expect(result.exitCode).not.toBe(0);
   expect(output).toContain("runtime text source requires app.runtimeText");
+  expect(output).toContain('{ "app": { "runtimeText": { "charset": "ascii" } } }');
   expect(output).toContain("host service input in tests/fixtures/runtime-text-missing/main.tsx");
   expect(output).toContain("capability input.text");
 }, 120_000);

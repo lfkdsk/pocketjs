@@ -40,6 +40,7 @@ import {
   parseFramework,
   transformFile,
   type PocketFramework,
+  type RuntimeTextSource,
 } from "../framework/compiler/jsx-plugin.ts";
 import type { PocketConfig } from "../framework/src/config.ts";
 import { verifyPlanHash, type ResolvedBuildPlan } from "../framework/src/manifest/plan.ts";
@@ -294,7 +295,7 @@ const classStrings: string[] = [];
 const seenClass = new Set<string>();
 const codepoints = new Set<number>();
 const visited = new Set<string>();
-const runtimeTextSourceFiles = new Set<string>();
+const runtimeTextSourceFiles = new Map<string, Set<RuntimeTextSource>>();
 
 async function walk(file: string): Promise<void> {
   if (visited.has(file)) return;
@@ -316,7 +317,9 @@ async function walk(file: string): Promise<void> {
     }
   }
   for (const cp of res.textCodepoints) codepoints.add(cp);
-  if (res.runtimeTextSources.size > 0) runtimeTextSourceFiles.add(file);
+  if (res.runtimeTextSources.size > 0) {
+    runtimeTextSourceFiles.set(file, res.runtimeTextSources);
+  }
   for (const spec of importSpecifiers(src)) {
     const dep = resolveImport(file, spec);
     if (dep) await walk(dep);
@@ -341,15 +344,25 @@ const runtimeTextCapabilities = [
 );
 if (!runtimeText && (runtimeTextSourceFiles.size > 0 || runtimeTextCapabilities.length > 0)) {
   const signals = [
-    ...[...runtimeTextSourceFiles].map(
-      (file) => `host service input in ${relative(ROOT, file).replace(/\\/g, "/")}`,
-    ),
+    ...[...runtimeTextSourceFiles].flatMap(([file, sources]) => {
+      const displayFile = relative(ROOT, file).replace(/\\/g, "/");
+      return [...sources].map((source) =>
+        source === "host-ops-dynamic-key"
+          ? `dynamic HostOps key in ${displayFile} ` +
+            `(every non-literal key on getOps() or a same-file local variable initialized from it ` +
+            `is treated as runtime text)`
+          : `host service input in ${displayFile}`
+      );
+    }),
     ...runtimeTextCapabilities.map((capability) => `capability ${capability}`),
   ];
+  const extraCharsNote = extraChars
+    ? "; --extra-chars only adds baked glyphs and does not declare a runtime text source"
+    : "";
   throw new Error(
     `PocketJS build: runtime text source requires app.runtimeText in pocket.json ` +
-      `(detected ${signals.join(", ")}); declare { "charset": "ascii" } or ` +
-      `{ "charset": "custom", "extraChars": "…" }`,
+      `(for example { "app": { "runtimeText": { "charset": "ascii" } } })` +
+      `${extraCharsNote}; detected ${signals.join(", ")}`,
   );
 }
 console.log(`  pass 1: ${visited.size} module(s), ${classStrings.length} candidate literal(s), ${codepoints.size} codepoint(s)`);

@@ -78,6 +78,7 @@ const SUITE: readonly Stage[] = [
       "tests/guest-minify.test.ts",
       "tests/vue-sfc.test.ts",
       "tests/font-bake.test.ts",
+      "tests/runtime-text-detection.test.ts",
       "tests/touch.test.ts",
       "tests/gesture.test.ts",
       "tests/kinetics.test.ts",
