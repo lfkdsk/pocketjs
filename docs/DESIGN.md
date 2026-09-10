@@ -173,8 +173,8 @@ PocketJS/
     tailwind.ts        token parser + style-table compiler → styles.bin + styles.generated.ts;
                        a literal becomes a style record iff EVERY whitespace-separated
                        token parses as a supported utility (else ignored) [R]
-    bake-font.ts       atlas baker (charset from AST scan + ASCII always + extraChars
-                       option [R]; gid 0 = tofu box)
+    bake-font.ts       atlas baker (charset from numeric 0-9 floor + AST scan +
+                       app.runtimeText/extraChars [R]; gid 0 = tofu box)
     pak.ts           writer (standalone; constants imported from contracts/spec/spec.ts)
   hosts/web/
     index.html         480×272 canvas playground, virtual buttons, demo picker
@@ -207,8 +207,11 @@ PocketJS/
 2. **Compile styles & fonts.** `tailwind.ts` validates tokens (all-or-nothing
    per literal), assigns styleIds, writes `styles.bin`, and keeps an ignored
    `styles.generated.ts` mirror for inspection (excluded from future scans).
-   `bake-font.ts` bakes atlas slots for the collected charset. `pak.ts` packs
-   styles.bin + atlases + images → `<app>.pak`.
+   `bake-font.ts` bakes atlas slots for the **numeric 0-9 floor**, the collected
+   charset, and characters declared by `app.runtimeText` or `--extra-chars`.
+   Apps that receive host-service or text-input data must declare that runtime
+   charset; the build rejects detected input paths without a declaration.
+   `pak.ts` packs styles.bin + atlases + images → `<app>.pak`.
 3. **Pass 2 — bundle.** `Bun.build` with an onLoad plugin that serves the
    *cached* pass-1 transforms plus this build's in-memory generated style
    module, `format:"iife"`, `minify:{whitespace:true, identifiers:false,

@@ -120,6 +120,8 @@ const SUITE: readonly Stage[] = [
       "tests/vue-vapor-dom.test.ts",
       "tests/vue-vapor-pak.test.ts",
       "tests/svg-bake.test.ts",
+      "tests/font-fallback.test.ts",
+      "tests/font-runtime-text.test.ts",
       "tests/devtools.test.ts",
       "tests/hot.test.ts",
       "tests/clock.test.ts",

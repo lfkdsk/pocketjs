@@ -331,11 +331,12 @@ A few notes on the low-level command:
   `bun tools/build.ts apps/hero/main.tsx` or the shorthand
   `bun tools/build.ts hero-main`, which emits `dist/hero-main.js`. The dev host
   runs the mounted `-main` bundle.
-- `--extra-chars=<string>` forces extra codepoints into every font atlas — useful
-  when text is data-driven and not present in the source:
+- `--extra-chars=<string>` adds codepoints to every font atlas in a low-level
+  build. Product builds declare data-driven text with `app.runtimeText` in
+  `pocket.json`:
 
   ```sh
-  bun tools/build.ts hero --extra-chars="0123456789€"
+  bun tools/build.ts hero --extra-chars="€←→"
   ```
 
 ## Run it
