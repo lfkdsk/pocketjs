@@ -13,7 +13,8 @@ import { BuildInputs } from "../framework/compiler/build-inputs.ts";
 //         placeholder); pak.ts packs it all -> dist/<app>.pak.
 // pass 2  Bun.build (plugin serves the CACHED pass-1 transforms plus this
 //         build's in-memory generated styles, iife, target browser,
-//         minify false) -> dist/<app>.js.
+//         whitespace minification with identifier and syntax minification
+//         disabled) -> dist/<app>.js.
 //
 // Flags:
 //   --framework=solid|vue-vapor|octane  select the framework for this build
@@ -530,7 +531,14 @@ const result = await Bun.build({
       ? { document: "globalThis.__pocketDocument" }
       : {}),
   },
-  minify: false,
+  // Bun's whitespace mode removes comments/layout whitespace and can omit
+  // ASI-safe semicolons. Identifier renaming and syntax transforms stay off:
+  // fully-minified esbuild output nested expressions deeply enough to overflow
+  // an ESP32-P4 QuickJS task's 8 KB parse stack; another variant parsed for
+  // four minutes and hit its five-second watchdog. That device needed
+  // whitespace-only output plus a 64 KB task stack. For this guest matrix,
+  // Babel parsing found identical AST structure and nesting before/after.
+  minify: { whitespace: true, identifiers: false, syntax: false },
   metafile: true,
   sourcemap: "none",
   plugins: [jsxPlugin(framework, {

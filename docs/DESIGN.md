@@ -211,9 +211,16 @@ PocketJS/
    styles.bin + atlases + images → `<app>.pak`.
 3. **Pass 2 — bundle.** `Bun.build` with an onLoad plugin that serves the
    *cached* pass-1 transforms plus this build's in-memory generated style
-   module, `format:"iife"`, `minify:false`, `target:"browser"`. Output
-   `<app>.js` next to the pak. Parallel builds therefore cannot import one
-   another's transient style table.
+   module, `format:"iife"`, `minify:{whitespace:true, identifiers:false,
+   syntax:false}`, `target:"browser"`. Output `<app>.js` next to the pak.
+   Bun removes comments and layout whitespace and may omit ASI-safe semicolons;
+   identifier renaming and syntax transforms stay off. Esbuild output built
+   with `minify: true` overflowed an ESP32-P4 QuickJS task's 8 KB parse stack; another
+   variant parsed for four minutes and hit its five-second watchdog. That
+   device required whitespace-only output and a 64 KB task stack (see the
+   pocket-pi-on-esp32-p4 blog post).
+   Parallel builds therefore cannot import one another's transient style
+   table.
 
 The PSP build (`tools/psp.ts`) then runs `rustup run nightly-2026-05-28
 cargo psp` with the exact env block from `runtime/build.ts` (LLVM PATH,
@@ -390,8 +397,10 @@ literals, `style={{…}}` objects, or `animate()`.
 One FFI crossing per steady-state frame; DrawList ≤ ~40 sceGuDrawArray calls,
 ≤ ~2000 quads; per-frame vertex bytes ≈48 KB from the bump pool; layout-prop
 animations relayout that frame (prefer transforms); Solid effects only on
-interaction. Boot: unminified but tree-shaken bundle; all binary assets in the
-pak (base64-in-JS is the known QuickJS boot killer).
+interaction. Boot: whitespace-minified and tree-shaken bundle
+(identifier and syntax minification stay off — the device QuickJS 8 KB parse
+stack rejected esbuild output built with `minify: true`); all binary assets in the pak
+(base64-in-JS is the known QuickJS boot killer).
 
 ## What v1 explicitly punts
 
