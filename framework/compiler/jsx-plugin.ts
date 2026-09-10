@@ -203,11 +203,14 @@ export interface TransformResult {
   classStrings: string[];
   /** Every codepoint appearing in any collected literal. */
   textCodepoints: Set<number>;
+  /** Runtime text inputs observed in executable AST nodes. */
+  runtimeTextSources: Set<"host-service">;
 }
 
 interface Collected {
   classStrings: string[];
   textCodepoints: Set<number>;
+  runtimeTextSources: Set<"host-service">;
 }
 
 export type BuildFeatures = Readonly<Record<string, boolean>>;
@@ -305,6 +308,13 @@ function makeCollector(out: Collected, framework: PocketFramework): PluginObj {
                 }
               }
             },
+            MemberExpression(path) {
+              const property = path.node.property;
+              const name = path.node.computed
+                ? property.type === "StringLiteral" ? property.value : undefined
+                : property.type === "Identifier" ? property.name : undefined;
+              if (name === "svcPoll") out.runtimeTextSources.add("host-service");
+            },
             ImportDeclaration(path) {
               if (framework !== "solid") return;
               const src = path.node.source.value;
@@ -376,6 +386,7 @@ interface CacheEntry {
   code: string;
   classStrings: string[];
   textCodepoints: number[];
+  runtimeTextSources?: "host-service"[];
 }
 
 function resolvePackageSubpath(spec: string): string | null {
@@ -452,12 +463,17 @@ export async function transformFile(
       code: cached.code,
       classStrings: cached.classStrings,
       textCodepoints: new Set(cached.textCodepoints),
+      runtimeTextSources: new Set(cached.runtimeTextSources ?? []),
     };
   }
 
   if (isVueSfc) {
     const result = compileVueSfc(src, path, { stripTypes: true });
-    const collected: Collected = { classStrings: [], textCodepoints: new Set() };
+    const collected: Collected = {
+      classStrings: [],
+      textCodepoints: new Set(),
+      runtimeTextSources: new Set(),
+    };
     const transformed = await transformAsync(result.code, {
       filename: path,
       presets: [],
@@ -477,16 +493,22 @@ export async function transformFile(
       code: transformed.code!,
       classStrings: collected.classStrings,
       textCodepoints: [...collected.textCodepoints],
+      runtimeTextSources: [...collected.runtimeTextSources],
     };
     await Bun.write(cacheFile, JSON.stringify(entry));
     return {
       code: entry.code,
       classStrings: entry.classStrings,
       textCodepoints: new Set(entry.textCodepoints),
+      runtimeTextSources: new Set(entry.runtimeTextSources ?? []),
     };
   }
 
-  const collected: Collected = { classStrings: [], textCodepoints: new Set() };
+  const collected: Collected = {
+    classStrings: [],
+    textCodepoints: new Set(),
+    runtimeTextSources: new Set(),
+  };
   const opts = transformOptions(framework);
   const plugins = [
     ...(options.features === undefined ? [] : [makeFeatureFolder(options.features)]),
@@ -562,9 +584,15 @@ export async function transformFile(
     code: res.code!,
     classStrings: collected.classStrings,
     textCodepoints: [...collected.textCodepoints],
+    runtimeTextSources: [...collected.runtimeTextSources],
   };
   await Bun.write(cacheFile, JSON.stringify(entry));
-  return { code: entry.code, classStrings: entry.classStrings, textCodepoints: collected.textCodepoints };
+  return {
+    code: entry.code,
+    classStrings: entry.classStrings,
+    textCodepoints: collected.textCodepoints,
+    runtimeTextSources: collected.runtimeTextSources,
+  };
 }
 
 export function jsxPlugin(

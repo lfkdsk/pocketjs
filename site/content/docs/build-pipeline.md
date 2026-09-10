@@ -46,10 +46,10 @@ bun tools/build.ts hero-main --framework=octane
 ```
 
 The build is **two passes over the same module graph**. Pass 1 transforms every
-reachable source file and, in the same traversal, *collects* the class strings
-and text codepoints the app uses — so styles and fonts compile for that set
-alone. Pass 2 bundles, reusing the cached pass‑1 output. This page walks
-through both.
+reachable source file and, in the same traversal, collects class strings and
+literal text codepoints. Font compilation combines those codepoints with the
+numeric floor and the app's declared runtime text. Pass 2 bundles, reusing the
+cached pass‑1 output. This page walks through both.
 
 ## Invoking the low-level compiler
 
@@ -82,7 +82,7 @@ parser in QuickJS. See [ESP-IDF](/docs/esp-idf/#build-an-application-package).
 | `--framework=solid\|vue-vapor\|octane` | Select the framework for this low-level build, overriding `pocket.config.ts`. Manifest builds take it from `pocket.json`. |
 | `--config=<path>` | Load a different Pocket config file. |
 | `--no-config` | Ignore `pocket.config.ts`; defaults to Solid unless `--framework` is set. |
-| `--extra-chars=<string>` | Force these codepoints into **every** baked atlas, on top of the collected charset and ASCII. |
+| `--extra-chars=<string>` | Add these codepoints to **every** baked atlas for a low-level build. |
 | `--density=N` | Raster samples per logical pixel for this build — an integer 1 through 255, default 1. A resolved plan owns the density, so passing both is an error. |
 | `--hz=N` | Bake this virtual tick rate into the bundle — an integer 1 through 240, default 60. The host must drive the surface at the same rate; a bundle whose baked rate differs from the host's `ui.__tickHz` throws before it mounts. |
 | `--font-regular=<path>` | Use this TTF instead of Inter Regular for the regular slots. |
@@ -91,6 +91,24 @@ parser in QuickJS. See [ESP-IDF](/docs/esp-idf/#build-an-application-package).
 ```sh
 bun tools/build.ts settings --extra-chars="←→↑↓✓✕"
 ```
+
+Product builds declare text that can arrive or be formed at runtime in
+`pocket.json`. Use the printable ASCII range for unrestricted keyboard,
+clipboard, file, or host-service text:
+
+```json
+"runtimeText": { "charset": "ascii" }
+```
+
+For a bounded protocol, list its complete supplement instead:
+
+```json
+"runtimeText": { "charset": "custom", "extraChars": "€←→" }
+```
+
+The build detects reachable `svcPoll` access and the `input.text`, `input.ime`,
+`host.clipboard`, and `text.glyphs.runtime` capabilities. **A detected runtime
+text source without `app.runtimeText` fails the build.**
 
 ### Output naming
 
@@ -269,9 +287,12 @@ faces for one build; the mono face has no flag.
 
 The charset baked into every slot is the union of:
 
-- **ASCII 32–126, always** — so basic text never depends on the scan;
+- **decimal digits `0`–`9`, always** — runtime number formatting does not
+  depend on source literals;
 - the **codepoints collected in pass 1** (printable, excluding DEL);
-- anything passed via **`--extra-chars`**.
+- the `app.runtimeText` declaration: printable ASCII for `charset: "ascii"`,
+  or `extraChars` for `charset: "custom"`;
+- anything passed via the low-level **`--extra-chars`** option.
 
 Codepoints the font does not map are left out of the atlas. **On a target whose
 profile carries only `text.glyphs.baked`, a codepoint missing from the atlas
