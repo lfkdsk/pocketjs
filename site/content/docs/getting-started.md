@@ -319,6 +319,10 @@ That density-1 development command writes the bundle and its packed assets to
 [Build pipeline](/docs/build-pipeline/#output-naming). The dev host and the sim
 are development paths rather than stock targets — see
 [Transitional dev targets](/docs/platform-contracts/#transitional-dev-targets).
+Pass 2 uses `minify: { whitespace: true, identifiers: false, syntax: false }`.
+Identifier and syntax minification stay disabled because one ESP32-P4 bundle
+overflowed QuickJS's 8 KB parse stack and another spent four minutes in the
+parser, crossing its five-second watchdog limit.
 
 A few notes on the low-level command:
 

@@ -370,7 +370,7 @@ Bun.build({
     __POCKET_TICK_HZ__: String(tickHz),
     ...(framework === "vue-vapor" ? { document: "globalThis.__pocketDocument" } : {}),
   },
-  minify: false,
+  minify: { whitespace: true, identifiers: false, syntax: false },
   metafile: true,
   sourcemap: "none",
   plugins: [jsxPlugin(framework, { entry, features: buildPlan?.features, generatedStyles })],
@@ -404,9 +404,14 @@ A few settings are deliberate:
   packages. For Solid, the `node` condition would pull the SSR build (where
   reactive updates no‑op); Bun's default `development` condition can also pull
   dev builds and duplicate runtimes.
-- **`minify: false`** — the bundle ships unminified but tree‑shaken; base64 blobs
-  in JS are the known QuickJS boot killer, which is why all binary assets live in
-  the pak instead.
+- **Whitespace minification is enabled; identifier and syntax minification are
+  disabled.** Bun removes comments and layout whitespace and may omit optional
+  semicolons. It does not rename identifiers or apply syntax transforms. An
+  ESP32-P4 bundle built with `minify: true` overflowed QuickJS's 8 KB parse
+  stack. A second syntax-minified variant spent four minutes in the parser and
+  crossed the five-second watchdog limit. The device used whitespace-only
+  output and a 64 KB task stack. Binary assets remain in the pak instead of
+  entering the QuickJS heap as base64 text.
 
 ```
   pass 2: /…/dist/hero.js (73814 bytes)
