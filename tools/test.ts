@@ -118,6 +118,7 @@ const SUITE: readonly Stage[] = [
   },
   {
     name: "unit (wasm host)",
+    prep: [["bun", "tools/wasm.ts"]],
     browser: true,
     tests: [
       "tests/tailwind.test.ts",
@@ -136,6 +137,7 @@ const SUITE: readonly Stage[] = [
       "tests/hot.test.ts",
       "tests/clock.test.ts",
       "tests/tiles.test.ts",
+      "tests/web-system-surface-gate.test.ts",
     ],
   },
   {
