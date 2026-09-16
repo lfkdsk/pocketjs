@@ -114,6 +114,7 @@ const SUITE: readonly Stage[] = [
       "tests/video-outro.test.ts",
       "tests/osk-layout.test.ts",
       "tests/test-suite.test.ts",
+      "tests/tape-assert.test.ts",
     ],
   },
   {
@@ -142,6 +143,21 @@ const SUITE: readonly Stage[] = [
     name: "handheld models and dual output",
     prep: [["bun", "tools/wasm.ts"]],
     tests: ["tests/handheld-models.test.ts"],
+  },
+  {
+    // Session golden: a 180-frame deterministic replay hashed per frame.
+    // Placed after a stage that preps hosts/web/pocketjs.wasm so this pays
+    // only the hero-main rebuild (~1s), never a cold wasm compile.
+    name: "tape golden",
+    script: [
+      "bun",
+      "tools/tape.ts",
+      "replay",
+      "hero-main",
+      "tests/tapes/hero-main.tape.json",
+      "--assert",
+      "tests/tapes/hero-main.hashes.json",
+    ],
   },
   {
     name: "vue-sfc journeys",

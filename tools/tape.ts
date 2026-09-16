@@ -13,7 +13,10 @@
 // A tape asserted against stored hashes is a SESSION GOLDEN: a real
 // interaction sequence replayed byte-for-byte against every future build
 // (same determinism contract as tests/golden.ts — fixed dt, no RNG/wall
-// clock). `--assert` exits 1 and names the first divergent frame.
+// clock). `--assert` validates the golden schema before booting and exits 1
+// on the first divergent frame; a missing, malformed, sparse, or partial
+// golden exits 1 before booting as well — a broken assert never degrades
+// into a partial or disabled check.
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -146,12 +149,104 @@ function loadTape(path: string): Tape {
 }
 
 // ---------------------------------------------------------------------------
+// --assert golden schema (fail closed)
+// ---------------------------------------------------------------------------
+
+/** fnv1a frame hashes are 8 lowercase hex chars. */
+const FRAME_HASH_RE = /^[0-9a-f]{8}$/;
+
+/**
+ * Validate an `--assert` golden document and return its dense hash list.
+ *
+ * A golden written by `replay --hashes` is `{app, frames, hashes}`. Every
+ * structural defect throws an Error whose message names `path`; the CLI maps
+ * that to exit 1 before booting. Checks: plain-object root, `app` equal to
+ * the replayed app, integer `frames` equal to the array length, `hashes` a
+ * real (Array.isArray) dense array whose length equals the frames the tape
+ * expands to, every entry an 8-char lowercase hex string.
+ */
+export function parseAssertHashes(
+  doc: unknown,
+  path: string,
+  app: string,
+  frameCount: number,
+): string[] {
+  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
+    const kind = doc === null ? "null" : Array.isArray(doc) ? "array" : typeof doc;
+    throw new Error(`${path}: assert root must be an object {app, frames, hashes} (got ${kind})`);
+  }
+  const root = doc as Record<string, unknown>;
+  if (typeof root.app !== "string") {
+    throw new Error(`${path}: assert golden must set string field "app"`);
+  }
+  if (root.app !== app) {
+    throw new Error(`${path}: golden app "${root.app}" does not match replayed app "${app}"`);
+  }
+  if (typeof root.frames !== "number" || !Number.isSafeInteger(root.frames) || root.frames < 0) {
+    throw new Error(`${path}: assert golden must set non-negative integer field "frames"`);
+  }
+  if (!Object.hasOwn(root, "hashes")) {
+    throw new Error(`${path}: assert golden is missing field "hashes"`);
+  }
+  const rawHashes = root.hashes;
+  if (!Array.isArray(rawHashes)) {
+    const kind = rawHashes === null ? "null" : typeof rawHashes;
+    throw new Error(`${path}: "hashes" must be an array of 8-char hex frame hashes (got ${kind})`);
+  }
+  if (rawHashes.length !== frameCount) {
+    throw new Error(
+      `${path}: hashes length ${rawHashes.length} does not match the ${frameCount} frames this tape replays`,
+    );
+  }
+  if (root.frames !== rawHashes.length) {
+    throw new Error(`${path}: field "frames" is ${root.frames} but hashes.length is ${rawHashes.length}`);
+  }
+  const hashes: string[] = [];
+  for (let i = 0; i < rawHashes.length; i++) {
+    if (!Object.hasOwn(rawHashes, i)) {
+      throw new Error(`${path}: "hashes" is sparse: no hash at index ${i}`);
+    }
+    const entry = rawHashes[i];
+    if (typeof entry !== "string" || !FRAME_HASH_RE.test(entry)) {
+      throw new Error(
+        `${path}: hashes[${i}] is not an 8-char lowercase hex string (got ${JSON.stringify(entry)})`,
+      );
+    }
+    hashes.push(entry);
+  }
+  return hashes;
+}
+
+/** Read and validate the `--assert` golden; any defect exits 1, never throws. */
+function loadAssertHashes(path: string, app: string, frameCount: number): string[] {
+  const fail = (message: string): never => {
+    console.error(`tape: ${message}`);
+    process.exit(1);
+  };
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (err) {
+    fail(`cannot read --assert file ${path}: ${(err as Error).message}`);
+  }
+  let doc: unknown;
+  try {
+    doc = JSON.parse(raw);
+  } catch (err) {
+    fail(`${path}: invalid JSON: ${(err as Error).message}`);
+  }
+  try {
+    return parseAssertHashes(doc, path, app, frameCount);
+  } catch (err) {
+    fail((err as Error).message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // commands
 // ---------------------------------------------------------------------------
 
-const [, , cmd, app, tapePathArg] = process.argv;
-
-async function cmdReplay(): Promise<void> {
+async function cmdReplay(app: string, tapePathArg: string): Promise<void> {
   const tape = loadTape(tapePathArg);
   const masks = expandTape(tape);
   const analogs = expandTapeAnalog(tape);
@@ -164,8 +259,10 @@ async function cmdReplay(): Promise<void> {
     (argValue("--png") ?? "").split(",").filter(Boolean).map((s) => Number(s)),
   );
   const outdir = argValue("--outdir") ?? CAPTURE_DIST;
+  // Validate before booting: a malformed golden must fail without spending a
+  // build, and the schema guarantees a dense string[] of the right length.
   const expected: string[] | null = assertPath
-    ? (JSON.parse(readFileSync(assertPath, "utf8")) as { hashes: string[] }).hashes
+    ? loadAssertHashes(assertPath, app, masks.length)
     : null;
 
   const b = await boot(app);
@@ -177,7 +274,7 @@ async function cmdReplay(): Promise<void> {
     const fb = b.render();
     const h = fnv1a(fb);
     hashes.push(h);
-    if (expected && expected[f] !== undefined && expected[f] !== h) {
+    if (expected && expected[f] !== h) {
       console.error(`tape: FIRST DIVERGENT FRAME ${f} — expected ${expected[f]}, got ${h}`);
       mkdirSync(outdir, { recursive: true });
       writeFileSync(`${outdir}/divergent.${f}.png`, encodePNG(fb.slice(), SCREEN_W, SCREEN_H));
@@ -190,10 +287,7 @@ async function cmdReplay(): Promise<void> {
     }
   }
   if (expected) {
-    if (expected.length !== hashes.length) {
-      console.error(`tape: frame count changed — expected ${expected.length}, replayed ${hashes.length}`);
-      process.exit(1);
-    }
+    // Length equality was validated against masks.length before the loop.
     console.log(`tape: OK — ${hashes.length} frames match ${assertPath}`);
     return;
   }
@@ -205,7 +299,7 @@ async function cmdReplay(): Promise<void> {
   }
 }
 
-async function cmdTree(): Promise<void> {
+async function cmdTree(app: string, tapePathArg: string): Promise<void> {
   const tape = loadTape(tapePathArg);
   const masks = expandTape(tape);
   const analogs = expandTapeAnalog(tape);
@@ -233,7 +327,7 @@ async function cmdTree(): Promise<void> {
   process.exit(1);
 }
 
-async function cmdRecord(): Promise<void> {
+async function cmdRecord(app: string): Promise<void> {
   const frames = Number(argValue("--frames") ?? 300);
   const out = argValue("--out") ?? `${app}.tape.json`;
   // e2e-style input script: "frame:mask,frame:mask" — mask holds until the
@@ -284,15 +378,24 @@ async function cmdRecord(): Promise<void> {
   console.log(`tape: wrote ${out} (${frames} frames)`);
 }
 
-if (cmd === "replay" && app && tapePathArg) await cmdReplay();
-else if (cmd === "tree" && app && tapePathArg) await cmdTree();
-else if (cmd === "record" && app) await cmdRecord();
-else {
-  console.log(
-    "usage:\n" +
-      '  bun tools/tape.ts record <app> --frames N [--input "f:mask,..."] [--touch "f:id,x,y;f:-"] --out t.json\n' +
-      "  bun tools/tape.ts replay <app> <tape.json> [--hashes out.json | --assert hashes.json | --png f1,f2 [--outdir d]]\n" +
-      "  bun tools/tape.ts tree   <app> <tape.json> --at N",
-  );
-  process.exit(cmd ? 1 : 0);
+// ---------------------------------------------------------------------------
+// CLI entry (guarded so tests can import the validator without replaying)
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  const [, , cmd, app, tapePathArg] = process.argv;
+  if (cmd === "replay" && app && tapePathArg) await cmdReplay(app, tapePathArg);
+  else if (cmd === "tree" && app && tapePathArg) await cmdTree(app, tapePathArg);
+  else if (cmd === "record" && app) await cmdRecord(app);
+  else {
+    console.log(
+      "usage:\n" +
+        '  bun tools/tape.ts record <app> --frames N [--input "f:mask,..."] [--touch "f:id,x,y;f:-"] --out t.json\n' +
+        "  bun tools/tape.ts replay <app> <tape.json> [--hashes out.json | --assert hashes.json | --png f1,f2 [--outdir d]]\n" +
+        "  bun tools/tape.ts tree   <app> <tape.json> --at N",
+    );
+    process.exit(cmd ? 1 : 0);
+  }
 }
+
+if (import.meta.main) await main();
