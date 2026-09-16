@@ -147,8 +147,13 @@ pocketjs_bytes_t pocketjs_package_manifest(const pocketjs_package_t *package) {
   };
 }
 
+static size_t pocketjs_strnlen(const char *text, size_t maximum) {
+  const char *end = memchr(text, '\0', maximum);
+  return end == NULL ? maximum : (size_t)(end - text);
+}
+
 static bool target_matches(const uint8_t *field, const char *target) {
-  const size_t length = strnlen(target, POCKETJS_PACKAGE_TARGET_BYTES);
+  const size_t length = pocketjs_strnlen(target, POCKETJS_PACKAGE_TARGET_BYTES);
   if (length == 0U || length >= POCKETJS_PACKAGE_TARGET_BYTES) {
     return false;
   }
