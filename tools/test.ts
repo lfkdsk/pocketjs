@@ -58,6 +58,7 @@ const SUITE: readonly Stage[] = [
       "tests/3ds-profile.test.ts",
       "tests/media-service.test.ts",
       "tests/service-client.test.ts",
+      "tests/overlay-host.test.ts",
       "tests/modality.test.ts",
       "tests/actions.test.ts",
       "tests/3ds-runtime-state.test.ts",
