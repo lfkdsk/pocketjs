@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const repository = join(import.meta.dir, "..");
@@ -7,7 +7,7 @@ const suiteSource = readFileSync(join(repository, "tools/test.ts"), "utf8");
 
 function unitTestFiles(): Set<string> {
   const unitStage = suiteSource.match(
-    /name: "unit",\s*tests: \[(.*?)\n\s*\],\n\s*},/s,
+    /name: "unit",[\s\S]*?tests: \[(.*?)\n\s*\],\n\s*},/s,
   )?.[1];
   if (!unitStage)
     throw new Error("tools/test.ts does not define the unit test stage");
@@ -19,7 +19,47 @@ function unitTestFiles(): Set<string> {
   );
 }
 
+function stageTestFiles(): Set<string> {
+  return new Set(
+    [...suiteSource.matchAll(/"(tests\/[^"\n]+\.test\.ts)"/g)].map(
+      ([, path]) => path,
+    ),
+  );
+}
+
+// Files intentionally run by a dedicated workflow instead of any
+// tools/test.ts stage. Each entry must name the workflow that runs it; the
+// test below verifies the file exists and that the workflow references it,
+// so an exclusion cannot silently rot.
+const STAGE_EXCLUSIONS: Readonly<Record<string, { workflow: string }>> = {
+  "tests/ui-cabi-allocator.test.ts": {
+    workflow: ".github/workflows/native-c-harness.yml",
+  },
+};
+
 describe("declared test suite", () => {
+  test("runs every tests/*.test.ts file in some stage or registers its exclusion", () => {
+    const declared = stageTestFiles();
+    const onDisk = readdirSync(join(repository, "tests"))
+      .filter((file) => file.endsWith(".test.ts"))
+      .map((file) => `tests/${file}`)
+      .sort();
+
+    expect(onDisk).not.toHaveLength(0);
+
+    const stray = onDisk.filter(
+      (file) => !declared.has(file) && !(file in STAGE_EXCLUSIONS),
+    );
+    expect(stray).toEqual([]);
+
+    for (const [file, { workflow }] of Object.entries(STAGE_EXCLUSIONS)) {
+      expect(onDisk).toContain(file);
+      const workflowPath = join(repository, workflow);
+      expect(existsSync(workflowPath)).toBe(true);
+      expect(readFileSync(workflowPath, "utf8")).toContain(file);
+    }
+  });
+
   test("runs every Nintendo 3DS test in the CI unit stage", () => {
     const declared = unitTestFiles();
     const threeDsTests = readdirSync(join(repository, "tests"))

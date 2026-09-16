@@ -35,7 +35,15 @@ const SUITE: readonly Stage[] = [
     script: ["bun", "tests/contract.ts"],
   },
   {
+    // One tests/*.test.ts file is deliberately absent from every stage:
+    // ui-cabi-allocator.test.ts needs the nightly toolchain pinned by
+    // engine/ui-cabi/rust-toolchain.toml and runs under
+    // .github/workflows/native-c-harness.yml instead ("bun test
+    // tests/ui-cabi-allocator.test.ts"). tests/test-suite.test.ts pins that
+    // single registered exclusion.
     name: "unit",
+    // wasm-auxiliary.test.ts loads hosts/web/pocketjs.wasm.
+    prep: [["bun", "tools/wasm.ts"]],
     tests: [
       "tests/release-check.test.ts",
       "tests/release-notes.test.ts",
@@ -52,11 +60,14 @@ const SUITE: readonly Stage[] = [
       "tests/pocket-system.test.ts",
       "tests/site-stage.test.ts",
       "tests/site-showcase.test.ts",
+      "tests/motions-attribution.test.ts",
       "tests/host-build-inputs.test.ts",
       "tests/host-layout.test.ts",
       "tests/quickjs-c-harness.test.ts",
+      "tests/native-source.test.ts",
       "tests/3ds-profile.test.ts",
       "tests/media-service.test.ts",
+      "tests/media.test.ts",
       "tests/service-client.test.ts",
       "tests/modality.test.ts",
       "tests/actions.test.ts",
@@ -82,7 +93,11 @@ const SUITE: readonly Stage[] = [
       "tests/app-check.test.ts",
       "tests/vue-sfc.test.ts",
       "tests/font-bake.test.ts",
+      "tests/indexed-image.test.ts",
       "tests/touch.test.ts",
+      "tests/desktop-pointer.test.ts",
+      "tests/keyboard-touch.test.ts",
+      "tests/caret-blink.test.ts",
       "tests/gesture.test.ts",
       "tests/kinetics.test.ts",
       "tests/osk-controller.test.ts",
@@ -97,18 +112,22 @@ const SUITE: readonly Stage[] = [
       "tests/ime-supervisor.test.ts",
       "tests/ime-text-tile.test.ts",
       "tests/text.test.ts",
+      "tests/text-layout-client.test.ts",
       "tests/clear-candidate-panel.test.ts",
       "tests/moto-g-play-profile.test.ts",
       "tests/offload-provider.test.ts",
       "tests/companion-session.test.ts",
       "tests/resource-cache.test.ts",
       "tests/net-web.test.js",
+      "tests/web-system-host.test.ts",
+      "tests/wasm-auxiliary.test.ts",
       "tests/vita-package.test.ts",
       "tests/psp-toolchain.test.ts",
       "tests/symbian-data.test.ts",
       "tests/symbian-toolchain.test.ts",
       "tests/symbian-device.test.ts",
       "tests/symbian-runtime.test.ts",
+      "tests/symbian-package.test.ts",
       "tests/cli.test.ts",
       "tests/npm-package.test.ts",
       "tests/video-outro.test.ts",
