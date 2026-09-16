@@ -386,3 +386,193 @@ describe("tape replay --assert CLI value boundary", () => {
     expect(out).not.toMatch(/frames match/);
   }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// Review B2rrr: the whole argv is scanned, not just the first --assert. A
+// valueless occurrence (bare, empty, attached-empty, flag-like) fails closed
+// wherever it appears, and two non-empty occurrences are a duplicate error —
+// safety must not depend on which occurrence comes first.
+// ---------------------------------------------------------------------------
+
+describe("tape --assert duplicate and later-occurrence parsing (pure)", () => {
+  const PREFIX = ["bun", "tools/tape.ts", "replay", "hero-main", "tests/tapes/hero-main.tape.json"];
+  const parse = (extra: string[]) => parseAssertArg([...PREFIX, ...extra]);
+  const reasonOf = (r: ReturnType<typeof parseAssertArg>): string =>
+    r.kind === "missing" || r.kind === "duplicate" ? r.reason : "";
+  const good = "tests/tapes/hero-main.hashes.json";
+  const other = "/tmp/second-golden.json";
+
+  const missingCases: { name: string; args: string[]; error: RegExp }[] = [
+    { name: "valid separated, then bare trailing", args: ["--assert", good, "--assert"], error: /last argument/ },
+    {
+      name: "valid separated, then empty string",
+      args: ["--assert", good, "--assert", ""],
+      error: /empty string/,
+    },
+    { name: "valid separated, then attached empty", args: ["--assert", good, "--assert="], error: /empty value/ },
+    { name: "valid attached, then attached empty", args: [`--assert=${good}`, "--assert="], error: /empty value/ },
+    {
+      name: "valid separated, then flag-like value",
+      args: ["--assert", good, "--assert", "--png", "0"],
+      error: /next argument is the flag "--png"/,
+    },
+    {
+      name: "valid attached, then flag-like value",
+      args: [`--assert=${good}`, "--assert", "--png", "0"],
+      error: /next argument is the flag "--png"/,
+    },
+    { name: "empty first, valid later (reverse order)", args: ["--assert", "", "--assert", good], error: /empty string/ },
+    {
+      name: "bare-looking first (next token is --assert), valid later",
+      args: ["--assert", "--assert", good],
+      error: /next argument is the flag "--assert"/,
+    },
+    {
+      name: "two malformed occurrences report the first one in argv order",
+      args: ["--assert", "", "--assert"],
+      error: /empty string/,
+    },
+  ];
+
+  for (const c of missingCases) {
+    test(`missing: ${c.name}`, () => {
+      const r = parse(c.args);
+      expect(r.kind).toBe("missing");
+      expect(reasonOf(r)).toMatch(c.error);
+    });
+  }
+
+  const duplicateCases: { name: string; args: string[] }[] = [
+    { name: "two separated paths", args: ["--assert", good, "--assert", other] },
+    { name: "two attached paths", args: [`--assert=${good}`, `--assert=${other}`] },
+    { name: "attached then separated", args: [`--assert=${good}`, "--assert", other] },
+    { name: "separated then attached", args: ["--assert", good, `--assert=${other}`] },
+    { name: "the same path twice", args: ["--assert", good, "--assert", good] },
+    {
+      name: "three occurrences",
+      args: ["--assert", good, "--assert", other, `--assert=${good}`],
+    },
+    {
+      name: "unrelated flags interleaved between the occurrences",
+      args: ["--png", "0", "--assert", good, "--outdir", "dist/x", "--assert", other],
+    },
+  ];
+
+  for (const c of duplicateCases) {
+    const count = c.args.filter((a) => a === "--assert" || a.startsWith("--assert=")).length;
+    test(`duplicate: ${c.name}`, () => {
+      const r = parse(c.args);
+      expect(r.kind).toBe("duplicate");
+      expect(reasonOf(r)).toMatch(/--assert may be given at most once/);
+      expect(reasonOf(r)).toMatch(new RegExp(`appeared ${count} times`));
+    });
+  }
+
+  test("duplicate reason names every path so composed command lines are debuggable", () => {
+    const r = parse(["--assert", good, "--assert", other]);
+    expect(r.kind).toBe("duplicate");
+    expect(reasonOf(r)).toContain(good);
+    expect(reasonOf(r)).toContain(other);
+  });
+
+  test("scanning is position-independent: --assert among positional arguments still counts twice", () => {
+    const r = parseAssertArg([
+      "bun",
+      "tools/tape.ts",
+      "replay",
+      "--assert",
+      good,
+      "hero-main",
+      "tests/tapes/hero-main.tape.json",
+      "--assert",
+      other,
+    ]);
+    expect(r.kind).toBe("duplicate");
+  });
+
+  test("a single valid occurrence mixed with other flags stays a value", () => {
+    expect(parse(["--png", "0", "--assert", good, "--outdir", "dist/x"])).toEqual({
+      kind: "value",
+      value: good,
+    });
+  });
+});
+
+describe("tape replay rejects duplicate and later valueless --assert (CLI)", () => {
+  const good = "tests/tapes/hero-main.hashes.json";
+
+  const cases: { name: string; args: (dir: string) => string[]; error: RegExp }[] = [
+    { name: "valid then bare --assert", args: () => ["--assert", good, "--assert"], error: /last argument/ },
+    {
+      name: "valid then empty string",
+      args: () => ["--assert", good, "--assert", ""],
+      error: /empty string/,
+    },
+    {
+      name: "valid attached then attached empty",
+      args: () => [`--assert=${good}`, "--assert="],
+      error: /empty value/,
+    },
+    {
+      name: "valid then flag-like value",
+      args: () => ["--assert", good, "--assert", "--png", "0"],
+      error: /next argument is the flag "--png"/,
+    },
+    {
+      name: "two non-empty paths (second one divergent) is rejected, not first-wins",
+      args: (d) => {
+        const p = join(d, "divergent.json");
+        const hashes = golden.hashes.slice();
+        hashes[40] = "deadbeef";
+        writeFileSync(p, JSON.stringify({ app: APP, frames: FRAMES, hashes }));
+        return ["--assert", good, "--assert", p];
+      },
+      error: /--assert may be given at most once/,
+    },
+    {
+      name: "two attached non-empty paths",
+      args: (d) => {
+        const p = join(d, "second.json");
+        writeFileSync(p, JSON.stringify({ app: APP, frames: FRAMES, hashes: [...golden.hashes] }));
+        return [`--assert=${good}`, `--assert=${p}`];
+      },
+      error: /--assert may be given at most once/,
+    },
+    {
+      name: "same path repeated",
+      args: () => ["--assert", good, "--assert", good],
+      error: /--assert may be given at most once/,
+    },
+    {
+      name: "three occurrences",
+      args: () => ["--assert", good, "--assert", good, `--assert=${good}`],
+      error: /appeared 3 times/,
+    },
+    {
+      name: "empty first with a valid second still rejects",
+      args: () => ["--assert", "", "--assert", good],
+      error: /empty string/,
+    },
+    {
+      name: "flag-like first with a valid second still rejects",
+      args: () => ["--assert", "--assert", good],
+      error: /next argument is the flag "--assert"/,
+    },
+  ];
+
+  for (const c of cases) {
+    test(c.name, () => {
+      const result = runTapeArgs(c.args(tmp()));
+      const out = result.stdout.toString();
+      const err = result.stderr.toString();
+      expect(result.exitCode, err + out).not.toBe(0);
+      expect(err).toMatch(/tape: --assert/);
+      expect(err).toMatch(c.error);
+      // A parameter error, not a failed file open or a replay verdict.
+      expect(err).not.toMatch(/cannot read --assert|FIRST DIVERGENT FRAME/);
+      expect(out + err).not.toMatch(/frames match|replayed \d+ frames/);
+      // Rejected before reading the tape and, crucially, before building.
+      expect(out + err).not.toMatch(/rebuilding|missing — running/);
+    }, 10_000);
+  }
+});

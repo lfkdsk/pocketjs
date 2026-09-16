@@ -20,6 +20,9 @@
 // (no following path, an empty string, `--assert=`, or a flag where the
 // path should be) is a command-line error and exits 1 before the tape is
 // even read; omitting `--assert` entirely stays a plain, unchecked replay.
+// `--assert` may appear at most once: every occurrence is scanned, so a
+// valueless or second occurrence later in a composed command line is
+// rejected too — the first valid value never wins by default.
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -74,31 +77,42 @@ function argValue(flag: string): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// --assert option parsing (absent vs. present-but-valueless are distinct)
+// --assert option parsing (absent vs. present-but-valueless are distinct,
+// and the flag may appear at most once)
 // ---------------------------------------------------------------------------
 
 export type AssertArg =
   | { readonly kind: "absent" }
   | { readonly kind: "value"; readonly value: string }
-  | { readonly kind: "missing"; readonly reason: string };
+  | { readonly kind: "missing"; readonly reason: string }
+  | { readonly kind: "duplicate"; readonly reason: string };
 
 /**
- * Resolve `--assert` in argv, accepting both `--assert PATH` and
- * `--assert=PATH`.
+ * Resolve every `--assert` occurrence in argv, accepting both
+ * `--assert PATH` and `--assert=PATH`.
  *
  * - "absent" — the flag is not there: a plain replay, the historical
  *   no-golden behaviour.
- * - "value" — the flag carries a non-empty path that is not itself a flag.
- * - "missing" — the flag is present but its value is absent: it is the last
- *   token, it is an empty string (`--assert ""`, the classic empty-env-var
- *   expansion), it is `--assert=`, or the next token starts with `--`.
- *   That is a command-line mistake, never a disabled assertion: callers exit
- *   non-zero before reading the tape, building, or booting.
+ * - "value" — exactly one occurrence carrying a non-empty path that is not
+ *   itself a flag.
+ * - "missing" — an occurrence is present but its value is absent: it is the
+ *   last token, it is an empty string (`--assert ""`, the classic empty-env-
+ *   var expansion), it is `--assert=`, or the next token starts with `--`.
+ *   That is a command-line mistake, never a disabled assertion.
+ * - "duplicate" — two or more occurrences carry values: which golden wins
+ *   must not be an accident of argv order, so the command is rejected.
+ *
+ * The whole argv is scanned. A malformed occurrence short-circuits immediately
+ * (it is the first such occurrence in argv order, and nothing later can
+ * outrank it); valid occurrences are collected, so a valueless or second
+ * occurrence after a valid one is rejected instead of being ignored.
+ * Callers exit non-zero before reading the tape, building, or booting.
  *
  * A lone "-" or any other value is treated as a literal path; a path that
  * starts with "--" can be passed with the attached form `--assert=--path`.
  */
 export function parseAssertArg(argv: readonly string[]): AssertArg {
+  const values: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
     if (token === "--assert") {
@@ -127,7 +141,9 @@ export function parseAssertArg(argv: readonly string[]): AssertArg {
             "(use --assert=<path> if the path itself starts with --)",
         };
       }
-      return { kind: "value", value: next };
+      values.push(next);
+      i++; // the value token is consumed, not rescanned as an option
+      continue;
     }
     if (token.startsWith("--assert=")) {
       const value = token.slice("--assert=".length);
@@ -137,10 +153,17 @@ export function parseAssertArg(argv: readonly string[]): AssertArg {
           reason: "--assert requires a golden hashes file path, but got an empty value (--assert=)",
         };
       }
-      return { kind: "value", value };
+      values.push(value);
     }
   }
-  return { kind: "absent" };
+  if (values.length === 0) return { kind: "absent" };
+  if (values.length === 1) return { kind: "value", value: values[0] };
+  return {
+    kind: "duplicate",
+    reason:
+      `--assert may be given at most once, but it appeared ${values.length} times with paths ` +
+      values.map((v) => JSON.stringify(v)).join(", "),
+  };
 }
 
 /** FNV-1a 32-bit over the RGBA framebuffer — cheap, deterministic, hex. */
@@ -330,10 +353,11 @@ function loadAssertHashes(path: string, app: string, frameCount: number): string
 
 async function cmdReplay(app: string, tapePathArg: string): Promise<void> {
   // Parse --assert before touching the tape, the build, or the replay: a
-  // present-but-valueless flag (typo, empty env expansion) is a command-line
-  // error, and the assertion request must never degrade into no assertions.
+  // present-but-valueless flag (typo, empty env expansion) or a repeated flag
+  // is a command-line error, and the assertion request must never degrade
+  // into no assertions or a first-wins guess.
   const assertArg = parseAssertArg(process.argv);
-  if (assertArg.kind === "missing") {
+  if (assertArg.kind === "missing" || assertArg.kind === "duplicate") {
     console.error(`tape: ${assertArg.reason}`);
     console.error("usage: bun tools/tape.ts replay <app> <tape.json> --assert <hashes.json>");
     process.exit(1);
