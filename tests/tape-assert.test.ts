@@ -11,7 +11,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseAssertHashes } from "../tools/tape.ts";
+import { parseAssertArg, parseAssertHashes } from "../tools/tape.ts";
 
 const APP = "hero-main";
 const FRAMES = 180;
@@ -115,6 +115,22 @@ describe("tape --assert schema (pure validator)", () => {
       hashes[at] = h as string;
       reject({ app: APP, frames: FRAMES, hashes }, new RegExp(`hashes\\[${at}\\]`));
     }
+  });
+
+  test("root must be a plain object — class instances cannot masquerade as a golden", () => {
+    class FakeGolden {
+      app = APP;
+      frames = FRAMES;
+      hashes = [...golden.hashes];
+    }
+    reject(new FakeGolden(), /non-standard prototype/);
+    // A null-prototype object is still plain data.
+    const nullProto = Object.assign(Object.create(null), {
+      app: APP,
+      frames: FRAMES,
+      hashes: [...golden.hashes],
+    });
+    expect(parseAssertHashes(nullProto, "nullproto.json", APP, FRAMES)).toHaveLength(180);
   });
 
   test("frame count argument disagreements are rejected too", () => {
@@ -247,4 +263,126 @@ describe("tape replay --assert CLI fails closed", () => {
       expect(out + err).not.toMatch(/rebuilding|missing — running/);
     }, 10_000);
   }
+});
+
+// ---------------------------------------------------------------------------
+// --assert argument parsing (Review B2rr): "the flag is absent" and "the flag
+// is present but its value is missing/empty/another flag" are different. The
+// first is a plain replay; the second must fail closed before any work.
+// ---------------------------------------------------------------------------
+
+describe("tape --assert argument parsing (pure)", () => {
+  const parse = (extra: string[]) =>
+    parseAssertArg(["bun", "tools/tape.ts", "replay", "hero-main", "tests/tapes/hero-main.tape.json", ...extra]);
+
+  test("absent: no --assert anywhere means a plain, unchecked replay", () => {
+    expect(parse([])).toEqual({ kind: "absent" });
+    expect(parse(["--hashes", "out.json", "--png", "0"])).toEqual({ kind: "absent" });
+  });
+
+  test("value: --assert PATH resolves to the path", () => {
+    expect(parse(["--assert", "tests/tapes/hero-main.hashes.json"])).toEqual({
+      kind: "value",
+      value: "tests/tapes/hero-main.hashes.json",
+    });
+  });
+
+  test("value: attached --assert=PATH resolves to the path", () => {
+    expect(parse(["--assert=tests/tapes/hero-main.hashes.json"])).toEqual({
+      kind: "value",
+      value: "tests/tapes/hero-main.hashes.json",
+    });
+  });
+
+  test("missing: --assert as the last token has no value", () => {
+    const r = parse(["--assert"]);
+    expect(r.kind).toBe("missing");
+    expect(r.kind === "missing" ? r.reason : "").toMatch(/last argument/);
+  });
+
+  test("missing: --assert followed by an empty string is an error, not 'absent'", () => {
+    const r = parse(["--assert", ""]);
+    expect(r.kind).toBe("missing");
+    expect(r.kind === "missing" ? r.reason : "").toMatch(/empty string/);
+  });
+
+  test("missing: --assert= (attached empty) is an error", () => {
+    const r = parse(["--assert="]);
+    expect(r.kind).toBe("missing");
+    expect(r.kind === "missing" ? r.reason : "").toMatch(/empty value/);
+  });
+
+  test("missing: --assert followed by another flag names that flag", () => {
+    const r = parse(["--assert", "--png", "0"]);
+    expect(r.kind).toBe("missing");
+    expect(r.kind === "missing" ? r.reason : "").toMatch(/next argument is the flag "--png"/);
+  });
+
+  test("a lone dash stays a literal path value", () => {
+    expect(parse(["--assert", "-"])).toEqual({ kind: "value", value: "-" });
+  });
+});
+
+// End-to-end boundary: every valueless form exits non-zero before the tape is
+// read or the bundle is rebuilt, a real golden still asserts, and a replay
+// without --assert keeps its unchecked behaviour.
+function runTapeArgs(extra: string[]) {
+  return Bun.spawnSync(
+    [process.execPath, "tools/tape.ts", "replay", "hero-main", "tests/tapes/hero-main.tape.json", ...extra],
+    { cwd: root, stdout: "pipe", stderr: "pipe" },
+  );
+}
+
+describe("tape replay --assert CLI value boundary", () => {
+  const missingCases: { name: string; args: string[]; error: RegExp }[] = [
+    { name: "bare --assert at the end", args: ["--assert"], error: /last argument/ },
+    { name: "empty string value", args: ["--assert", ""], error: /empty string/ },
+    { name: "attached empty --assert=", args: ["--assert="], error: /empty value/ },
+    {
+      name: "next argument is a flag",
+      args: ["--assert", "--png", "0"],
+      error: /next argument is the flag "--png"/,
+    },
+  ];
+
+  for (const c of missingCases) {
+    test(c.name, () => {
+      const result = runTapeArgs(c.args);
+      const out = result.stdout.toString();
+      const err = result.stderr.toString();
+      expect(result.exitCode, err + out).not.toBe(0);
+      expect(err).toMatch(/tape: --assert requires a golden hashes file path/);
+      expect(err).toMatch(c.error);
+      // The error is a parameter error, not a failed file open.
+      expect(err).not.toMatch(/cannot read --assert/);
+      expect(out + err).not.toMatch(/frames match|replayed \d+ frames/);
+      // Fails before reading the tape matters and, crucially, before building.
+      expect(out + err).not.toMatch(/rebuilding|missing — running/);
+    }, 10_000);
+  }
+
+  test("valid separated --assert PATH still strictly asserts 180/180", () => {
+    const result = runTapeArgs(["--assert", "tests/tapes/hero-main.hashes.json"]);
+    const out = result.stdout.toString();
+    const err = result.stderr.toString();
+    expect(result.exitCode, err + out).toBe(0);
+    expect(out).toMatch(/tape: OK — 180 frames match tests\/tapes\/hero-main\.hashes\.json/);
+  }, 30_000);
+
+  test("valid attached --assert=PATH is accepted", () => {
+    const result = runTapeArgs(["--assert=tests/tapes/hero-main.hashes.json"]);
+    const out = result.stdout.toString();
+    const err = result.stderr.toString();
+    expect(result.exitCode, err + out).toBe(0);
+    expect(out).toMatch(/tape: OK — 180 frames match/);
+  }, 30_000);
+
+  test("no --assert at all keeps the plain unchecked replay (exit 0)", () => {
+    const result = runTapeArgs([]);
+    const out = result.stdout.toString();
+    const err = result.stderr.toString();
+    expect(result.exitCode, err + out).toBe(0);
+    expect(out).toMatch(/tape: replayed 180 frames/);
+    expect(out).not.toMatch(/frames match/);
+  }, 30_000);
 });

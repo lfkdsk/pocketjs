@@ -16,7 +16,10 @@
 // clock). `--assert` validates the golden schema before booting and exits 1
 // on the first divergent frame; a missing, malformed, sparse, or partial
 // golden exits 1 before booting as well — a broken assert never degrades
-// into a partial or disabled check.
+// into a partial or disabled check. A present but valueless `--assert`
+// (no following path, an empty string, `--assert=`, or a flag where the
+// path should be) is a command-line error and exits 1 before the tape is
+// even read; omitting `--assert` entirely stays a plain, unchecked replay.
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -68,6 +71,76 @@ function buildApp(app: string): void {
 function argValue(flag: string): string | undefined {
   const i = process.argv.indexOf(flag);
   return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// --assert option parsing (absent vs. present-but-valueless are distinct)
+// ---------------------------------------------------------------------------
+
+export type AssertArg =
+  | { readonly kind: "absent" }
+  | { readonly kind: "value"; readonly value: string }
+  | { readonly kind: "missing"; readonly reason: string };
+
+/**
+ * Resolve `--assert` in argv, accepting both `--assert PATH` and
+ * `--assert=PATH`.
+ *
+ * - "absent" — the flag is not there: a plain replay, the historical
+ *   no-golden behaviour.
+ * - "value" — the flag carries a non-empty path that is not itself a flag.
+ * - "missing" — the flag is present but its value is absent: it is the last
+ *   token, it is an empty string (`--assert ""`, the classic empty-env-var
+ *   expansion), it is `--assert=`, or the next token starts with `--`.
+ *   That is a command-line mistake, never a disabled assertion: callers exit
+ *   non-zero before reading the tape, building, or booting.
+ *
+ * A lone "-" or any other value is treated as a literal path; a path that
+ * starts with "--" can be passed with the attached form `--assert=--path`.
+ */
+export function parseAssertArg(argv: readonly string[]): AssertArg {
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === "--assert") {
+      const next = argv[i + 1];
+      if (next === undefined) {
+        return {
+          kind: "missing",
+          reason:
+            "--assert requires a golden hashes file path, but no value follows it " +
+            "(--assert is the last argument)",
+        };
+      }
+      if (next === "") {
+        return {
+          kind: "missing",
+          reason:
+            "--assert requires a golden hashes file path, but got an empty string " +
+            "(did an empty variable expand into --assert \"\"?)",
+        };
+      }
+      if (next.startsWith("--")) {
+        return {
+          kind: "missing",
+          reason:
+            `--assert requires a golden hashes file path, but the next argument is the flag "${next}" ` +
+            "(use --assert=<path> if the path itself starts with --)",
+        };
+      }
+      return { kind: "value", value: next };
+    }
+    if (token.startsWith("--assert=")) {
+      const value = token.slice("--assert=".length);
+      if (value === "") {
+        return {
+          kind: "missing",
+          reason: "--assert requires a golden hashes file path, but got an empty value (--assert=)",
+        };
+      }
+      return { kind: "value", value };
+    }
+  }
+  return { kind: "absent" };
 }
 
 /** FNV-1a 32-bit over the RGBA framebuffer — cheap, deterministic, hex. */
@@ -175,6 +248,15 @@ export function parseAssertHashes(
     const kind = doc === null ? "null" : Array.isArray(doc) ? "array" : typeof doc;
     throw new Error(`${path}: assert root must be an object {app, frames, hashes} (got ${kind})`);
   }
+  // A real plain JSON object: JSON.parse only produces Object.prototype roots.
+  // A class instance (Date, Map, …) carrying lookalike fields is not a golden.
+  const proto = Object.getPrototypeOf(doc);
+  if (proto !== Object.prototype && proto !== null) {
+    throw new Error(
+      `${path}: assert root must be an object {app, frames, hashes} ` +
+        "(got an object with a non-standard prototype)",
+    );
+  }
   const root = doc as Record<string, unknown>;
   if (typeof root.app !== "string") {
     throw new Error(`${path}: assert golden must set string field "app"`);
@@ -247,6 +329,16 @@ function loadAssertHashes(path: string, app: string, frameCount: number): string
 // ---------------------------------------------------------------------------
 
 async function cmdReplay(app: string, tapePathArg: string): Promise<void> {
+  // Parse --assert before touching the tape, the build, or the replay: a
+  // present-but-valueless flag (typo, empty env expansion) is a command-line
+  // error, and the assertion request must never degrade into no assertions.
+  const assertArg = parseAssertArg(process.argv);
+  if (assertArg.kind === "missing") {
+    console.error(`tape: ${assertArg.reason}`);
+    console.error("usage: bun tools/tape.ts replay <app> <tape.json> --assert <hashes.json>");
+    process.exit(1);
+  }
+  const assertPath = assertArg.kind === "value" ? assertArg.value : undefined;
   const tape = loadTape(tapePathArg);
   const masks = expandTape(tape);
   const analogs = expandTapeAnalog(tape);
@@ -254,7 +346,6 @@ async function cmdReplay(app: string, tapePathArg: string): Promise<void> {
   const touches = expandTapeTouch(tape);
   const touchSurfaces = expandTapeTouchSurfaces(tape);
   const hashesOut = argValue("--hashes");
-  const assertPath = argValue("--assert");
   const pngFrames = new Set(
     (argValue("--png") ?? "").split(",").filter(Boolean).map((s) => Number(s)),
   );
