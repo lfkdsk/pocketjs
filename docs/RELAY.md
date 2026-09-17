@@ -309,14 +309,37 @@ leave the sender FIFO; a frame never reorders inside its stream.
 
 ## Resource identity
 
-`ResourceRef` is `{kind, ns, key, revision?, rendition}`. The cache identity
-is the six-tuple `(authenticatedAuthority, ns, kind, key, revision,
-rendition)`; the authority is the pinned session/namespace grant, so it is
-not repeated in the key. `revision` is opaque: a get may omit it to request
-the current revision, and every response or push carries the concrete
+`ResourceRef` is `{kind, ns, key, revision?, rendition}`. The wire identity
+tuple named in draft §3.5 is `(authenticatedAuthority, ns, kind, key,
+revision, rendition)`; the authority is the pinned session/namespace grant, so
+it is not repeated in a local key. `revision` is opaque: a get may omit it to
+request the current revision, and every response or push carries the concrete
 value. **`rendition` binds codec, dimensions, density, style and font bytes;
 a source hash alone is not a rendition identity.** A wire reference never
 carries a local texture or surface handle.
+
+**The local fence/entry key omits `revision`: it is `(kind, ns, key,
+rendition)`, and the concrete revision is compared separately.** A get that
+omits revision and its response naming a concrete revision must hit one
+generation counter, or a key-scope invalidate could not fence the in-flight
+get (draft §3.8 makes a key/namespace invalidate move the generation of
+*every* revision, which a per-revision counter cannot express). Key and
+namespace scope advance that one revision-free generation and mark the
+resident value stale; revision scope compares the concrete revision, removes
+only the matching resident entry, and records the invalidated revision on an
+in-flight get so a late response naming that revision is dropped with
+`RESYNC_REQUIRED` while a response for a newer revision may still land. The
+resident cache holds the current concrete revision under the revision-less
+key; publishing a newer revision replaces it at a frame boundary.
+
+**Draft errata (§3.5 cache key).** The draft lists `revision` inside the
+cache-key tuple while also permitting a revisionless get and requiring a
+key-scope invalidate to move every revision. The three statements do not
+share one key: a literal per-revision key gives the revisionless get and its
+concrete response two unrelated counters. The implementation keeps
+`revision` in the *wire* identity tuple and on every entry/response, but
+excludes it from the *local generation-fence* key, comparing it separately.
+This is a reconciliation of the three clauses, not a second identity scheme.
 
 The L2 state machines live in `framework/src/relay/resource.ts`
 (`RelayResourceClient` on the consumer, `RelayResourceAuthority` on the
@@ -339,10 +362,14 @@ against the schemas in `contracts/spec/relay.ts`.
   `value.subscription`, a session-scoped u32 that is never reused after
   unsubscribe. A reliable delta carries a top-level `baseRevision` and
   applies only when the base equals the held revision; a mismatch sets
-  `resyncRequired` instead of guessing the base. A latest-snapshot
-  re-delivery of the held revision is idempotent. resource.unsubscribe
-  terminates the subscription; pushes already on the wire are consumed and
-  dropped.
+  `resyncRequired` instead of guessing the base, and a delta alone never
+  advances the held revision or clears the flag. **Recovery is a full
+  snapshot — a push with no `baseRevision`: it re-establishes the held
+  revision on any revision and clears `resyncRequired`, so the next matching
+  delta applies; the object at the resync boundary is still delivered marked
+  `resyncRequired`.** A latest-snapshot re-delivery of the held revision is
+  idempotent. resource.unsubscribe terminates the subscription; pushes
+  already on the wire are consumed and dropped.
 - **resource.release** ends an explicit provider `lease:u32` on remote
   residence. Local cache disposal is a different operation.
 
@@ -356,7 +383,11 @@ repeat `resource`/`codec`/`transfer.id`/`total`/`digest`; offsets run
 contiguously from 0, and the final chunk carries `final:true` with
 `offset + dataBytes == total`. A gap, overlap, identity change, transfer-id
 reuse or over-range offset rejects the assembly as `INVALID` and drops its
-scratch. The SHA-256 `digest` is verified over the assembled bytes
+scratch. **An assembly key is `(stream, id-space, id)`: RESPONSE deliveries
+use the get correlation space and PUSH deliveries the subscription id space.
+The two allocators start at 1 independently, so a get correlation 1 and
+subscription id 1 coexist on one stream and never collide.** The SHA-256
+`digest` is verified over the assembled bytes
 (`framework/src/relay/sha256.ts`, a pure-TS hash because the QuickJS guest
 has no node:crypto or WebCrypto). The assembled object is returned once,
 after the digest passes; **a half object never reaches the cache or a
@@ -372,14 +403,23 @@ assembly scratch (`maxAssemblies`, `maxScratchBytes`) is separate from the
 resident reservation; both are receiver guarantees negotiated in
 `rxLimits`.
 
+**A conditional get that comes back `notModified` does not replace the
+resident value.** The loader completes with a `revalidated` result: the
+cache keeps the existing `ready` bytes, runs neither `materialize` nor
+`dispose`, and refreshes the entry age, so a §3.8 TTL revalidate cannot turn
+a resident tile into an empty value. A `revalidated` result delivered while
+no value is resident fails the entry.
+
 Two distinct operations use the INVALIDATE frame type:
 
 - **resource.invalidate** is authority-to-consumer and reliable, with
-  `scope:"revision" | "key" | "namespace"`. It advances a per-identity
-  local generation; a revision-scope invalidation deletes the local entry,
-  while key/namespace scope retain the value marked stale. A late get
-  response stamped with an older generation is dropped with
-  `RESYNC_REQUIRED`, and a subscription in scope is marked for resync.
+  `scope:"revision" | "key" | "namespace"`. Key/namespace scope advance the
+  revision-free local generation and retain the value marked stale; revision
+  scope removes only the resident entry whose concrete revision matches and
+  records that revision on an in-flight get. A late get response stamped
+  with an older generation, or naming a revision invalidated in flight, is
+  dropped with `RESYNC_REQUIRED`; a response for a newer revision may still
+  land. A subscription in scope is marked for resync.
 - **cache.evict** is consumer-to-provider advisory only
   (`reason:"budget" | "view-close"`). It states that the consumer no longer
   holds a copy; **the provider may ignore it and there is no ACK.** Remote
