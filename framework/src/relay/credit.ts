@@ -15,7 +15,11 @@
  *
  * Sideband (two 256-byte slots per direction) is a separate bounded lane for
  * relay.credit, relay.ping, relay.reset and CANCEL. Sideband frames take
- * stream-0 seq but consume no normal window and earn no credit. */
+ * stream-0 seq but consume no normal window and earn no credit. The sender
+ * admits/drains them through RelaySideband; the receiver classifies decoded
+ * records with isSidebandFrame(), stages them in its own two-slot lane
+ * (ingestSideband/pumpSideband), and never charges them to the control
+ * slice. */
 
 import {
   RELAY_EFFECT,
@@ -262,6 +266,24 @@ export class RelayCreditLedger {
   }
 }
 
+// --- sideband whitelist (both directions) --------------------------------------
+
+/** §3.9 sideband whitelist, identical in both directions: a record rides the
+ * reserved lane only on stream 0 and only as credit, ping/pong, reset or
+ * CANCEL. Every other stream-0 record is an ordinary management frame that
+ * consumes the normal control slice. The send lane checks prepared bodies
+ * (metadata already serialized); the receiver checks decoded frames. */
+export function isSidebandFrame(f: { type: number; stream: number; metadata: { op?: unknown } }): boolean {
+  if (f.stream !== 0) return false;
+  const op = f.metadata?.op;
+  if (f.type === RELAY_TYPE.CANCEL) return op === RELAY_OP.REQUEST_CANCEL;
+  if (f.type === RELAY_TYPE.PUSH) return op === RELAY_OP.CREDIT || op === RELAY_OP.RESET;
+  if (f.type === RELAY_TYPE.REQUEST || f.type === RELAY_TYPE.RESPONSE) {
+    return op === RELAY_OP.PING;
+  }
+  return false;
+}
+
 // --- outbound sideband lane ----------------------------------------------------
 
 interface SidebandItem {
@@ -312,14 +334,11 @@ export class RelaySideband {
   }
 
   private whitelisted(body: RelayPreparedBody): boolean {
-    if (body.stream !== 0) return false;
-    const op = this.opOf(body);
-    if (body.type === RELAY_TYPE.CANCEL) return op === RELAY_OP.REQUEST_CANCEL;
-    if (body.type === RELAY_TYPE.PUSH) return op === RELAY_OP.CREDIT || op === RELAY_OP.RESET;
-    if (body.type === RELAY_TYPE.REQUEST || body.type === RELAY_TYPE.RESPONSE) {
-      return op === RELAY_OP.PING;
-    }
-    return false;
+    return isSidebandFrame({
+      type: body.type,
+      stream: body.stream,
+      metadata: { op: this.opOf(body) },
+    });
   }
 
   private opOf(body: RelayPreparedBody): string {
@@ -780,22 +799,37 @@ interface HeldFrame {
 }
 
 /** Receive side for one direction: contiguous-seq staging bounded by the
- * granted per-stream window. A frame past the window is a peer protocol
- * error (the adapter is required to hold every granted frame), never a
- * silent drop; the transport applies backpressure by stopping reads while
- * staging is full (compare hosts/3ds/src/offload.c, which leaves a full
- * incoming queue in the ready state and reads nothing). Seq holes/repeats
- * stop the stream (stream 0 kills the session). Frames leave staging
- * through pump() and keep occupying window until release(), the only point
- * at which wire credit returns. */
+ * granted per-stream window, plus a §3.9 reserved inbound sideband lane.
+ *
+ * A frame past the normal window is a peer protocol error (the adapter is
+ * required to hold every granted frame), never a silent drop; the transport
+ * applies backpressure by stopping reads while staging is full (compare
+ * hosts/3ds/src/offload.c, which leaves a full incoming queue in the ready
+ * state and reads nothing). Seq holes/repeats stop the stream (stream 0
+ * kills the session). Normal frames leave staging through pump() and keep
+ * occupying window until release(), the only point at which wire credit
+ * returns.
+ *
+ * Whitelisted stream-0 records (relay.credit, ping/pong, relay.reset,
+ * CANCEL) use the separate two-slot / 256-byte inbound lane: they advance
+ * the same stream-0 seq as ordinary stream-0 management frames, but occupy
+ * no normal window and earn no credit. The transport classifies a decoded
+ * record with isSidebandFrame(), gates reads on canIngestSideband(), and
+ * takes delivered controls from pumpSideband(). A record past the reserved
+ * capacity is a stream-0 protocol error (§3.9: the adapter must hold every
+ * granted sideband record). */
 export class RelayReceiver {
   private held = new Map<number, HeldFrame[]>();
   private outstanding = new Map<string, HeldFrame & { stream: number; seq: number }>();
   private expected = new Map<number, number>();
   /** Window occupancy per stream: staged frames plus delivered frames not
    * yet released. A frame occupies its granted slot from ingest until
-   * release/reset; late drops never enter this count. */
+   * release/reset; late drops never enter this count. Sideband frames are
+   * never counted here. */
   private occ = new Map<number, RelayStreamAlloc>();
+  /** Inbound reserved lane (§3.9: two 256-byte slots per direction). */
+  private sideHeld: HeldFrame[] = [];
+  private sideBytes = 0;
   private dead = new Set<number>();
   private stopped = new Set<number>();
   private finishedAssoc = new Set<string>();
@@ -806,8 +840,10 @@ export class RelayReceiver {
     private session: bigint,
     private allocations: ReadonlyMap<number, RelayStreamAlloc>,
     private readonly creditTable: RelayCreditTable,
-    private readonly maxStreams = RELAY_LIMITS.maxStreams,
-    private readonly deliveryPerPump = 1,
+    private readonly maxStreams: number = RELAY_LIMITS.maxStreams,
+    private readonly deliveryPerPump: number = 1,
+    private readonly sideSlots: number = RELAY_LIMITS.sidebandSlots,
+    private readonly sideSlotBytes: number = RELAY_LIMITS.sidebandSlotBytes,
   ) {}
 
   beginSession(session: bigint, allocations: ReadonlyMap<number, RelayStreamAlloc>) {
@@ -817,6 +853,8 @@ export class RelayReceiver {
     this.outstanding.clear();
     this.expected.clear();
     this.occ.clear();
+    this.sideHeld = [];
+    this.sideBytes = 0;
     this.dead.clear();
     this.stopped.clear();
     this.finishedAssoc.clear();
@@ -854,12 +892,62 @@ export class RelayReceiver {
 
   /** True while one more record of wireBytes stays inside the stream's
    * granted window. The transport calls this before recv; false means stop
-   * reading (backpressure), never discard the next frame. */
+   * reading (backpressure), never discard the next frame. Records
+   * isSidebandFrame() classifies as sideband are gated on
+   * canIngestSideband instead, so a full normal control slice does not
+   * block the reserved lane. */
   canIngest(stream: number, wireBytes: number): boolean {
     const cap = this.allocations.get(stream);
     if (!cap || this.dead.has(stream) || this.stopped.has(stream)) return false;
     const use = this.occ.get(stream) ?? { frames: 0, bytes: 0 };
     return use.frames + 1 <= cap.frames && use.bytes + wireBytes <= cap.bytes;
+  }
+
+  /** Staged occupancy of the inbound reserved lane. */
+  sidebandOccupancy(): RelayStreamAlloc {
+    return { frames: this.sideHeld.length, bytes: this.sideBytes };
+  }
+
+  /** True while one more whitelisted record of wireBytes fits the reserved
+   * lane (two 256-byte slots). Independent of the normal stream-0 slice:
+   * the lane stays readable while both normal control slots are held. */
+  canIngestSideband(wireBytes: number): boolean {
+    if (this.sessionFatal) return false;
+    return this.sideHeld.length < this.sideSlots
+      && wireBytes <= this.sideSlotBytes
+      && this.sideBytes + wireBytes <= this.sideSlots * this.sideSlotBytes;
+  }
+
+  /** Ingests one decoded record classified by isSidebandFrame(). The
+   * record advances the same stream-0 seq expectation as ordinary
+   * stream-0 management frames, occupies no normal window and earns no
+   * credit. A non-whitelisted record is SIDEBAND_FORBIDDEN; a record past
+   * the reserved capacity or over 256 bytes is a stream-0 protocol error
+   * (§3.9: the adapter must hold every granted sideband record). */
+  ingestSideband(frame: RelayDecodedFrame, recordLength: number): P3Result {
+    if (frame.session !== this.session || this.sessionFatal) {
+      return { ok: false, code: RELAY_P3_ERROR.SESSION_FATAL };
+    }
+    if (frame.stream !== 0 || !isSidebandFrame(frame)) {
+      return { ok: false, code: RELAY_P3_ERROR.SIDEBAND_FORBIDDEN };
+    }
+    if (recordLength > this.sideSlotBytes
+      || this.sideHeld.length >= this.sideSlots
+      || this.sideBytes + recordLength > this.sideSlots * this.sideSlotBytes) {
+      this.sessionFatal = true;
+      return { ok: false, code: RELAY_P3_ERROR.SESSION_FATAL };
+    }
+    // Stream-0 seq is shared with the normal lane: a hole or repeat ends
+    // the session, whether the record rode the lane or the slice.
+    const want = this.expected.get(0) ?? 1;
+    if (frame.seq !== want) {
+      this.sessionFatal = true;
+      return { ok: false, code: RELAY_P3_ERROR.SESSION_FATAL };
+    }
+    this.expected.set(0, frame.seq >= 0xffffffff ? 0xffffffff : frame.seq + 1);
+    this.sideHeld.push({ frame, wireBytes: recordLength });
+    this.sideBytes += recordLength;
+    return { ok: true };
   }
 
   /** Ingests one decoded record. `recordLength` is the full wire length
@@ -873,6 +961,12 @@ export class RelayReceiver {
     const { stream, seq } = frame;
     if (stream > this.maxStreams || !this.allocations.has(stream)) {
       return { ok: false, code: RELAY_P3_ERROR.STREAM_LIMIT };
+    }
+    // A whitelisted stream-0 record belongs on ingestSideband; routing it
+    // through the normal path would charge the control slice it must not
+    // use. This is a local dispatch error, not a peer fault.
+    if (stream === 0 && isSidebandFrame(frame)) {
+      return { ok: false, code: RELAY_P3_ERROR.SIDEBAND_FORBIDDEN };
     }
     if (this.stopped.has(stream)) {
       return { ok: false, code: stream === 0 ? RELAY_P3_ERROR.SESSION_FATAL : RELAY_P3_ERROR.SEQ_GAP };
@@ -948,6 +1042,29 @@ export class RelayReceiver {
     return stream > this.rr ? stream - this.rr : stream + this.maxStreams + 1 - this.rr;
   }
 
+  /** Delivers staged sideband controls in FIFO order. These frames occupy
+   * no normal window, so no handle/release cycle exists: taking one frees
+   * its reserved slot at once and earns no credit. The session layer runs
+   * the side effect (apply relay.credit, answer a ping, apply reset,
+   * dispatch CANCEL). The caller processes every returned frame; the lane
+   * budget is the worker-turn bound (§3.9: at most two per turn). */
+  pumpSideband(maxFrames = this.sideSlots): RelayReceived[] {
+    const n = Math.min(maxFrames, this.sideHeld.length);
+    const out: RelayReceived[] = [];
+    for (let i = 0; i < n; i++) {
+      const held = this.sideHeld.shift()!;
+      this.sideBytes -= held.wireBytes;
+      out.push({
+        frame: held.frame,
+        handle: `side:0:${held.frame.seq}`,
+        wireBytes: held.wireBytes,
+        stream: 0,
+        seq: held.frame.seq,
+      });
+    }
+    return out;
+  }
+
   /** Staging releases after the frame is consumed or moved into a reserved
    * bounded assembler/result mailbox; that is the only point wire credit
    * returns (§3.9). */
@@ -992,7 +1109,13 @@ export class RelayReceiver {
     this.expected.delete(stream);
     this.stopped.delete(stream);
     this.dead.add(stream);
-    if (stream === 0) this.sessionFatal = true;
+    if (stream === 0) {
+      // Stream 0 ends the attachment: the reserved lane staging is
+      // discarded and undelivered controls earn no credit.
+      this.sideHeld = [];
+      this.sideBytes = 0;
+      this.sessionFatal = true;
+    }
     return { ok: true, failed, reason };
   }
 }

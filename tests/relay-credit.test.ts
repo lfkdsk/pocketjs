@@ -9,7 +9,7 @@ import {
   RELAY_OP,
   RELAY_TYPE,
 } from "../contracts/spec/relay.ts";
-import { decodeFrame, encodePreparedFrame, prepareFrameBody } from "../framework/src/relay/frame.ts";
+import { decodeFrame, encodePreparedFrame, prepareFrameBody, type RelayDecodedFrame } from "../framework/src/relay/frame.ts";
 import {
   RELAY_P3_ERROR,
   RELAY_PRIORITY,
@@ -20,7 +20,9 @@ import {
   RelaySender,
   RelaySideband,
   clipUtf8Bytes,
+  isSidebandFrame,
   type RelayPriority,
+  type RelayReceived,
 } from "../framework/src/relay/credit.ts";
 
 // R5 §3.9 proposal numbers (contracts/spec/relay.ts RELAY_LIMITS).
@@ -91,8 +93,12 @@ class Endpoint {
   }
 }
 
-/** Moves A's pumped frames to B (relay.credit applied, normal frames
- * ingested) and delivers one staged frame per B pump round. */
+/** Moves A's pumped frames to B. Whitelisted stream-0 records (credit,
+ * ping/pong, reset, CANCEL) cross B's inbound reserved sideband lane: they
+ * pass canIngestSideband/ingestSideband, come out pumpSideband, occupy no
+ * normal window and earn no credit. relay.credit is applied on arrival;
+ * other controls are handed back for the caller to assert. Normal frames
+ * ingest against the granted slices and one per pump round delivers. */
 function transport(from: Endpoint, to: Endpoint): string[] {
   const pumped = from.sender.pump();
   if (!pumped.ok) throw new Error(pumped.code);
@@ -100,13 +106,22 @@ function transport(from: Endpoint, to: Endpoint): string[] {
     const dec = decodeFrame(bytes);
     if (!dec.ok) throw new Error(dec.code);
     const f = dec.frame;
-    if (f.type === RELAY_TYPE.PUSH && f.metadata.op === RELAY_OP.CREDIT) {
-      const applied = to.sender.applyCredit({
-        targetStream: f.metadata.targetStream as number,
-        framesReleased: f.metadata.framesReleased as string,
-        bytesReleased: f.metadata.bytesReleased as string,
-      });
-      if (!applied.ok) throw new Error(applied.code);
+    if (isSidebandFrame(f)) {
+      if (!to.receiver.canIngestSideband(bytes.length)) throw new Error("sideband lane full");
+      const sideIn = to.receiver.ingestSideband(f, bytes.length);
+      if (!sideIn.ok) throw new Error(sideIn.code);
+      // Reserved lane traffic never touches the normal control slice.
+      expect(to.receiver.occupancyStream(0)).toEqual({ frames: 0, bytes: 0 });
+      const [control] = to.receiver.pumpSideband();
+      expect(control?.seq).toBe(f.seq);
+      if (f.type === RELAY_TYPE.PUSH && f.metadata.op === RELAY_OP.CREDIT) {
+        const applied = to.sender.applyCredit({
+          targetStream: f.metadata.targetStream as number,
+          framesReleased: f.metadata.framesReleased as string,
+          bytesReleased: f.metadata.bytesReleased as string,
+        });
+        if (!applied.ok) throw new Error(applied.code);
+      }
       continue;
     }
     const ingested = to.receiver.ingest(f, bytes.length);
@@ -579,6 +594,212 @@ test("request table: maxPending=8; cancel does not release a slot; 2 slots reser
   });
   expect(table.consumeTerminal(1).ok).toBe(true);
   expect(table.active).toBe(7);
+});
+
+// ---------------------------------------------------------------------------
+// Step 6 — inbound reserved sideband lane (review 963 blocker B1)
+// ---------------------------------------------------------------------------
+
+const OPEN_META = {
+  op: RELAY_OP.OPEN, app: "app", namespace: "ns",
+  profile: { name: "pocket-map", version: 1 },
+};
+
+/** Pumps A once and returns each wire record with its decoded frame. */
+function pumpDecoded(ep: Endpoint): Array<{ bytes: Uint8Array; frame: RelayDecodedFrame }> {
+  const out = ep.sender.pump();
+  if (!out.ok) throw new Error(out.code);
+  return out.frames.map((bytes) => {
+    const dec = decodeFrame(bytes);
+    if (!dec.ok) throw new Error(dec.code);
+    return { bytes, frame: dec.frame };
+  });
+}
+
+test("receive sideband (CE-1): an inbound CANCEL rides the reserved lane, occupies no normal control window and earns no credit", () => {
+  const a = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 8192 } }]);
+  const b = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 8192 } }]);
+  expect(a.sender.cancel(1, 7, "user left").ok).toBe(true);
+  const [{ bytes, frame }] = pumpDecoded(a);
+  expect(frame.type).toBe(RELAY_TYPE.CANCEL);
+
+  // The reserved lane is readable even though no normal stream-0 frame was
+  // ever granted, and admission does not touch the control slice.
+  expect(b.receiver.canIngestSideband(bytes.length)).toBe(true);
+  const ing = b.receiver.ingestSideband(frame, bytes.length);
+  expect(ing.ok).toBe(true);
+  expect(b.receiver.occupancyStream(0)).toEqual({ frames: 0, bytes: 0 });
+  expect(b.receiver.sidebandOccupancy()).toEqual({ frames: 1, bytes: bytes.length });
+
+  // The control comes out the sideband pump and frees its reserved slot
+  // without a release() call or any relay.credit row.
+  const [control] = b.receiver.pumpSideband();
+  expect(control.handle).toBe(`side:0:${frame.seq}`);
+  expect(b.receiver.sidebandOccupancy()).toEqual({ frames: 0, bytes: 0 });
+  expect(b.creditTable.counters(0)).toBeUndefined();
+});
+
+test("receive sideband (CE-2): no stream-0 credit is produced for a CANCEL, so the peer ledger never sees CREDIT_RANGE", () => {
+  const a = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 8192 } }]);
+  const b = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 8192 } }]);
+  expect(a.sender.cancel(1, 7, "user left").ok).toBe(true);
+  const [{ bytes, frame }] = pumpDecoded(a);
+  expect(b.receiver.ingestSideband(frame, bytes.length).ok).toBe(true);
+  b.receiver.pumpSideband();
+  // Before the fix this row existed (1 frame / wireBytes) and applying it
+  // to A failed CREDIT_RANGE because A charged the CANCEL to no window.
+  expect(b.creditTable.counters(0)).toBeUndefined();
+  // The CANCEL consumed no normal window on A either; a stream-0 credit
+  // claiming one frame is still out of range and must be rejected.
+  expect(a.sender.ledgerView().sentTotals(0)).toEqual({ frames: 0, bytes: 0 });
+  const bogus = a.sender.applyCredit({
+    targetStream: 0,
+    framesReleased: "0000000000000001",
+    bytesReleased: bytes.length.toString(16).padStart(16, "0"),
+  });
+  expect(bogus.code).toBe(RELAY_P3_ERROR.CREDIT_RANGE);
+});
+
+test("receive sideband (CE-3): a full normal control slice does not block the reserved lane; seq stays shared", () => {
+  const a = new Endpoint(SESSION, []);
+  const b = new Endpoint(SESSION, []);
+  // Fill B's normal stream-0 slice (2 frames) with ordinary OPEN frames.
+  for (const corr of [1, 2]) {
+    expect(a.sender.admit({
+      type: RELAY_TYPE.REQUEST, stream: 0, correlation: corr,
+      priority: RELAY_PRIORITY.CONTROL, metadata: OPEN_META,
+    }).ok).toBe(true);
+  }
+  const normal = pumpDecoded(a);
+  expect(normal.length).toBe(2);
+  for (const { bytes, frame } of normal) {
+    expect(b.receiver.canIngest(0, bytes.length)).toBe(true);
+    expect(b.receiver.ingest(frame, bytes.length).ok).toBe(true);
+  }
+  // The transport must stop reading normal stream-0 records here.
+  expect(b.receiver.occupancyStream(0).frames).toBe(2);
+  expect(b.receiver.canIngest(0, 100)).toBe(false);
+  // The reserved lane still carries a CANCEL past the full slice.
+  expect(a.sender.cancel(1, 9, "user left").ok).toBe(true);
+  const [side] = pumpDecoded(a);
+  expect(isSidebandFrame(side.frame)).toBe(true);
+  expect(b.receiver.canIngestSideband(side.bytes.length)).toBe(true);
+  expect(b.receiver.ingestSideband(side.frame, side.bytes.length).ok).toBe(true);
+  expect(b.receiver.occupancyStream(0).frames).toBe(2); // normal slice untouched
+  expect(b.receiver.sidebandOccupancy().frames).toBe(1);
+
+  // Stream-0 seq is one space: normal OPEN took 1,2 and CANCEL took 3.
+  const seqs = [normal[0]!.frame.seq, normal[1]!.frame.seq, side.frame.seq];
+  expect(seqs).toEqual([1, 2, 3]);
+  // Consume one normal frame (its release notes ordinary stream-0 credit),
+  // then the next ordinary stream-0 record seq 4 ingests with no gap.
+  const [h1] = b.receiver.pump().map((r) => r.handle);
+  expect(h1).toBe("0:1");
+  expect(b.receiver.release(h1).ok).toBe(true);
+  // Return the stream-0 credit so A's control slice has one slot again.
+  transport(b, a);
+  expect(a.sender.admit({
+    type: RELAY_TYPE.REQUEST, stream: 0, correlation: 3,
+    priority: RELAY_PRIORITY.CONTROL, metadata: OPEN_META,
+  }).ok).toBe(true);
+  const [next] = pumpDecoded(a);
+  expect(next.frame.seq).toBe(4);
+  expect(b.receiver.ingest(next.frame, next.bytes.length).ok).toBe(true);
+  // The staged CANCEL still delivers once the session layer pumps the lane.
+  const [cancel] = b.receiver.pumpSideband();
+  expect(cancel.frame.type).toBe(RELAY_TYPE.CANCEL);
+  expect(cancel.seq).toBe(3);
+});
+
+test("receive sideband (CE-4): a sideband record between two normal stream-0 records opens no seq gap", () => {
+  const a = new Endpoint(SESSION, []);
+  const b = new Endpoint(SESSION, []);
+  const open = (corr: number) => a.sender.admit({
+    type: RELAY_TYPE.REQUEST, stream: 0, correlation: corr,
+    priority: RELAY_PRIORITY.CONTROL, metadata: OPEN_META,
+  });
+
+  // Pump 1: ordinary stream-0 management REQUEST -> seq 1.
+  expect(open(1).ok).toBe(true);
+  const [f1] = pumpDecoded(a);
+  expect(f1.frame.seq).toBe(1);
+  // Pump 2: CANCEL on the lane -> seq 2 (no normal window charged).
+  expect(a.sender.cancel(1, 7, "user left").ok).toBe(true);
+  const [fSide] = pumpDecoded(a);
+  expect(fSide.frame.seq).toBe(2);
+  expect(isSidebandFrame(fSide.frame)).toBe(true);
+  // Pump 3: another ordinary stream-0 management REQUEST -> seq 3.
+  expect(open(2).ok).toBe(true);
+  const [f3] = pumpDecoded(a);
+  expect(f3.frame.seq).toBe(3);
+
+  // Both paths share one stream-0 expectation: normal, sideband, normal.
+  expect(b.receiver.ingest(f1.frame, f1.bytes.length).ok).toBe(true);
+  expect(b.receiver.ingestSideband(fSide.frame, fSide.bytes.length).ok).toBe(true);
+  expect(b.receiver.ingest(f3.frame, f3.bytes.length).ok).toBe(true);
+  expect(b.receiver.sessionFatal).toBe(false);
+  // The sideband control occupies its own slot; the two OPEN frames occupy
+  // the normal slice; the seq cursor is at 4.
+  expect(b.receiver.occupancyStream(0)).toEqual({
+    frames: 2,
+    bytes: f1.bytes.length + f3.bytes.length,
+  });
+  expect(b.receiver.sidebandOccupancy().frames).toBe(1);
+  // Delivery keeps the two record classes distinguishable.
+  expect(b.receiver.pump().map((r) => r.handle)).toEqual(["0:1"]);
+  expect(b.receiver.pumpSideband().map((r) => r.handle)).toEqual(["side:0:2"]);
+  expect(b.receiver.pump().map((r) => r.handle)).toEqual(["0:3"]);
+  // Routing a whitelisted record through the normal path is a local
+  // dispatch error and leaves the seq cursor untouched.
+  expect(a.sender.cancel(1, 8, "again").ok).toBe(true);
+  const [fSide2] = pumpDecoded(a);
+  expect(fSide2.frame.seq).toBe(4);
+  expect(b.receiver.ingest(fSide2.frame, fSide2.bytes.length).code)
+    .toBe(RELAY_P3_ERROR.SIDEBAND_FORBIDDEN);
+  expect(b.receiver.ingestSideband(fSide2.frame, fSide2.bytes.length).ok).toBe(true);
+});
+
+test("receive sideband: a third staged control cannot be held and is a stream-0 protocol error", () => {
+  const rx = new RelayReceiver(
+    SESSION, new Map([[0, controlSlice()]]), new RelayCreditTable(), RELAY_LIMITS.maxStreams, 1,
+  );
+  const cancel = (seq: number) => {
+    const bytes = wireRecord(0, seq, seq, {
+      op: RELAY_OP.REQUEST_CANCEL, targetStream: 1, reason: "x",
+    }, RELAY_TYPE.CANCEL);
+    const dec = decodeFrame(bytes);
+    if (!dec.ok) throw new Error(dec.code);
+    return { bytes, frame: dec.frame };
+  };
+  const c1 = cancel(1), c2 = cancel(2), c3 = cancel(3);
+  expect(c1.bytes.length).toBeLessThanOrEqual(256);
+  expect(rx.ingestSideband(c1.frame, c1.bytes.length).ok).toBe(true);
+  expect(rx.ingestSideband(c2.frame, c2.bytes.length).ok).toBe(true);
+  // Two slots are the reservation: the transport stops reading the lane.
+  expect(rx.canIngestSideband(c3.bytes.length)).toBe(false);
+  const overflow = rx.ingestSideband(c3.frame, c3.bytes.length);
+  expect(overflow.code).toBe(RELAY_P3_ERROR.SESSION_FATAL);
+  expect(rx.sessionFatal).toBe(true);
+});
+
+test("receive sideband: business records and non-whitelisted stream-0 ops stay off the lane", () => {
+  const rx = new RelayReceiver(
+    SESSION, new Map([[0, controlSlice()], [1, { frames: 2, bytes: 2 * GET_WIRE }]]),
+    new RelayCreditTable(), RELAY_LIMITS.maxStreams, 1,
+  );
+  // A business REQUEST on a nonzero stream is not lane traffic.
+  const biz = wireRecord(1, 1, 1, GET_META);
+  const bizDec = decodeFrame(biz);
+  if (!bizDec.ok) throw new Error(bizDec.code);
+  expect(rx.ingestSideband(bizDec.frame, biz.length).code).toBe(RELAY_P3_ERROR.SIDEBAND_FORBIDDEN);
+  // An ordinary stream-0 PUSH with a non-whitelisted op stays normal and
+  // still consumes the control slice.
+  const mgmt = wireRecord(0, 1, 0, { op: "relay.close" }, RELAY_TYPE.PUSH);
+  const mgmtDec = decodeFrame(mgmt);
+  if (!mgmtDec.ok) throw new Error(mgmtDec.code);
+  expect(isSidebandFrame(mgmtDec.frame)).toBe(false);
+  expect(rx.ingestSideband(mgmtDec.frame, mgmt.length).code).toBe(RELAY_P3_ERROR.SIDEBAND_FORBIDDEN);
+  expect(rx.ingest(mgmtDec.frame, mgmt.length).ok).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
