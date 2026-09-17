@@ -990,3 +990,96 @@ test("adapter declines (returns false) on BUSY so the scheduler retries next fra
   const second = load(tileRef("b"), () => {});
   expect(second).toBe(false);
 });
+
+test("F4: a notModified revalidation keeps the resident bytes instead of materializing 0 bytes", () => {
+  const TILE_BYTES = 4096;
+  const { wire, client } = makeClient({ maxObjectBytes: TILE_BYTES });
+  const auth = new RelayResourceAuthority({ maxWireBytes: 65536 });
+  const scheduler = createResourceScheduler({
+    maxConcurrent: 1, startsPerFrame: 1, completionsPerFrame: 1, maxCollections: 1,
+  });
+  const ref: RelayResourceRef = {
+    kind: RELAY_KIND.TILE, ns: "doc/demo", key: "page-1/tile/0",
+    revision: "layout-12", rendition: "coverage2-256x16-v1",
+  };
+  let materializations = 0;
+  const cache = scheduler.createCache<RelayResourceRef, Uint8Array, Uint8Array>({
+    key: relayResourceKey,
+    maxEntries: 1, maxCost: TILE_BYTES, maxResponseBytes: TILE_BYTES,
+    cost: () => TILE_BYTES, maxAgeFrames: 1,
+    load: createRelayResourceLoad({
+      client, stream: 1, accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: TILE_BYTES,
+      ifRevisionFor: (input) => input.revision,
+    }),
+    materialize: (raw) => { materializations++; return raw; },
+  });
+  cache.reconcile([{ input: ref, priority: 0 }]);
+
+  // Round 1: a real 4096 B object lands in the cache.
+  scheduler.step();
+  for (const req of wire.sent.splice(0)) {
+    for (const env of auth.chunkObject({
+      type: RELAY_TYPE.RESPONSE, stream: 1, correlation: req.correlation,
+      ref, codec: RELAY_CODEC.R5G6B5LE, data: zeros(TILE_BYTES),
+    })) feed(client, env, RELAY_CODEC.R5G6B5LE);
+  }
+  scheduler.step();
+  expect((cache.state(ref) as { value: Uint8Array }).value.byteLength).toBe(TILE_BYTES);
+  expect(materializations).toBe(1);
+
+  // Round 2: aged out, conditional get comes back notModified (no bytes).
+  scheduler.step();
+  const revalidation = wire.sent.splice(0);
+  expect(revalidation.length).toBe(1);
+  expect((revalidation[0].metadata.args as { ifRevision?: string }).ifRevision).toBe("layout-12");
+  feed(client, auth.answerNotModified({ stream: 1, correlation: revalidation[0].correlation }, ref));
+  scheduler.step();
+
+  // The resident 4096 B value survives and is not rematerialized (§3.8 TTL).
+  const state = cache.state(ref);
+  expect(state.status).toBe("ready");
+  expect((state as { value: Uint8Array }).value.byteLength).toBe(TILE_BYTES);
+  expect(materializations).toBe(1);
+  scheduler.dispose();
+});
+
+test("M12 teeth: notModified must be final and name a concrete revision", () => {
+  const { wire, client } = makeClient();
+  const results: unknown[] = [];
+  client.get(1, tileRef("r1"), {
+    accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072, ifRevision: "r1",
+  }, (r) => results.push(r));
+
+  // notModified without a concrete revision on the resource is malformed:
+  // §3.6 requires the response to still name the revision. It must not be
+  // delivered as {notModified:true, revision:undefined}.
+  client.handleFrame({
+    type: RELAY_TYPE.RESPONSE, codec: RELAY_CODEC.NONE, stream: 1,
+    correlation: wire.lastRequest().correlation,
+    metadata: {
+      op: RELAY_OP.RESOURCE_GET,
+      resource: { kind: RELAY_KIND.TILE, ns: "map/demo", key: "k", rendition: "x" },
+      status: RELAY_STATUS.OK, final: true, value: { notModified: true },
+    },
+    data: new Uint8Array(0),
+  });
+  expect(results.length).toBe(0);
+  expect(client.stats().protocolErrors).toBe(1);
+
+  // notModified without final is non-terminal and rejected the same way.
+  const results2: unknown[] = [];
+  client.get(1, tileRef("r2"), {
+    accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072, ifRevision: "r2",
+  }, (r) => results2.push(r));
+  client.handleFrame({
+    type: RELAY_TYPE.RESPONSE, codec: RELAY_CODEC.NONE, stream: 1,
+    correlation: wire.lastRequest().correlation,
+    metadata: {
+      op: RELAY_OP.RESOURCE_GET, resource: tileRef("r2"),
+      status: RELAY_STATUS.OK, final: false, value: { notModified: true },
+    },
+    data: new Uint8Array(0),
+  });
+  expect(results2.length).toBe(0);
+  expect(client.stats().protocolErrors).toBe(2);
+});
