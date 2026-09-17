@@ -217,9 +217,15 @@ export class RelayResourceClient {
     if (args.ifRevision) (metadata.args as Record<string, unknown>).ifRevision = args.ifRevision;
     const correlation = this.opts.wire.request(stream, metadata);
     if (correlation === 0) return { ok: false, code: RELAY_ERROR.BUSY };
-    // The capacity was pre-checked; reserve the concrete correlation.
-    const reservation = this.assembler.reserve({ stream, channel: correlation }, args.maxObjectBytes);
-    if (!reservation.ok) return { ok: false, code: reservation.code };
+    // The capacity was pre-checked; reserve the concrete correlation in the
+    // get (RESPONSE correlation) id space.
+    const reservation = this.assembler.reserve({ stream, channel: correlation, space: "get" }, args.maxObjectBytes);
+    if (!reservation.ok) {
+      // A request is already on the wire; withdraw interest so the provider
+      // does not keep working and the request window is not leaked (§3.9).
+      this.opts.wire.cancel(stream, correlation, "busy");
+      return { ok: false, code: reservation.code };
+    }
     this.pending.set(correlation, {
       kind: "get", stream, ref, generation: this.generationFor(ref), reserved: true, complete,
     });
@@ -259,9 +265,10 @@ export class RelayResourceClient {
       complete: (result) => {
         if (result.ok && typeof result.value.subscription === "number") {
           const id = result.value.subscription;
-          // The push channel reserves one object slot for the negotiated
-          // ceiling; admission failure closes the subscription.
-          const reservation = this.assembler.reserve({ stream, channel: id }, this.opts.negotiated.maxObjectBytes);
+          // Reserve the push channel in the subscription id space, distinct
+          // from get correlations (§3.7); admission failure closes the
+          // subscription.
+          const reservation = this.assembler.reserve({ stream, channel: id, space: "push" }, this.opts.negotiated.maxObjectBytes);
           if (!reservation.ok) { handler.onEnd?.({ code: reservation.code }); complete(result); return; }
           if (isRef) {
             const ref = target as RelayResourceRef;
@@ -451,7 +458,7 @@ export class RelayResourceClient {
   private terminatePending(correlation: number, pending: Pending): void {
     this.pending.delete(correlation);
     if (pending.kind === "get" && pending.reserved) {
-      this.assembler.release({ stream: pending.stream, channel: correlation });
+      this.assembler.release({ stream: pending.stream, channel: correlation, space: "get" });
       pending.reserved = false;
     }
   }
@@ -478,6 +485,7 @@ export class RelayResourceClient {
       const result = this.assembler.push({
         stream: frame.stream,
         channel: frame.correlation,
+        space: "get",
         codec: frame.codec,
         resource: ref,
         digest: meta.digest as string | undefined,
@@ -535,6 +543,7 @@ export class RelayResourceClient {
       const result = this.assembler.push({
         stream: frame.stream,
         channel: sub.id,
+        space: "push",
         codec: frame.codec,
         resource: ref,
         digest: meta.digest as string | undefined,
@@ -607,7 +616,7 @@ export class RelayResourceClient {
     const sub = this.subscriptions.get(id);
     if (sub) {
       this.subscriptions.delete(id);
-      this.assembler.release({ stream: sub.stream, channel: id });
+      this.assembler.release({ stream: sub.stream, channel: id, space: "push" });
     }
   }
 
@@ -636,7 +645,7 @@ export class RelayResourceClient {
       if (pending.stream === stream) {
         this.pending.delete(correlation);
         if (pending.kind === "get" && pending.reserved) {
-          this.assembler.release({ stream, channel: correlation });
+          this.assembler.release({ stream, channel: correlation, space: "get" });
           pending.reserved = false;
           pending.complete({ ok: false, error: { code: RELAY_ERROR.RESYNC_REQUIRED } });
         } else {
