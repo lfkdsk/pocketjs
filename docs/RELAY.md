@@ -167,11 +167,15 @@ The machine has six phases: `idle`, `hello-sent`, `hello-received`,
    4096 wire bytes.
 2. The provider answers on session 0 with a random nonzero u64 `session`,
    its `peerNonce`, the echoed `bootNonce`, one exact selected `[major,
-   minor]` version, the profile and codec intersections, its grants, and
-   `rxLimits` computed field by field as `min(local, peer)`. With no
+   minor]` version, the profile, codec and kind intersections, its grants,
+   and `rxLimits` computed field by field as `min(local, peer)`. With no
    version/profile/kind intersection, or an app outside the adapter grants,
    it returns a final RESPONSE with `status:"error"` and an `error.code`
-   (`UNSUPPORTED` or `UNAUTHORIZED`) and closes.
+   (`UNSUPPORTED` or `UNAUTHORIZED`) and closes. The echoed codec and kind
+   sets are optional metadata fields (the field table lists the
+   intersection rule but the step-3 response list omits both fields); a
+   guest that does not receive them keeps its own offer, and a set naming a
+   codec or kind the guest did not offer tears the session down.
 3. The guest sends REQUEST `relay.ready` on the new session confirming the
    selected version; the provider acks and both sides enter `ready`. Each
    direction's seq restarts at 1 on the new session.

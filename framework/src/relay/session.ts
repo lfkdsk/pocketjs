@@ -754,6 +754,14 @@ export class RelaySession {
           || !codecs.every((c) => local.codecs.includes(c)))) {
         this.teardown("selected codec set invalid"); return;
       }
+      // §3.2 field table: kinds are chosen by mutual intersection. The
+      // provider echoes the picked set; every value must be one the guest
+      // offered and at least one kind must survive.
+      const kinds = meta.kinds as number[] | undefined;
+      if (kinds !== undefined
+          && (kinds.length === 0 || !kinds.every((k) => local.kinds.includes(k)))) {
+        this.teardown("selected kind set invalid"); return;
+      }
       const grants = meta.grants as string[];
       if (!grants.includes(local.app!)) { this.teardown("app outside grants"); return; }
       const limits = minLimits(local.rxLimits, meta.rxLimits as RelayRxLimits);
@@ -770,7 +778,10 @@ export class RelaySession {
         version: selected,
         profiles,
         codecs: codecs ?? [RELAY_CODEC.NONE],
-        kinds: local.kinds,
+        // The provider echoes the intersected kinds (same erratum as
+        // codecs); a response that omits the field is a pre-fix peer, for
+        // which the local offer stands.
+        kinds: kinds ?? [...local.kinds],
         grants,
         rxLimits: limits,
         peerNonce: meta.peerNonce as string,
@@ -839,6 +850,7 @@ export class RelaySession {
       selected: [...selectedVersion],
       profiles,
       codecs,
+      kinds: (meta.kinds as number[]).filter((k) => local.kinds.includes(k)),
       grants: peer.grants,
       rxLimits,
     };
