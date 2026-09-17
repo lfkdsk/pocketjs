@@ -918,6 +918,14 @@ export class RelaySession {
     this.nextCorrelation = 1;
   }
 
+  /** Reset one stream's two seq counters when its binding is installed,
+   *  so a frame that arrived before the stream existed cannot leave a
+   *  stale value behind (a newly bound stream starts at seq 1). */
+  private clearStreamSeq(stream: number) {
+    this.txSeq.delete(stream);
+    this.rxSeq.delete(stream);
+  }
+
   private enterReady() {
     this.setPhase("ready");
     const waiters = this.readyResolvers;
@@ -958,6 +966,10 @@ export class RelaySession {
         profile: frame.metadata.profile as RelayProfileEntry,
         rxLimits: frame.metadata.rxLimits as RelayRxLimits,
       };
+      // A frame that raced in before this stream existed may have touched
+      // its seq space (handleRecord checks seq before the stream exists).
+      // The binding starts a fresh per-stream seq at 1 in each direction.
+      this.clearStreamSeq(stream);
       this.streams.set(stream, binding);
       pending.resolve({
         stream, namespace: binding.namespace, profile: binding.profile, rxLimits: binding.rxLimits,
@@ -1005,7 +1017,9 @@ export class RelaySession {
       app: request.app, namespace: request.namespace, profile: request.profile, rxLimits,
     };
     // Bind before the response leaves so a synchronous transport's nested
-    // business frame on the new stream is admitted immediately.
+    // business frame on the new stream is admitted immediately. The id is
+    // fresh (never reused), so drop any seq an early frame planted.
+    this.clearStreamSeq(stream);
     this.streams.set(stream, binding);
     const sent = this.controlResponse(frame.correlation, {
       op: RELAY_OP.OPEN, status: RELAY_STATUS.OK, final: true,
@@ -1087,6 +1101,13 @@ export class RelaySession {
   private handleReset(frame: RelayDecodedFrame) {
     if (this.phase !== "ready" || frame.type !== RELAY_TYPE.PUSH || frame.stream !== 0) {
       this.statsValue.droppedNotReady++; return;
+    }
+    // §3.6 resets a business stream. stream 0 is the reserved control
+    // stream; refuse the action before the schema (whose minimum is 1) so
+    // the control seq space survives instead of teardown.
+    if (frame.metadata.targetStream === 0) {
+      this.statsValue.droppedNotReady++;
+      return;
     }
     if (!this.validateAgainst(frame, RELAY_OP.RESET)) return;
     const target = frame.metadata.targetStream as number;

@@ -239,7 +239,11 @@ class Parser {
   }
   private object(depth: number): Record<string, unknown> {
     this.pos++; // {
-    const out: Record<string, unknown> = {};
+    // Null prototype: assigning `out["__proto__"]` on a plain {} invokes
+    // the setter and the key never becomes an own property, so a wire
+    // `__proto__` would silently vanish (and could inject fields). A null
+    // prototype keeps it as a normal own key the strict schema then sees.
+    const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     this.ws();
     if (this.peek() === 0x7d) { this.pos++; return out; }
     while (true) {
