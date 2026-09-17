@@ -95,7 +95,10 @@ export function validateRelaySchema(schema: Schema, value: unknown, path = ""): 
       }
     }
     for (const [key, child] of Object.entries(obj)) {
-      if (!(key in props)) {
+      // Own properties only: `props` is a plain object, so `key in props`
+      // would resolve `constructor`/`__proto__` and other
+      // Object.prototype names through the chain and treat them as known.
+      if (!Object.prototype.hasOwnProperty.call(props, key)) {
         if (schema.additionalProperties === false) return failAt(path, `unknown property ${key}`);
         continue;
       }
