@@ -240,6 +240,62 @@ mark is still written, after which sends are busy until the queue drains.
 Reporting a queued frame as busy would make the session roll its seq back
 and reuse it on the retry, putting a duplicate seq on the wire.
 
+## Queues, credit, priority and CANCEL
+
+The send side (`framework/src/relay/credit.ts`) keeps two capacities separate:
+the wire window (`windowFrames`/`windowBytes`, frames sent but not released)
+and admitted work (`maxPending`, originated requests). The implementation is
+`RelayCreditLedger`, `RelaySender`, `RelaySideband`, `RelayCreditTable`,
+`RelayReceiver`, and `RelayRequestTable`.
+
+**`seq` exists only after a frame is selected and its wire credit is
+charged.** Work admitted before that point has no seq. Frames of one stream
+leave the sender FIFO; a frame never reorders inside its stream.
+
+- **Admission is bounded before any work starts.** A frame enters a stream
+  queue only when `in-flight + queued + new ≤ slice` for both frames and
+  bytes; otherwise admission returns `BUSY` and the caller keeps the demand.
+  Per-stream slices sum with the stream-0 control slice to at most the
+  attachment window. The transport stops reading when the receiver cannot
+  hold the next frame; no frame is discarded. A frame past the granted
+  window is a protocol error (`WINDOW_OVERFLOW`).
+- **Selection order is priority band then round-robin.** Band 0 is
+  management/input, band 1 is currently visible resources, band 2 is
+  prefetch. Streams at equal priority alternate. A head blocked on byte
+  credit is skipped in favor of a smaller head on another stream; it keeps
+  its FIFO position. A pump moves at most `framesPerPump`/`bytesPerPump`
+  normal frames (a guest submits at most two per host frame).
+- **The sideband is a separate two-slot, 256-byte-per-slot lane per
+  direction** for `relay.credit`, `relay.ping`/pong, `relay.reset`, and
+  CANCEL only. Sideband frames take stream-0 seq, consume no normal window,
+  and earn no credit. They are selected before normal work. Outbound
+  releases merge into at most nine credit rows (stream 0 plus eight
+  nonzero streams).
+- **Credit returns at one point:** after the receiver consumes a staged
+  frame or moves it into a reserved assembler/result mailbox. Reading a
+  frame or parsing its header returns no credit. `relay.credit` carries
+  cumulative counters; values that move backwards or exceed what the
+  receiver sent are a protocol error; repeating the same values is a
+  no-op.
+- **Receive seq is contiguous per stream starting at 1.** A hole or repeat
+  stops that stream (`SEQ_GAP`) until resync; a seq error on stream 0 ends
+  the session. A receiver reset discards staging and delivered-unreleased
+  frames, returns their credit, and the stream id can never be reopened.
+- **CANCEL rides stream 0** with `op:"request.cancel"`, the original
+  request correlation, and `targetStream`. The provider emits exactly one
+  terminal response on the original stream: if the result was already in
+  flight the success terminal stands; if the cancel finished first the
+  terminal is `error.code=CANCELLED` with `effect:"none"`. A repeated
+  terminal is rejected (`ALREADY_TERMINAL`), a repeated CANCEL produces no
+  second terminal. Cancelling, timing out, or unmounting a view does not
+  free a pending slot or wire credit: the request slot frees when the one
+  terminal is consumed, and the wire slot frees through the returned
+  credit. The canceler keeps consuming late chunks — they pass seq and
+  credit accounting, return credit, and are dropped without delivery.
+- **`relay.reset`** fails every request and subscription on the target
+  stream, queues and seq state clear, and later work requires a new stream
+  id. In-flight frames still settle through credit accounting.
+
 ## Tests and vectors
 
 The cross-language vectors are generated, not hand-edited:
@@ -249,6 +305,7 @@ bun tests/fixtures/relay/generate.ts   # rewrites vectors/*.bin + constants.json
 bun test tests/relay-frame.test.ts     # byte vectors, codec, reassembly
 bun test tests/relay-session.test.ts   # handshake/negotiation/session/ping
 bun test tests/relay-wire.test.ts      # provider over a TCP loopback
+bun test tests/relay-credit.test.ts    # queues/credit/priority/CANCEL
 bun tests/contract.ts
 ```
 
