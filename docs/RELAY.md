@@ -147,13 +147,81 @@ peer transmitted, and a counter is valid for one session. A CANCEL or local
 timeout withdraws interest but does not return request or execution capacity
 until the terminal response is consumed or the session ends.
 
+## Session state machine
+
+The guest and provider run one shared state machine,
+`framework/src/relay/session.ts` (`RelaySession`); the provider imports it
+from `tools/relay-wire.ts`. The machine holds no socket. It runs on a
+`RelayTransportAdapter` with three operations: bounded
+`trySend(bytes) -> "accepted" | "busy" | "offline"`, ordered record delivery
+through `handleRecord`, and an authenticated `peer { id, grants }`. **Peer
+identity comes from the adapter; HELLO metadata is never trusted for
+identity.**
+
+The machine has six phases: `idle`, `hello-sent`, `hello-received`,
+`ready-sent`, `ready`, `closed`.
+
+1. The guest sends REQUEST `relay.hello` on session 0 with `seq:1`,
+   `correlation:1`, a 16-byte `bootNonce` (32 hex chars), its supported
+   versions, profiles, codecs, kinds and `rxLimits`. The frame is at most
+   4096 wire bytes.
+2. The provider answers on session 0 with a random nonzero u64 `session`,
+   its `peerNonce`, the echoed `bootNonce`, one exact selected `[major,
+   minor]` version, the profile and codec intersections, its grants, and
+   `rxLimits` computed field by field as `min(local, peer)`. With no
+   version/profile/kind intersection, or an app outside the adapter grants,
+   it returns a final RESPONSE with `status:"error"` and an `error.code`
+   (`UNSUPPORTED` or `UNAUTHORIZED`) and closes.
+3. The guest sends REQUEST `relay.ready` on the new session confirming the
+   selected version; the provider acks and both sides enter `ready`. Each
+   direction's seq restarts at 1 on the new session.
+4. REQUEST `relay.open` on stream 0 makes the provider allocate a nonzero
+   stream id (1..8) for an app/namespace/profile binding. Stream ids are
+   never reused inside the session; each stream's two directions keep
+   independent seq counters starting at 1.
+5. Business frames are admitted in `ready` on opened streams only. Frames
+   that arrive before `ready`, on an unknown stream, or with a session that
+   is not the pinned session are dropped; frames with an unknown op on
+   stream 0 end the session.
+6. REQUEST/RESPONSE `relay.ping` carries a u32 token echoed without clock
+   interpretation. A ping is sent every 2 seconds with at most one
+   outstanding; 15 seconds without an inbound frame ends the session; a
+   `busy` send retries after 1.5 seconds.
+
+**A reconnect or a guest realm reset is a new session: the machine discards
+the session id, negotiation, every stream binding, every seq counter and
+correlation counter, and restarts at `idle`.** Frames that name a prior
+session fail the frame codec's session pin and are dropped as stale without
+reaching the business callback; they do not tear down the current session.
+
+seq allocation follows the header rule: a number is consumed when the frame
+enters the ordered send stream, so a `busy` or failed send leaves the counter
+where it was. On receive, seq must be exactly previous+1 per
+`(session, stream)`; a gap or duplicate on stream 0 ends the session, and on
+a business stream invokes the `onStreamError` resync hook.
+
+Resource delivery is not in this layer. `sendBusiness` is the single
+admission point P3/P4 extend with queue and credit checks; inbound
+non-control frames go to `onBusinessFrame`, `relay.credit` and `relay.reset`
+PUSH frames go to `onCredit`/`onReset` hooks, and OPEN authorization is an
+`authorizeOpen` hook returning an error code or null.
+
+`tools/relay-wire.ts` binds the machine to a byte channel:
+`attachRelayProvider` (one connection), `attachRelayChannel` (guest side),
+`relaySocketChannel` (node `net`), and `serveRelayTcp`, which takes an
+`authenticate(socket)` callback returning the peer grants. Records are
+reassembled by `RelayRecordDecoder` before they reach the machine, and a
+record over the advertised bound destroys the connection without allocating.
+
 ## Tests and vectors
 
 The cross-language vectors are generated, not hand-edited:
 
 ```sh
 bun tests/fixtures/relay/generate.ts   # rewrites vectors/*.bin + constants.json
-bun test tests/relay-frame.test.ts
+bun test tests/relay-frame.test.ts     # byte vectors, codec, reassembly
+bun test tests/relay-session.test.ts   # handshake/negotiation/session/ping
+bun test tests/relay-wire.test.ts      # provider over a TCP loopback
 bun tests/contract.ts
 ```
 
