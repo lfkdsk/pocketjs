@@ -136,6 +136,14 @@ test("a structurally complete seq-0 frame is not recorded", async () => {
   expect(() => rec.noteOut(zeroSeq)).toThrow(/seq is 0/);
 });
 
+test("note() rejects a direction other than \"in\"/\"out\" before touching the frame", async () => {
+  // M25: the direction argument guard is a tape rule, not optional input.
+  const rec = new RelayFrameRecorder({ session: 0x0102030405060708n });
+  const ping = await loadBin("ping");
+  expect(() => rec.note(ping, "sideways" as RelayFrameDirection)).toThrow(/direction must be/);
+  expect(rec.framesRecorded).toBe(0);
+});
+
 test("recording off by default: wrapRelayTransport returns the inner transport itself", () => {
   const sent: Uint8Array[] = [];
   const inner = {
@@ -208,6 +216,10 @@ test("parseFrameTape rejects every structural deviation", async () => {
     .toThrow(/4-tuple/);
   expect(bad((t) => { (t as { frames: unknown[][] }).frames[0][0] = "up"; })).toThrow(/direction/);
   expect(bad((t) => { (t as { frames: unknown[][] }).frames[0][1] = 0; })).toThrow(/seq/);
+  // M20: frameHex shorter than one 48-byte record (< 96 hex chars) is a
+  // structural rejection, even when even-length and the digest is valid.
+  expect(bad((t) => { (t as { frames: unknown[][] }).frames[0][2] = "ab".repeat(24); }))
+    .toThrow(/frameHex/);
   expect(bad((t) => { (t as { frames: unknown[][] }).frames[0][3] = "z".repeat(64); })).toThrow(/sha256/);
 });
 
@@ -233,6 +245,22 @@ test("verifyFrameTape: recorded tape verifies; one tampered byte reports that tu
   expect(v.divergence!.index).toBe(2);
   expect(v.divergence!.seq).toBe(tape.frames[2][1]);
   expect(v.divergence!.code).toBe("digest");
+});
+
+test("verifyFrameTape: a tape whose document session disagrees with the frame header is refused (M07/CE2)", async () => {
+  const rec = new RelayFrameRecorder({ session: 0x0102030405060708n });
+  rec.noteOut(await loadBin("ping"));
+  const tape = rec.toTape();
+  // The frame header still carries 0102030405060708; only the document
+  // field lies. verifyFrameTape must return a record divergence at index 0.
+  const forged = { ...tape, session: "00000000000000ff" };
+  const v = verifyFrameTape(forged);
+  expect(v.ok).toBe(false);
+  expect(v.frames).toBe(0);
+  expect(v.divergence!.index).toBe(0);
+  expect(v.divergence!.seq).toBe(tape.frames[0][1]);
+  expect(v.divergence!.code).toBe("record");
+  expect(v.divergence!.detail).toMatch(/does not match tape session/);
 });
 
 test("replay: P1 vector sequence replays OK in capture order", async () => {
