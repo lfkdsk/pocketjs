@@ -307,6 +307,84 @@ leave the sender FIFO; a frame never reorders inside its stream.
   stream, queues and seq state clear, and later work requires a new stream
   id. In-flight frames still settle through credit accounting.
 
+## Resource identity
+
+`ResourceRef` is `{kind, ns, key, revision?, rendition}`. The cache identity
+is the six-tuple `(authenticatedAuthority, ns, kind, key, revision,
+rendition)`; the authority is the pinned session/namespace grant, so it is
+not repeated in the key. `revision` is opaque: a get may omit it to request
+the current revision, and every response or push carries the concrete
+value. **`rendition` binds codec, dimensions, density, style and font bytes;
+a source hash alone is not a rendition identity.** A wire reference never
+carries a local texture or surface handle.
+
+The L2 state machines live in `framework/src/relay/resource.ts`
+(`RelayResourceClient` on the consumer, `RelayResourceAuthority` on the
+provider) above a transport-neutral `RelayResourceWire` seam. L2 never
+assigns a session or a wire seq; it works on metadata plus an optional data
+region. Strict op metadata is checked by `framework/src/relay/metadata.ts`
+against the schemas in `contracts/spec/relay.ts`.
+
+## get, subscribe, release
+
+- **resource.get** sends `args.accept` (negotiated codec ids) and
+  `args.maxObjectBytes`. A conditional get adds `ifRevision`; a match comes
+  back `status:"ok", final:true, value:{notModified:true}` with the concrete
+  revision still named on the resource. An object larger than
+  `maxObjectBytes` is `TOO_LARGE`; a request that cannot enter the bounded
+  window or the local assembly budget is `BUSY` and the caller retries on a
+  later frame.
+- **resource.subscribe** selects `delivery:"reliable-delta"` or
+  `"latest-snapshot"`. The terminal response carries
+  `value.subscription`, a session-scoped u32 that is never reused after
+  unsubscribe. A reliable delta carries a top-level `baseRevision` and
+  applies only when the base equals the held revision; a mismatch sets
+  `resyncRequired` instead of guessing the base. A latest-snapshot
+  re-delivery of the held revision is idempotent. resource.unsubscribe
+  terminates the subscription; pushes already on the wire are consumed and
+  dropped.
+- **resource.release** ends an explicit provider `lease:u32` on remote
+  residence. Local cache disposal is a different operation.
+
+## Chunked transfer and atomic publication
+
+Chunking uses bounded assembly (`framework/src/relay/assembler.ts`).
+**Admission is reserve-then-accept: the consumer reserves one assembly slot
+and up to `maxObjectBytes` before the request is admitted; the first chunk
+commits the real total, which must not exceed the reservation.** Chunks
+repeat `resource`/`codec`/`transfer.id`/`total`/`digest`; offsets run
+contiguously from 0, and the final chunk carries `final:true` with
+`offset + dataBytes == total`. A gap, overlap, identity change, transfer-id
+reuse or over-range offset rejects the assembly as `INVALID` and drops its
+scratch. The SHA-256 `digest` is verified over the assembled bytes
+(`framework/src/relay/sha256.ts`, a pure-TS hash because the QuickJS guest
+has no node:crypto or WebCrypto). The assembled object is returned once,
+after the digest passes; **a half object never reaches the cache or a
+subscriber.**
+
+## Residence budget, invalidation and eviction
+
+Residence integrates with the existing `framework/src/resource-cache.ts`
+scheduler through `createRelayResourceLoad`: the collection reserves cost
+before `load()` starts, a `BUSY` admission declines the start for a later
+frame, and a terminal error fails the entry like any loader. In-flight
+assembly scratch (`maxAssemblies`, `maxScratchBytes`) is separate from the
+resident reservation; both are receiver guarantees negotiated in
+`rxLimits`.
+
+Two distinct operations use the INVALIDATE frame type:
+
+- **resource.invalidate** is authority-to-consumer and reliable, with
+  `scope:"revision" | "key" | "namespace"`. It advances a per-identity
+  local generation; a revision-scope invalidation deletes the local entry,
+  while key/namespace scope retain the value marked stale. A late get
+  response stamped with an older generation is dropped with
+  `RESYNC_REQUIRED`, and a subscription in scope is marked for resync.
+- **cache.evict** is consumer-to-provider advisory only
+  (`reason:"budget" | "view-close"`). It states that the consumer no longer
+  holds a copy; **the provider may ignore it and there is no ACK.** Remote
+  lease teardown uses resource.release instead.
+
 ## Tests and vectors
 
 The cross-language vectors are generated, not hand-edited:
@@ -317,6 +395,7 @@ bun test tests/relay-frame.test.ts     # byte vectors, codec, reassembly
 bun test tests/relay-session.test.ts   # handshake/negotiation/session/ping
 bun test tests/relay-wire.test.ts      # provider over a TCP loopback
 bun test tests/relay-credit.test.ts    # queues/credit/priority/CANCEL
+bun test tests/relay-resource.test.ts  # L2 get/subscribe/chunks/budget/invalidate
 bun tests/contract.ts
 ```
 
