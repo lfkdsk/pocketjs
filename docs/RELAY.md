@@ -472,6 +472,61 @@ reserved storage. Admission counts the incoming frame (`queued + length <=
 window`), so a backlog that already fills the window cannot be extended.
 `relay_frame_admit` validates a record before it enqueues it.
 
+## Frame tape (record and replay)
+
+**The frame tape records one session's complete wire records for debugging
+and conformance replay. Recording is off by default (R5 Q7) and is turned on
+per transport.** The implementation is `framework/src/relay/tape.ts`; the sim
+host hook is `hosts/sim/relay-tape.ts`.
+
+The tape is a JSON document:
+
+```json
+{"kind":"relay-frame","v":1,"session":"0102030405060708","frames":[["out",3,"…hex…","…64 hex chars…"]]}
+```
+
+**Each entry is a four-element tuple `[direction, seq, frameHex, sha256Hex]`
+in capture order.** `direction` is `"out"` (sent) or `"in"` (received);
+`seq` is read from the 48-byte header so a divergence report names the seq
+when the header bytes themselves are wrong; `frameHex` is the complete wire
+record including the 4-byte length prefix; `sha256Hex` is the SHA-256 of
+those bytes, computed by a dependency-free implementation in `tape.ts` (the
+module runs inside QuickJS guests and does not use `node:crypto`). The tape
+stores no timestamps, labels, session/stream columns, or parsed metadata;
+those fields are already inside the record. `session` is the u64 header
+value as 16 hex chars and every entry must carry it; `"0000…0"` is accepted
+only for a bootstrap HELLO exchange. This format is not the input tape
+(`framework/src/devtools.ts`, versions 1..3, `{v, app, masks, …}`); a frame
+tape carries `kind: "relay-frame"` and the parser rejects an input tape.
+
+`wrapRelayTransport(inner, { enabled: true, session })` wraps a
+complete-record transport and copies every `send`/`recv` record through a
+`RelayFrameRecorder`. **With recording off, `wrapRelayTransport` returns the
+inner transport object itself**, so the disabled path has no wrapper frame
+and no hash work; the recorder's counters stay at 0. `toTape()` serializes
+the entries, and `parseFrameTape` shape-validates the JSON back.
+
+Replay uses a fake transport from `createRelayFrameReplay`: `recv()` returns
+the next recorded inbound record in capture order and `send(frame)` hashes
+the produced outbound record against the stored digest. **The first frame
+whose sha256 disagrees, whose direction disagrees, or that does not parse as
+one complete PRLY record latches a divergence carrying tuple index and seq;
+later frames do not clear it** — the `--assert` semantics of
+`tools/tape.ts`, which names the first divergent frame. A run is OK only
+when every tuple is consumed. Missing and extra frames report
+`incomplete` and `unexpected`. `verifyFrameTape(tape)` checks a stored tape
+without a session stack.
+
+The sim hook mounts through `bootWorld`'s `extraGlobals` at the
+`relayTape` slot, alongside `db`/`fs`/`audio`:
+
+```ts
+const hook = createSimRelayTapeHook({ enabled: true, session });
+const transport = hook.wrap(inner);
+hook.save((text) => writeFileSync(path, text));
+const { replay } = loadSimRelayReplay(readFileSync(path, "utf8"));
+```
+
 ## Tests and vectors
 
 The cross-language vectors are generated, not hand-edited:
@@ -484,6 +539,7 @@ bun test tests/relay-wire.test.ts      # provider over a TCP loopback
 bun test tests/relay-credit.test.ts    # queues/credit/priority/CANCEL
 bun test tests/relay-resource.test.ts  # L2 get/subscribe/chunks/budget/invalidate
 bun test tests/relay-frame-c.test.ts  # compiles the C layer, feeds it the vectors
+bun test tests/relay-tape.test.ts tests/relay-sim-tape.test.ts
 bun tests/contract.ts
 ```
 
