@@ -56,9 +56,13 @@ stream and triggers resync; an error on stream 0 ends the session.
 it is never base64-wrapped into metadata.** v1 metadata rules: root is an
 object; duplicate keys reject; no NaN or Infinity; ordinary numbers are safe
 integers (`-(2^53-1)..2^53-1`); fractional and exponent notation reject; JSON
-depth is capped at 16. u64 counters and the session are 16 lowercase hex
-characters; `opId` is 32 lowercase hex characters. String offsets that refer
-to product source text are explicit UTF-16 units and must not split a
+depth is capped at 16. Parsed objects carry a null prototype, so `__proto__`
+is an ordinary own key (it does not invoke the prototype setter); the strict
+schemas then reject it as an unknown property, along with any other key the
+schema does not declare, including names on `Object.prototype`
+(`constructor`, `toString`). u64 counters and the session are 16 lowercase
+hex characters; `opId` is 32 lowercase hex characters. String offsets that
+refer to product source text are explicit UTF-16 units and must not split a
 surrogate pair.
 
 Common fields: `op` (required, `^[a-z][a-z0-9_.-]{0,63}$`), `resource`
@@ -186,7 +190,11 @@ The machine has six phases: `idle`, `hello-sent`, `hello-received`,
 5. Business frames are admitted in `ready` on opened streams only. Frames
    that arrive before `ready`, on an unknown stream, or with a session that
    is not the pinned session are dropped; frames with an unknown op on
-   stream 0 end the session.
+   stream 0 end the session. Installing an OPEN binding resets that stream's
+   two seq counters, so an early frame on an id that OPEN later allocates
+   cannot desync the new stream. `relay.reset` applies to a business stream;
+   `targetStream: 0` is refused (the schema minimum is 1 and the handler
+   drops it) so a forged reset cannot wipe the control-stream seq space.
 6. REQUEST/RESPONSE `relay.ping` carries a u32 token echoed without clock
    interpretation. A ping is sent every 2 seconds with at most one
    outstanding; 15 seconds without an inbound frame ends the session; a

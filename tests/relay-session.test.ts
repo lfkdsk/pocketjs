@@ -893,6 +893,92 @@ test("B-1 wire: a READY-session PING carrying `constructor` is refused, never an
   expect(pair.provider.getStats().pingsReceived).toBe(0);
 });
 
+test("D-1 relay.reset targeting stream 0 is refused without wiping the control seq space", async () => {
+  const pair = makePair({ sync: true, pingIntervalMs: 10 ** 9 });
+  pair.guest.hello();
+  expect(pair.guest.phase).toBe("ready");
+  const sid = pair.guest.sessionId;
+  // Guest's new-session stream-0 rx seq stands at 1 (READY ack); the forged
+  // reset is seq 2 and a legitimate credit follows at seq 3.
+  pair.guest.handleRecord(rawFrame({
+    type: RELAY_TYPE.PUSH, session: sid, seq: 2, stream: 0, correlation: 0,
+    metadata: { op: RELAY_OP.RESET, targetStream: 0, reason: "hostile" },
+  }));
+  pair.guest.handleRecord(rawFrame({
+    type: RELAY_TYPE.PUSH, session: sid, seq: 3, stream: 0, correlation: 0,
+    metadata: {
+      op: RELAY_OP.CREDIT, targetStream: 1,
+      framesReleased: "0000000000000001", bytesReleased: "0000000000000040",
+    },
+  }));
+  // §3.6 scopes relay.reset to a business stream; stream 0 is reserved. The
+  // reset action is refused, the session survives and seq stays contiguous.
+  expect(pair.guest.phase).toBe("ready");
+  expect(pair.guest.getStats().droppedStaleSeq).toBe(0);
+});
+
+test("D-2 a frame on an un-opened stream does not poison its rx seq after OPEN allocates it", async () => {
+  let delivered = 0;
+  const pair = makePair({ sync: true, pingIntervalMs: 10 ** 9, onBusiness: () => { delivered++; } });
+  pair.guest.hello();
+  expect(pair.guest.phase).toBe("ready");
+  const sid = pair.guest.sessionId;
+  // Early/hostile PUSH on stream 1 before OPEN allocates it.
+  pair.guest.handleRecord(rawFrame({
+    type: RELAY_TYPE.PUSH, session: sid, seq: 1, stream: 1, correlation: 0,
+    metadata: { op: "map.tile" },
+  }));
+  // OPEN now allocates stream 1 for real; the binding starts from a clean
+  // per-stream seq space.
+  const opened = await pair.guest.open({
+    app: "pocket-map", namespace: "tiles",
+    profile: { name: "map.raster", version: 1 },
+  });
+  expect(opened.stream).toBe(1);
+  // Provider's first business frame on the new stream is seq 1 (§3.2 step 5).
+  pair.guest.handleRecord(rawFrame({
+    type: RELAY_TYPE.PUSH, session: sid, seq: 1, stream: 1, correlation: 0,
+    metadata: { op: "map.tile" },
+  }));
+  expect({ delivered, staleSeq: pair.guest.getStats().droppedStaleSeq })
+    .toEqual({ delivered: 1, staleSeq: 0 });
+});
+
+test("D-3 decode: a `__proto__` metadata key stays an own property and cannot inject fields", () => {
+  const metadata: Record<string, unknown> = { op: RELAY_OP.PING };
+  Object.defineProperty(metadata, "__proto__", {
+    value: { polluted: true }, enumerable: true, configurable: true,
+  });
+  const encoded = encodeFrame({
+    type: RELAY_TYPE.PUSH, codec: 0, session: 0n, seq: 1, stream: 0, correlation: 0,
+    metadata,
+  }, { maxWireBytes: 4096, codecs: [0] });
+  if (!encoded.ok) throw new Error(encoded.code);
+  const decoded = decodeFrame(encoded.bytes, { maxWireBytes: 4096 });
+  if (!decoded.ok) throw new Error(decoded.code);
+  const own = Object.prototype.hasOwnProperty.call(decoded.frame.metadata, "__proto__");
+  const polluted = (decoded.frame.metadata as Record<string, unknown>).polluted === true;
+  expect({ own, polluted }).toEqual({ own: true, polluted: false });
+});
+
+test("D-3 wire: a PING carrying `__proto__` is rejected as an unknown key, not absorbed", async () => {
+  const pair = makePair({ sync: true, pingIntervalMs: 10 ** 9 });
+  pair.guest.hello();
+  expect(pair.provider.phase).toBe("ready");
+  const sid = pair.provider.sessionId;
+  const before = pair.wire.length;
+  const metadata: Record<string, unknown> = { op: RELAY_OP.PING, token: 5 };
+  Object.defineProperty(metadata, "__proto__", {
+    value: { polluted: true }, enumerable: true, configurable: true,
+  });
+  pair.provider.handleRecord(rawFrame({
+    type: RELAY_TYPE.REQUEST, session: sid, seq: 2, stream: 0, correlation: 9,
+    metadata,
+  }));
+  expect(pair.provider.phase).toBe("closed");
+  expect(pair.wire.slice(before).some((f) => f.from === "provider")).toBe(false);
+});
+
 test("mutation: flipping one magic byte of the HELLO record rejects at the frame layer", () => {
   const pair = makePair();
   pair.guest.hello();

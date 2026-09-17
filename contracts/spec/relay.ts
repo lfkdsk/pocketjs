@@ -622,7 +622,9 @@ export const RELAY_METADATA_SCHEMAS: Readonly<Record<string, JsonSchema>> = Obje
     required: ["op", "targetStream", "reason"],
     properties: {
       op: { const: RELAY_OP.RESET },
-      targetStream: u32,
+      // §3.6 resets a business stream; stream 0 is the reserved control
+      // stream and its seq space must survive a forged reset.
+      targetStream: { type: "integer", minimum: 1, maximum: 0xffffffff },
       reason: { type: "string", minLength: 1, maxBytes: 64 },
     },
   },
