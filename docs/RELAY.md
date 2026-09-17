@@ -265,12 +265,23 @@ leave the sender FIFO; a frame never reorders inside its stream.
   credit is skipped in favor of a smaller head on another stream; it keeps
   its FIFO position. A pump moves at most `framesPerPump`/`bytesPerPump`
   normal frames (a guest submits at most two per host frame).
-- **The sideband is a separate two-slot, 256-byte-per-slot lane per
+- **The sideband is a separate two-slot, 256-byte-per-slot lane in each
   direction** for `relay.credit`, `relay.ping`/pong, `relay.reset`, and
-  CANCEL only. Sideband frames take stream-0 seq, consume no normal window,
-  and earn no credit. They are selected before normal work. Outbound
-  releases merge into at most nine credit rows (stream 0 plus eight
-  nonzero streams).
+  CANCEL only. The send side admits and drains them through `RelaySideband`;
+  the receive side classifies a decoded record with `isSidebandFrame()`,
+  gates reads on `canIngestSideband()`, stages it in its own two-slot lane,
+  and delivers it through `pumpSideband()`. Sideband frames take stream-0
+  seq from the same per-stream counter as ordinary stream-0 management
+  frames, so dropping or filtering one opens a fatal seq hole; they consume
+  no normal window and earn no credit, so taking one from the sideband pump
+  frees its reserved slot without a `release()` call. The lane stays
+  readable while both normal control slots are held. A whitelisted record
+  routed through the normal receive path returns `SIDEBAND_FORBIDDEN`; a
+  record the receiver cannot fit in the two reserved slots, or one over
+  256 bytes, is a stream-0 protocol error, since the adapter must hold
+  every granted sideband record. Sideband frames are selected before normal
+  work on send. Outbound releases merge into at most nine credit rows
+  (stream 0 plus eight nonzero streams).
 - **Credit returns at one point:** after the receiver consumes a staged
   frame or moves it into a reserved assembler/result mailbox. Reading a
   frame or parsing its header returns no credit. `relay.credit` carries
