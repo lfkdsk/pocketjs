@@ -750,6 +750,20 @@ test("metadata-schema: the control schemas reject unknown props, bad types, over
   expect(validateRelaySchema(hello, { ...base, rxLimits: { ...limits, windowBytes: 9999999999 } })).not.toBeNull();
 });
 
+test("metadata-schema: unknown keys named after Object.prototype members do not bypass strictness", () => {
+  const ping = RELAY_METADATA_SCHEMAS[`${RELAY_OP.PING}.request`] as Record<string, unknown>;
+  // A plain-object schema's prototype chain exposes these names; the
+  // unknown-property check must look at own properties only (Review 937 B-1).
+  for (const key of ["constructor", "toString", "valueOf", "hasOwnProperty",
+      "isPrototypeOf", "propertyIsEnumerable", "toLocaleString"]) {
+    const smuggled: Record<string, unknown> = { op: RELAY_OP.PING, token: 1 };
+    smuggled[key] = "x";
+    expect(validateRelaySchema(ping, smuggled)).toContain("unknown");
+  }
+  // Control: the rule fires for an ordinary unknown key too.
+  expect(validateRelaySchema(ping, { op: RELAY_OP.PING, token: 1, plain: 1 })).toContain("unknown");
+});
+
 test("malformed inbound control metadata fails the strict schema and ends the session", async () => {
   const pair = makePair({ pingIntervalMs: 10 ** 9 });
   await handshake(pair);
@@ -787,6 +801,43 @@ test("a duplicate stream-0 seq ends the session", async () => {
 // 9. Mutation (one): a single-byte wire mutation of the bootstrap HELLO must
 //    never establish a session
 // =============================================================================
+
+// =============================================================================
+// 10. Review 937 adversarial cases
+// =============================================================================
+
+/** Encode a frame straight from an own-property metadata object, bypassing
+ *  the sending machine so a hostile peer can smuggle any key the parser or
+ *  strict validator might mishandle. */
+function rawFrame(input: {
+  type: number; session: bigint; seq: number; stream: number; correlation: number;
+  metadata: Record<string, unknown>;
+}, codecs: number[] = [0]) {
+  const encoded = encodeFrame({ codec: 0, ...input }, { maxWireBytes: 4096, codecs });
+  if (!encoded.ok) throw new Error(encoded.code);
+  return encoded.bytes;
+}
+
+test("B-1 wire: a READY-session PING carrying `constructor` is refused, never answered", async () => {
+  const pair = makePair({ sync: true, pingIntervalMs: 10 ** 9 });
+  pair.guest.hello();
+  expect(pair.provider.phase).toBe("ready");
+  const sid = pair.provider.sessionId;
+  // Provider has accepted only the READY (new session, stream 0, seq 1);
+  // the hostile frame is stream 0 seq 2.
+  const before = pair.wire.length;
+  const smuggled: Record<string, unknown> = { op: RELAY_OP.PING, token: 5 };
+  Object.defineProperty(smuggled, "constructor", { value: "smuggled", enumerable: true });
+  pair.provider.handleRecord(rawFrame({
+    type: RELAY_TYPE.REQUEST, session: sid, seq: 2, stream: 0, correlation: 9,
+    metadata: smuggled,
+  }));
+  // Strict validation fails the frame: the session tears down and the peer
+  // never spends a frame answering the smuggled PING.
+  expect(pair.provider.phase).toBe("closed");
+  expect(pair.wire.slice(before).some((f) => f.from === "provider")).toBe(false);
+  expect(pair.provider.getStats().pingsReceived).toBe(0);
+});
 
 test("mutation: flipping one magic byte of the HELLO record rejects at the frame layer", () => {
   const pair = makePair();
