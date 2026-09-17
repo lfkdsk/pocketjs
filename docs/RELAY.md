@@ -443,6 +443,35 @@ Two distinct operations use the INVALIDATE frame type:
   holds a copy; **the provider may ignore it and there is no ACK.** Remote
   lease teardown uses resource.release instead.
 
+## C frame layer
+
+`hosts/shared/relay_frame.h` and `relay_frame.c` decode the fixed header on a
+C host. **The C layer checks the header fields, the length identity, the
+negotiated `maxWireBytes`/`maxMetaBytes`/codec set, and UTF-8 over the
+metadata region; it does not parse JSON.** Metadata reaches the caller as a
+pointer into the caller's record, so JSON structure and semantics (root
+object, duplicate keys, number grammar, surrogate escapes) and the envelope
+rules (`BAD_ENVELOPE`) are decided by the layer above. Of the 46 shared vectors the C layer decides 41 with the
+same code as the TypeScript codec and hands the other 5 through as well
+formed frames.
+
+Declared lengths widen to `uint64_t` before they are summed or compared, so a
+`frameBytes` near the top of u32 cannot wrap past a check, and the limit test
+runs before the declared payload size is trusted. Wire integers are read byte
+by byte, which holds on a big-endian host and needs no aligned access. The
+code is C11 plus the C standard library: **no POSIX function is called**, in
+the library or in the test harness.
+
+`RelayFrameQueue` has the shape of `OffloadQueue` in
+`hosts/shared/offload_queue.h` — single producer, single consumer, fixed
+slots, no waiting — with the admission rules of R5 §3.9. A full queue answers
+busy; it never drops or overwrites a frame it holds. Slot occupancy and
+window bytes are two counters: `relay_frame_queue_pop` frees the slot, while
+the bytes stay charged until `relay_frame_queue_release` moves the frame into
+reserved storage. Admission counts the incoming frame (`queued + length <=
+window`), so a backlog that already fills the window cannot be extended.
+`relay_frame_admit` validates a record before it enqueues it.
+
 ## Tests and vectors
 
 The cross-language vectors are generated, not hand-edited:
@@ -454,6 +483,7 @@ bun test tests/relay-session.test.ts   # handshake/negotiation/session/ping
 bun test tests/relay-wire.test.ts      # provider over a TCP loopback
 bun test tests/relay-credit.test.ts    # queues/credit/priority/CANCEL
 bun test tests/relay-resource.test.ts  # L2 get/subscribe/chunks/budget/invalidate
+bun test tests/relay-frame-c.test.ts  # compiles the C layer, feeds it the vectors
 bun tests/contract.ts
 ```
 
