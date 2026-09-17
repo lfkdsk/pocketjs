@@ -45,11 +45,15 @@ const hex16 = (n: number): string => {
 
 // --- identity ----------------------------------------------------------------
 
-/** Cache identity per §3.5: (ns, kind, key, revision, rendition). The
- * authenticated authority is the pinned session/namespace grant and is not
- * repeated here. */
+/** Local fence/entry identity per §3.5: (kind, ns, key, rendition).
+ * `revision` is not part of the identity: a get may omit it ("current
+ * version") while the response names a concrete revision, and a §3.8
+ * key/namespace invalidate moves the generation of every revision of the
+ * identity. The concrete revision is compared separately on the entry, the
+ * response and revision-scope invalidation. See the §3.5 cache-key errata in
+ * docs/RELAY.md. */
 export function relayResourceKey(ref: RelayResourceRef): string {
-  return `${ref.kind}|${ref.ns}|${ref.key}|${ref.revision ?? ""}|${ref.rendition}`;
+  return `${ref.kind}|${ref.ns}|${ref.key}|${ref.rendition}`;
 }
 
 function refMatchesKeyScope(a: RelayResourceRef, b: RelayResourceRef): boolean {
@@ -122,8 +126,13 @@ interface PendingGet {
   stream: number;
   ref: RelayResourceRef;
   /** Local identity generation captured at request time; a response stamped
-   * with an older generation is dropped after invalidation. */
+   * with an older generation is dropped after a key/namespace invalidation. */
   generation: number;
+  /** Concrete revisions invalidated while this get was in flight. The late
+   * response is dropped when it names one of them; a response for a newer
+   * revision may still publish. The array dies with the request, so it is
+   * bounded by maxPending in-flight requests. */
+  fencedRevisions?: string[];
   /** Assembler reservation exists for this correlation. */
   reserved: boolean;
   complete: (result: ResourceResult<RelayGetOutcome>) => void;
@@ -334,31 +343,49 @@ export class RelayResourceClient {
     const ns = ref?.ns ?? args.namespace!;
 
     for (const [key, entry] of this.entries) {
-      const match =
-        args.scope === RELAY_INVALIDATE_SCOPE.NAMESPACE ? entry.ref.ns === ns
-        : ref && args.scope === RELAY_INVALIDATE_SCOPE.KEY ? refMatchesKeyScope(entry.ref, ref)
-        : ref ? relayResourceKey(entry.ref) === relayResourceKey(ref) : false;
-      if (!match) continue;
+      if (args.scope === RELAY_INVALIDATE_SCOPE.NAMESPACE) {
+        if (entry.ref.ns !== ns) continue;
+      } else if (ref) {
+        if (!refMatchesKeyScope(entry.ref, ref)) continue;
+        // Revision scope removes only the concrete revision; a newer resident
+        // revision of the same identity stays.
+        if (args.scope === RELAY_INVALIDATE_SCOPE.REVISION && entry.ref.revision !== ref.revision) continue;
+      } else continue;
+      entry.stale = true;
+      if (args.scope === RELAY_INVALIDATE_SCOPE.REVISION) {
+        this.entries.delete(key);
+        continue;
+      }
+      // Key/namespace scope move the revision-free identity generation of
+      // every revision of the identity; the stale value is retained.
       const next = entry.generation + 1;
       this.generations.set(relayResourceKey(entry.ref), next);
       entry.generation = next;
-      entry.stale = true;
-      if (args.scope === RELAY_INVALIDATE_SCOPE.REVISION) this.entries.delete(key);
     }
-    // Namespace/key scope can match identities with no resident entry but an
-    // in-flight get; move their generation fence too.
-    if (args.scope === RELAY_INVALIDATE_SCOPE.NAMESPACE) {
-      for (const pending of this.pending.values()) {
-        if (pending.kind === "get" && pending.ref.ns === ns) {
-          const idKey = relayResourceKey(pending.ref);
-          this.generations.set(idKey, (this.generations.get(idKey) ?? 0) + 1);
-        }
+    // Identities with no resident entry but an in-flight get: key/namespace
+    // scope move the identity fence; revision scope records the concrete
+    // revision that must not land (a response for a newer revision may still
+    // publish).
+    for (const pending of this.pending.values()) {
+      if (pending.kind !== "get") continue;
+      if (args.scope === RELAY_INVALIDATE_SCOPE.NAMESPACE) {
+        if (pending.ref.ns !== ns) continue;
+        const idKey = relayResourceKey(pending.ref);
+        this.generations.set(idKey, (this.generations.get(idKey) ?? 0) + 1);
+        continue;
       }
-    } else if (ref) {
-      for (const pending of this.pending.values()) {
-        if (pending.kind === "get" && this.refInScope(pending.ref, args.scope, ref, ns)) {
-          const idKey = relayResourceKey(pending.ref);
-          this.generations.set(idKey, (this.generations.get(idKey) ?? 0) + 1);
+      if (!ref || !refMatchesKeyScope(pending.ref, ref)) continue;
+      if (args.scope === RELAY_INVALIDATE_SCOPE.KEY) {
+        const idKey = relayResourceKey(pending.ref);
+        this.generations.set(idKey, (this.generations.get(idKey) ?? 0) + 1);
+      } else {
+        // Revision scope records the invalidated concrete revision on every
+        // get of this key identity, including a revisionless "current version"
+        // get: the fence is checked against the response's concrete revision,
+        // not the request name. A response for a different (including newer)
+        // revision may still publish.
+        if (!pending.fencedRevisions?.includes(ref.revision!)) {
+          (pending.fencedRevisions ??= []).push(ref.revision!);
         }
       }
     }
@@ -436,7 +463,12 @@ export class RelayResourceClient {
 
     if (value?.notModified) {
       if (!meta.final || !ref.revision) { this.protocolErrors++; return; }
+      const fenced = this.isFenced(pending, ref);
       this.terminatePending(frame.correlation, pending);
+      if (fenced) {
+        pending.complete({ ok: false, error: { code: RELAY_ERROR.RESYNC_REQUIRED } });
+        return;
+      }
       pending.complete({ ok: true, value: { notModified: true, revision: ref.revision! } });
       return;
     }
@@ -475,12 +507,20 @@ export class RelayResourceClient {
 
   private publishGet(pending: PendingGet, ref: RelayResourceRef, codec: number, data: Uint8Array,
     digest: string | undefined, value?: unknown) {
-    if (this.generationFor(ref) !== pending.generation) {
+    if (this.isFenced(pending, ref)) {
       pending.complete({ ok: false, error: { code: RELAY_ERROR.RESYNC_REQUIRED } });
       return;
     }
     if (ref.revision) this.storeEntry(ref);
     pending.complete({ ok: true, value: { ref, codec, data, digest, value } });
+  }
+
+  /** Whether a late response must be dropped: a key/namespace invalidate moved
+   * the revision-free identity generation after the request was captured, or a
+   * revision-scope invalidate named the concrete revision the response carries. */
+  private isFenced(pending: PendingGet, responseRef: RelayResourceRef): boolean {
+    if (this.generationFor(responseRef) !== pending.generation) return true;
+    return responseRef.revision !== undefined && !!pending.fencedRevisions?.includes(responseRef.revision);
   }
 
   private handlePush(frame: RelayResourceIncomingFrame): void {
@@ -567,13 +607,6 @@ export class RelayResourceClient {
   private generationFor(ref: RelayResourceRef): number {
     const idKey = relayResourceKey(ref);
     return this.generations.get(idKey) ?? this.entries.get(idKey)?.generation ?? 0;
-  }
-
-  private refInScope(ref: RelayResourceRef, scope: string, target: RelayResourceRef | undefined, ns: string): boolean {
-    if (scope === RELAY_INVALIDATE_SCOPE.NAMESPACE) return ref.ns === ns;
-    if (!target) return false;
-    return scope === RELAY_INVALIDATE_SCOPE.KEY ? refMatchesKeyScope(ref, target)
-      : relayResourceKey(ref) === relayResourceKey(target);
   }
 
   localEntry(ref: RelayResourceRef): RelayLocalEntry | undefined {
