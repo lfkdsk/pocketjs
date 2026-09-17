@@ -589,6 +589,96 @@ test("invalidate scope=namespace moves every matching namespace generation forwa
   expect(seeded.client.localEntry(other)?.generation).toBe(0);
 });
 
+test("the cache identity excludes revision: every revision of a key shares it", () => {
+  expect(relayResourceKey(tileRef("r1"))).toBe(relayResourceKey(tileRef("r2")));
+  expect(relayResourceKey(tileRef(undefined))).toBe(relayResourceKey(tileRef("r2")));
+  // rendition and key still distinguish identities.
+  expect(relayResourceKey(tileRef("r1")))
+    .not.toBe(relayResourceKey({ ...tileRef("r1"), rendition: "r5g6b5le-128-v1" }));
+});
+
+test("F1: a key-scope invalidate fences an in-flight revisionless get", () => {
+  const { wire, client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  const results: { ok: boolean; error?: { code: string } }[] = [];
+  // §3.5: a get without revision requests the current revision.
+  client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+    (r) => results.push(r as { ok: boolean; error?: { code: string } }));
+  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
+  // The late response names the concrete revision (§3.5).
+  for (const f of auth.chunkObject({
+    type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
+    ref: tileRef("r1"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
+  })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  expect(results[0].ok).toBe(false);
+  expect(results[0].error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);
+  // The stale object must not be cached as fresh.
+  expect(client.localEntry(tileRef("r1"))?.stale).not.toBe(false);
+});
+
+test("F1: a revision-scope invalidate fences only the invalidated concrete revision", () => {
+  const { wire, client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  const results: { ok: boolean; error?: { code: string }; value?: { ref?: RelayResourceRef } }[] = [];
+  // Revisionless "current version" get.
+  client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+    (r) => results.push(r as typeof results[number]));
+  // r1 is invalidated while the get is in flight.
+  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
+  // Authority answers with the current revision, r2: a different concrete
+  // revision that the fence must not reject.
+  for (const f of auth.chunkObject({
+    type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
+    ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
+  })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  expect(results[0].ok).toBe(true);
+  expect(results[0].value?.ref?.revision).toBe("r2");
+  expect(client.localEntry(tileRef("r2"))?.stale).toBe(false);
+
+  // A named-r1 get already in flight when r1 is invalidated must still fence.
+  const named: { ok: boolean; error?: { code: string } }[] = [];
+  client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+    (r) => named.push(r as { ok: boolean; error?: { code: string } }));
+  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
+  for (const f of auth.chunkObject({
+    type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
+    ref: tileRef("r1"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
+  })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  expect(named[0].ok).toBe(false);
+  expect(named[0].error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);
+});
+
+test("F1: revision scope removes only the current concrete revision; an invalidate for another revision keeps it", () => {
+  const seeded = makeClient();
+  const auth = new RelayResourceAuthority();
+  const serve = (revision: string) => {
+    const out = seeded.client.get(1, tileRef(revision), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, () => {});
+    if (!("correlation" in out)) throw new Error("budget");
+    for (const f of auth.chunkObject({
+      type: RELAY_TYPE.RESPONSE, stream: 1, correlation: out.correlation,
+      ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE, data: zeros(10),
+    })) seeded.client.handleFrame(toFrame(f, RELAY_CODEC.R5G6B5LE));
+  };
+  // The resident cache holds the current revision per revision-less identity;
+  // publishing r2 replaces r1 at a frame boundary (§3.7).
+  serve("r1");
+  serve("r2");
+  const current = seeded.client.localEntry(tileRef("r2"));
+  expect(current?.ref.revision).toBe("r2");
+  // A revision invalidate for the stale r1 must not remove the resident r2.
+  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") })));
+  expect(seeded.client.localEntry(tileRef("r2"))?.ref.revision).toBe("r2");
+  expect(seeded.client.localEntry(tileRef("r2"))?.stale).toBe(false);
+  // An invalidate for the concrete current revision removes it.
+  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r2") })));
+  expect(seeded.client.localEntry(tileRef("r2"))).toBeUndefined();
+
+  // Key scope marks the current revision stale without deleting it.
+  serve("r3");
+  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r3") })));
+  expect(seeded.client.localEntry(tileRef("r3"))?.stale).toBe(true);
+});
+
 test("invalidate after subscribe forces resync on the next delta", () => {
   const { wire, client } = makeClient();
   const marks: boolean[] = [];
