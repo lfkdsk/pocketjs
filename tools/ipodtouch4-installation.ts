@@ -89,8 +89,24 @@ rollback() {
 }
 trap rollback EXIT
 trap 'exit 1' HUP INT TERM
-# Reject corrupt transfers before moving the existing app.
-test "$(/usr/bin/openssl dgst -sha256 "$archive")" = ${shellQuote(`SHA256(${archive})= ${archiveHash}`)}
+# Check bytes before moving the existing app. POSIX sh reports the status of the
+# last command in a pipeline, so openssl must not feed a pipe: capture its exit
+# status with the output, then match the complete line. OpenSSL 3 prints
+# SHA2-256(file)=; OpenSSL 0.9/1.0 and LibreSSL print SHA256(file)=.
+verify_digest() {
+  expected=$1
+  target=$2
+  if ! digest=$(/usr/bin/openssl dgst -sha256 "$target"); then
+    echo "digest command failed: $target" >&2
+    return 1
+  fi
+  if test "$digest" != "SHA2-256($target)= $expected" &&
+     test "$digest" != "SHA256($target)= $expected"; then
+    echo "digest verification failed: $target" >&2
+    return 1
+  fi
+}
+verify_digest ${shellQuote(archiveHash)} "$archive"
 if [ -e "$legacy" ]; then
   test "$("$installer" bundle-id "$legacy")" = "$id"
   test ! -e "$journal/legacy.app"
@@ -106,7 +122,7 @@ fi
 dest=$("$installer" user-path "$id")
 test "\${dest##*/}" = ${shellQuote(bundleName)}
 cd "$dest"
-${Object.entries(files).map(([name, hash]) => `test "$(/usr/bin/openssl dgst -sha256 ${shellQuote(name)})" = ${shellQuote(`SHA256(${name})= ${hash}`)}`).join("\n")}
+${Object.entries(files).map(([name, hash]) => `verify_digest ${shellQuote(hash)} ${shellQuote(name)}`).join("\n")}
 container=\${dest%/*}
 if [ -f "$journal/preferences.plist" ]; then
   mkdir -p "$container/Library/Preferences"
