@@ -423,6 +423,74 @@ function validateEnvelope(meta: Record<string, unknown>, type: number, stream: n
   return null;
 }
 
+// --- prepared bodies (P3 send scheduler) -------------------------------------
+
+/** A frame whose header fields are not known yet. The P3 scheduler admits
+ * work before it allocates seq (R5 §3.3: seq is assigned at selection), so
+ * metadata is serialized and size-checked once at admission. */
+export interface RelayFrameBodyInput {
+  type: number;
+  codec?: number;
+  stream: number;
+  metadata: Record<string, unknown>;
+  data?: Uint8Array;
+}
+
+export interface RelayPreparedBody {
+  type: number;
+  codec: number;
+  stream: number;
+  meta: Uint8Array;
+  data: Uint8Array;
+  /** 44 + metaBytes + dataBytes; does not include the length prefix. */
+  frameBytes: number;
+  /** Full wire record length: frameBytes + 4. Wire credit charges this. */
+  wireBytes: number;
+}
+
+type PrepareBodyResult =
+  | { ok: true; body: RelayPreparedBody }
+  | { ok: false; code: RelayFrameErrorCode };
+
+/** Validates type/codec/stream and the metadata/data body, and serializes
+ * metadata once. maxWireBytes/maxMetaBytes/codecs are enforced here so the
+ * admission decision already reflects every body-level bound. */
+export function prepareFrameBody(
+  input: RelayFrameBodyInput,
+  options: Pick<RelayFrameOptions, "maxWireBytes" | "maxMetaBytes" | "codecs"> = {},
+): PrepareBodyResult {
+  const type = input.type;
+  if (!(type >= RELAY_TYPE.REQUEST && type <= RELAY_TYPE.INVALIDATE)) return { ok: false, code: RELAY_FRAME_ERROR.BAD_TYPE };
+
+  const codec = input.codec ?? RELAY_CODEC.NONE;
+  if (!isU32(codec) || codec > 0xffff) return { ok: false, code: RELAY_FRAME_ERROR.BAD_CODEC };
+  const allowed = options.codecs ? new Set(options.codecs) : new Set(RELAY_DEFINED_CODECS);
+  if (!allowed.has(codec)) return { ok: false, code: RELAY_FRAME_ERROR.BAD_CODEC };
+
+  if (!isU32(input.stream)) return { ok: false, code: RELAY_FRAME_ERROR.BAD_LENGTH };
+
+  return buildBody(type, codec, input.stream, input.metadata, input.data, options);
+}
+
+/** Stamps session/seq/stream/correlation onto a prepared body. The envelope
+ * already fixed type/stream; only the four per-frame header values remain. */
+export function encodePreparedFrame(
+  body: RelayPreparedBody,
+  header: { session: bigint; seq: number; correlation: number },
+): EncodeResult {
+  if (typeof header.session !== "bigint" || header.session < 0n || header.session > 0xffffffffffffffffn) {
+    return { ok: false, code: RELAY_FRAME_ERROR.BAD_SESSION };
+  }
+  if (!isU32(header.seq) || header.seq === 0) return { ok: false, code: RELAY_FRAME_ERROR.BAD_SEQ };
+  if (!isU32(header.correlation)) return { ok: false, code: RELAY_FRAME_ERROR.BAD_CORRELATION };
+  const correlationRequired = body.type === RELAY_TYPE.REQUEST
+    || body.type === RELAY_TYPE.RESPONSE || body.type === RELAY_TYPE.CANCEL;
+  if (correlationRequired ? header.correlation === 0 : header.correlation !== 0) {
+    return { ok: false, code: RELAY_FRAME_ERROR.BAD_CORRELATION };
+  }
+  return { ok: true, bytes: assembleBody(body, header.session, header.seq, header.correlation) };
+}
+
 // --- encode ------------------------------------------------------------------
 
 export function encodeFrame(input: RelayFrameInput, options: RelayFrameOptions = {}): EncodeResult {
@@ -445,16 +513,32 @@ export function encodeFrame(input: RelayFrameInput, options: RelayFrameOptions =
     return { ok: false, code: RELAY_FRAME_ERROR.BAD_CORRELATION };
   }
 
-  const data = input.data ?? new Uint8Array(0);
+  const built = buildBody(type, codec, input.stream, input.metadata ?? {}, input.data, options);
+  if (!built.ok) return built;
+  return { ok: true, bytes: assembleBody(built.body, input.session, input.seq, input.correlation) };
+}
+
+/** Body-level checks shared by prepareFrameBody and encodeFrame: codec-0 data
+ * rule, strict metadata, envelope, u32 length math, receiver size limits. */
+function buildBody(
+  type: number,
+  codec: number,
+  stream: number,
+  metadataInput: Record<string, unknown> | undefined,
+  dataInput: Uint8Array | undefined,
+  options: Pick<RelayFrameOptions, "maxWireBytes" | "maxMetaBytes" | "codecs">,
+): PrepareBodyResult {
+  const data = dataInput ?? new Uint8Array(0);
   if (codec === RELAY_CODEC.NONE && data.length !== 0) return { ok: false, code: RELAY_FRAME_ERROR.BAD_CODEC };
 
   let meta: Uint8Array;
+  const metadata = metadataInput ?? {};
   try {
-    meta = writeMetadata(input.metadata ?? {});
+    meta = writeMetadata(metadata);
   } catch (e) {
     return { ok: false, code: e instanceof JsonWriteError ? e.code : RELAY_FRAME_ERROR.BAD_METADATA };
   }
-  const envelope = validateEnvelope(input.metadata ?? {}, type, input.stream);
+  const envelope = validateEnvelope(metadata, type, stream);
   if (envelope) return { ok: false, code: envelope };
 
   if (!Number.isSafeInteger(meta.length) || meta.length > 0xffffffff || data.length > 0xffffffff) {
@@ -469,27 +553,30 @@ export function encodeFrame(input: RelayFrameInput, options: RelayFrameOptions =
   if (options.maxWireBytes !== undefined && wireBytes > options.maxWireBytes) {
     return { ok: false, code: RELAY_FRAME_ERROR.WIRE_TOO_LARGE };
   }
+  return { ok: true, body: { type, codec, stream, meta, data, frameBytes, wireBytes } };
+}
 
-  const out = new Uint8Array(wireBytes);
+function assembleBody(body: RelayPreparedBody, session: bigint, seq: number, correlation: number): Uint8Array {
+  const out = new Uint8Array(body.wireBytes);
   const dv = new DataView(out.buffer);
-  dv.setUint32(H.frameBytes.offset, frameBytes, true);
+  dv.setUint32(H.frameBytes.offset, body.frameBytes, true);
   out.set([0x50, 0x52, 0x4c, 0x59], H.magic.offset);
   out[H.major.offset] = RELAY_FRAME.major;
   out[H.minor.offset] = RELAY_FRAME.minor;
-  out[H.type.offset] = type;
+  out[H.type.offset] = body.type;
   out[H.flags.offset] = 0;
   dv.setUint16(H.headerBytes.offset, RELAY_FRAME.headerBytes, true);
-  dv.setUint16(H.codec.offset, codec, true);
-  dv.setBigUint64(H.session.offset, input.session, true);
-  dv.setUint32(H.seq.offset, input.seq, true);
-  dv.setUint32(H.stream.offset, input.stream, true);
-  dv.setUint32(H.correlation.offset, input.correlation, true);
-  dv.setUint32(H.metaBytes.offset, meta.length, true);
-  dv.setUint32(H.dataBytes.offset, data.length, true);
+  dv.setUint16(H.codec.offset, body.codec, true);
+  dv.setBigUint64(H.session.offset, session, true);
+  dv.setUint32(H.seq.offset, seq, true);
+  dv.setUint32(H.stream.offset, body.stream, true);
+  dv.setUint32(H.correlation.offset, correlation, true);
+  dv.setUint32(H.metaBytes.offset, body.meta.length, true);
+  dv.setUint32(H.dataBytes.offset, body.data.length, true);
   dv.setUint32(H.reserved.offset, 0, true);
-  out.set(meta, RELAY_FRAME.headerBytes);
-  out.set(data, RELAY_FRAME.headerBytes + meta.length);
-  return { ok: true, bytes: out };
+  out.set(body.meta, RELAY_FRAME.headerBytes);
+  out.set(body.data, RELAY_FRAME.headerBytes + body.meta.length);
+  return out;
 }
 
 // --- decode ------------------------------------------------------------------
