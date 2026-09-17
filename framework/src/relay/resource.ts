@@ -263,7 +263,7 @@ export class RelayResourceClient {
     this.pending.set(correlation, {
       kind: "subscribe", stream,
       complete: (result) => {
-        if (result.ok && typeof result.value.subscription === "number") {
+        if (result.ok && "value" in result && typeof result.value.subscription === "number") {
           const id = result.value.subscription;
           // Reserve the push channel in the subscription id space, distinct
           // from get correlations (§3.7); admission failure closes the
@@ -901,10 +901,11 @@ export function createRelayResourceLoad(deps: RelayCacheAdapterDeps):
       ref,
       { accept: deps.accept, maxObjectBytes: deps.maxObjectBytes, ifRevision: deps.ifRevisionFor?.(ref) },
       (result) => {
-        if (!result.ok) { complete(result); return; }
+        if (!result.ok || !("value" in result)) { complete(result); return; }
         if ("notModified" in result.value) {
-          // The collection already holds the bytes; the cache keeps them.
-          complete({ ok: true, value: new Uint8Array(0) });
+          // notModified confirms the held revision; the cache retains the
+          // resident bytes and must not materialize an empty value (§3.8 TTL).
+          complete({ ok: true, revalidated: true });
           return;
         }
         complete({ ok: true, value: result.value.data });
