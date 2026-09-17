@@ -506,6 +506,30 @@ inner transport object itself**, so the disabled path has no wrapper frame
 and no hash work; the recorder's counters stay at 0. `toTape()` serializes
 the entries, and `parseFrameTape` shape-validates the JSON back.
 
+**Recording sits off the live path.** `send(frame)` calls the inner
+transport first and hands the frame to the recorder after it returns;
+`recv()` returns the inner frame before recording it. A frame the recorder
+rejects (a session other than the pinned one, a zero seq, or the
+`maxFrames` cap) still crosses the wire, and an error thrown by the inner
+transport propagates without recording the frame. The first rejected frame
+instead latches an `incomplete: {index, reason}` field onto the tape, and
+no later frame is appended: the stored tuples stay a clean single-session
+prefix ending at `index`. R5 §3.11 record mode requires partial record
+loss to mark the trace incomplete rather than break the live session.
+`verifyFrameTape` returns a `tape-incomplete` divergence for such a
+document, and `createRelayFrameReplay` refuses to build a replay from it;
+R5 §3.11 bars deterministic replay of a trace with gaps. The recorder also
+exposes the strict `note()`/`noteOut()`/`noteIn()` entry points that throw
+on the same rules, and the non-throwing `observe()` entry point the
+transport wrapper uses.
+
+The §3.2 bootstrap reaches the cap rule in ordinary use: HELLO carries
+session 0 and the first frame on the assigned session uses a different
+session value. An unpinned recorder pins the tape to the bootstrap
+session; the assigned-session frames reach the peer and mark the trace
+incomplete. Pin the recorder with `{ session }` or start recording after
+READY to capture a full post-bootstrap session.
+
 Replay uses a fake transport from `createRelayFrameReplay`: `recv()` returns
 the next recorded inbound record in capture order and `send(frame)` hashes
 the produced outbound record against the stored digest. **The first frame
