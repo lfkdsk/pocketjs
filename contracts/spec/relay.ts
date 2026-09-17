@@ -524,6 +524,7 @@ export const RELAY_METADATA_SCHEMAS: Readonly<Record<string, JsonSchema>> = Obje
       selected: versionSchema,
       profiles: { type: "array", items: profileEntrySchema },
       codecs: { type: "array", items: u16 },
+      kinds: { type: "array", items: u8 },
       grants: { type: "array", items: { type: "string", minLength: 1 } },
       rxLimits: rxLimitsSchema,
       transport: transportSchema,

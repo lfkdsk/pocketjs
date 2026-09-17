@@ -414,6 +414,60 @@ test("negotiation: codecs are the exact intersection in client order, always inc
   expect(pair.guest.negotiation!.codecs).toEqual([0, 257]);
 });
 
+test("B-2 negotiation: kinds are the exact intersection on both ends (guest [1,6,7] vs provider [1])", async () => {
+  const pair = makePair({
+    guestCaps: { kinds: [1, 6, 7] },
+    providerCaps: { kinds: [1] },
+  });
+  await handshake(pair);
+  // Draft §3.2 field table: codecs/kinds are chosen by mutual intersection;
+  // a value not selected is rejected. Both ends must record the same set.
+  expect(pair.provider.negotiation!.kinds).toEqual([1]);
+  expect(pair.guest.negotiation!.kinds).toEqual([1]);
+});
+
+test("B-2 negotiation: kinds intersection keeps guest order and rejects 6/7 the provider did not pick", async () => {
+  const pair = makePair({
+    guestCaps: { kinds: [7, 6, 1] },
+    providerCaps: { kinds: [1, 6] },
+  });
+  await handshake(pair);
+  // Provider filters the guest's offer into its own set, so guest order
+  // [7,6,1] narrows to [6,1]; both ends record the same list.
+  expect(pair.guest.negotiation!.kinds).toEqual([6, 1]);
+  expect(pair.provider.negotiation!.kinds).toEqual([6, 1]);
+});
+
+test("B-2 handshake: a HELLO response claiming a kind the guest never offered tears the guest down", async () => {
+  // Capture a well-formed provider response from a donor pair, then hand a
+  // copy to a fresh guest with its own bootNonce but kinds [3,8] (the
+  // default guest offers only [1,6]).
+  const donor = makePair();
+  donor.guest.hello();
+  await donor.flush();
+  const real = decode(donor.wire.find((f) => f.from === "provider")!);
+  expect(real.metadata.op).toBe(RELAY_OP.HELLO);
+
+  const solo = makePair();
+  solo.guest.hello(); // async transport: only the guest HELLO is on the wire
+  const ownHello = decode(solo.wire[0]);
+  expect(ownHello.metadata.op).toBe(RELAY_OP.HELLO);
+  solo.provider.close(); // never deliver the real response
+  expect(solo.guest.phase).toBe("hello-sent");
+
+  const bytes = encodeFrame({
+    type: RELAY_TYPE.RESPONSE, codec: 0, session: 0n, seq: 1, stream: 0, correlation: 1,
+    metadata: {
+      ...real.metadata,
+      bootNonce: ownHello.metadata.bootNonce, // pass the replay check first
+      kinds: [3, 8],
+    },
+  }, { maxWireBytes: 4096, codecs: [0] });
+  if (!bytes.ok) throw new Error(bytes.code);
+  solo.guest.handleRecord(bytes.bytes);
+  expect(solo.guest.phase).toBe("closed");
+});
+
 test("OPEN outside grants or with a non-negotiated profile/codec is refused", async () => {
   const pair = makePair();
   await handshake(pair);
