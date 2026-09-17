@@ -205,6 +205,77 @@ export interface RelayResourceRef {
   rendition: string; // binds codec/dimensions/density/style/font/renderer, <= 128 bytes
 }
 
+// --- 3.6 resource op delivery modes, scopes and advisory reasons -------------
+
+/** resource.subscribe delivery modes. [R5-P07] */
+export const RELAY_DELIVERY = Object.freeze({
+  /** Revision-ordered deltas; a gap stops application and requires resync. */
+  RELIABLE_DELTA: "reliable-delta",
+  /** Complete snapshots; only the newest unrevised snapshot is applied. */
+  LATEST_SNAPSHOT: "latest-snapshot",
+} as const);
+
+/** resource.invalidate scope. [R5-P06/P08] */
+export const RELAY_INVALIDATE_SCOPE = Object.freeze({
+  /** One concrete (ref, revision). */
+  REVISION: "revision",
+  /** Every revision of ns/kind/key/rendition. */
+  KEY: "key",
+  /** Every resource in the namespace. */
+  NAMESPACE: "namespace",
+} as const);
+
+/** cache.evict advisory reason; consumer-side only. [R5-P08, Q5] */
+export const RELAY_EVICT_REASON = Object.freeze({
+  BUDGET: "budget",
+  VIEW_CLOSE: "view-close",
+} as const);
+
+/** resource.get args. [R5-P06] */
+export interface RelayResourceGetArgs {
+  accept: number[]; // u16 RELAY_CODEC values the consumer can decode
+  maxObjectBytes: number; // u32 assembled-object ceiling the consumer reserves
+  /** Conditional fetch: the revision the consumer already holds. A match
+   * comes back status=ok with value.notModified=true and the concrete
+   * revision still named at the top level. */
+  ifRevision?: string; // <= 128 UTF-8 bytes
+}
+
+/** resource.get notModified value; no data region accompanies it. [R5-P06] */
+export interface RelayNotModifiedValue {
+  notModified: true;
+}
+
+export interface RelayResourceSubscribeArgs {
+  delivery: string; // one of RELAY_DELIVERY
+  /** Authorized-namespace subscription; when present `resource` may be
+   * omitted. The filter is still ns/kind/key/rendition. [R5-P06] */
+  namespace?: string; // <= 128 UTF-8 bytes
+}
+
+export interface RelaySubscribeValue {
+  subscription: number; // u32, session-scoped, never reused
+}
+
+export interface RelayUnsubscribeArgs {
+  subscription: number; // u32
+}
+
+export interface RelayResourceReleaseArgs {
+  lease: number; // u32 provider-allocated remote-residence lease
+}
+
+export interface RelayInvalidateArgs {
+  scope: string; // one of RELAY_INVALIDATE_SCOPE
+  /** Required for scope=namespace when no resource.ns is supplied. */
+  namespace?: string; // <= 128 UTF-8 bytes
+  reason?: string; // diagnostics only; the draft sets no byte cap
+}
+
+export interface RelayEvictArgs {
+  reason: string; // one of RELAY_EVICT_REASON
+}
+
 // --- 3.2 handshake and negotiation bounds -----------------------------------
 
 export const RELAY_HANDSHAKE = Object.freeze({
@@ -630,6 +701,198 @@ export const RELAY_METADATA_SCHEMAS: Readonly<Record<string, JsonSchema>> = Obje
       // stream and its seq space must survive a forged reset.
       targetStream: { type: "integer", minimum: 1, maximum: 0xffffffff },
       reason: { type: "string", minLength: 1, maxBytes: 64 },
+    },
+  },
+
+  // --- L2 resource op metadata schemas [R5-P05/P06/P07/P08] ------------------
+
+  [`${RELAY_OP.RESOURCE_GET}.request`]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "resource", "args"],
+    properties: {
+      op: { const: RELAY_OP.RESOURCE_GET },
+      resource: resourceRefSchema,
+      args: {
+        type: "object",
+        additionalProperties: false,
+        required: ["accept", "maxObjectBytes"],
+        properties: {
+          accept: { type: "array", minItems: 1, items: u16 },
+          maxObjectBytes: u32,
+          ifRevision: { type: "string", minLength: 1, maxBytes: RELAY_RESOURCE.revisionMaxBytes },
+        },
+      },
+      budgetMs: u32,
+    },
+  },
+  [`${RELAY_OP.RESOURCE_GET}.response`]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "resource", "status", "final"],
+    properties: {
+      op: { const: RELAY_OP.RESOURCE_GET },
+      resource: resourceRefSchema,
+      status: { type: "string", enum: [RELAY_STATUS.OK, RELAY_STATUS.ERROR] },
+      final: { type: "boolean" },
+      // Chunked deliveries carry codec-1.. data in the data region; small
+      // unchunked results and notModified use value.
+      value: { type: "object" },
+      transfer: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "offset", "total"],
+        properties: { id: u32, offset: hex16, total: hex16 },
+      },
+      digest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+      error: { type: "object" },
+    },
+  },
+  [`${RELAY_OP.RESOURCE_SUBSCRIBE}.request`]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "args"],
+    properties: {
+      op: { const: RELAY_OP.RESOURCE_SUBSCRIBE },
+      resource: resourceRefSchema,
+      args: {
+        type: "object",
+        additionalProperties: false,
+        required: ["delivery"],
+        properties: {
+          delivery: { type: "string", enum: [RELAY_DELIVERY.RELIABLE_DELTA, RELAY_DELIVERY.LATEST_SNAPSHOT] },
+          namespace: { type: "string", minLength: 1, maxBytes: RELAY_RESOURCE.nsMaxBytes },
+        },
+      },
+      budgetMs: u32,
+    },
+  },
+  [`${RELAY_OP.RESOURCE_SUBSCRIBE}.response`]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "status", "final", "value"],
+    properties: {
+      op: { const: RELAY_OP.RESOURCE_SUBSCRIBE },
+      resource: resourceRefSchema,
+      status: { type: "string", enum: [RELAY_STATUS.OK, RELAY_STATUS.ERROR] },
+      final: { const: true },
+      value: {
+        type: "object",
+        additionalProperties: false,
+        required: ["subscription"],
+        properties: { subscription: u32 },
+      },
+      error: { type: "object" },
+    },
+  },
+  [`${RELAY_OP.RESOURCE_UNSUBSCRIBE}.request`]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "args"],
+    properties: {
+      op: { const: RELAY_OP.RESOURCE_UNSUBSCRIBE },
+      args: {
+        type: "object",
+        additionalProperties: false,
+        required: ["subscription"],
+        properties: { subscription: u32 },
+      },
+    },
+  },
+  [`${RELAY_OP.RESOURCE_UNSUBSCRIBE}.response`]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "status", "final"],
+    properties: {
+      op: { const: RELAY_OP.RESOURCE_UNSUBSCRIBE },
+      status: { const: RELAY_STATUS.OK },
+      final: { const: true },
+      error: { type: "object" },
+    },
+  },
+  [`${RELAY_OP.RESOURCE_RELEASE}.request`]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "resource", "args"],
+    properties: {
+      op: { const: RELAY_OP.RESOURCE_RELEASE },
+      resource: resourceRefSchema,
+      args: {
+        type: "object",
+        additionalProperties: false,
+        required: ["lease"],
+        properties: { lease: u32 },
+      },
+    },
+  },
+  [`${RELAY_OP.RESOURCE_RELEASE}.response`]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "status", "final"],
+    properties: {
+      op: { const: RELAY_OP.RESOURCE_RELEASE },
+      status: { type: "string", enum: [RELAY_STATUS.OK, RELAY_STATUS.ERROR] },
+      final: { const: true },
+      error: { type: "object" },
+    },
+  },
+  /** PUSH content for an established subscription. Chunked pushes repeat
+   * transfer/digest exactly like get responses. `final` is required on PUSH. */
+  "resource.push": {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "resource", "subscription", "final"],
+    properties: {
+      op: { type: "string", minLength: 1, maxLength: 64, pattern: "^[a-z][a-z0-9_.-]{0,63}$" },
+      resource: resourceRefSchema,
+      subscription: u32,
+      final: { type: "boolean" },
+      value: { type: "object" },
+      baseRevision: { type: "string", minLength: 1, maxBytes: RELAY_RESOURCE.revisionMaxBytes },
+      transfer: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "offset", "total"],
+        properties: { id: u32, offset: hex16, total: hex16 },
+      },
+      digest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+    },
+  },
+  /** Authority -> consumers. Exactly one of resource (revision/key scope)
+   * or args.namespace (namespace scope) identifies the blast radius. */
+  [RELAY_OP.RESOURCE_INVALIDATE]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "args"],
+    properties: {
+      op: { const: RELAY_OP.RESOURCE_INVALIDATE },
+      resource: resourceRefSchema,
+      args: {
+        type: "object",
+        additionalProperties: false,
+        required: ["scope"],
+        properties: {
+          scope: { type: "string", enum: [RELAY_INVALIDATE_SCOPE.REVISION, RELAY_INVALIDATE_SCOPE.KEY, RELAY_INVALIDATE_SCOPE.NAMESPACE] },
+          namespace: { type: "string", minLength: 1, maxBytes: RELAY_RESOURCE.nsMaxBytes },
+          reason: { type: "string", minLength: 1, maxBytes: 160 },
+        },
+      },
+    },
+  },
+  /** Consumer -> provider advisory. Never an ACK; the provider may ignore it. */
+  [RELAY_OP.CACHE_EVICT]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "resource", "args"],
+    properties: {
+      op: { const: RELAY_OP.CACHE_EVICT },
+      resource: resourceRefSchema,
+      args: {
+        type: "object",
+        additionalProperties: false,
+        required: ["reason"],
+        properties: { reason: { type: "string", enum: [RELAY_EVICT_REASON.BUDGET, RELAY_EVICT_REASON.VIEW_CLOSE] } },
+      },
     },
   },
 });
