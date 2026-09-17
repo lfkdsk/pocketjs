@@ -50,10 +50,10 @@ export type PackageRole = (typeof PACKAGE_ROLES)[number];
  *   stock host. Admission is the RUNTIME rule this file defines — manifest
  *   `requires` ⊆ target profile `capabilities`.
  * - "aot":   the same source is recompiled natively per device by an AOT
- *   compiler family (Pocket Vapor, Pocket Static). There is no hostAbi, no
+ *   compiler family. There is no hostAbi, no
  *   ops and no runtime capability check; admission is COMPILE-TIME — the
  *   compiler derives the app's demands and checks them against a BOARD
- *   PROFILE (data, not a registry entry — see vapor/BOARDS.md).
+ *   PROFILE (data, not a guest target registry entry).
  *
  * The classes scale differently on purpose: guest targets stay an inventory
  * of real, golden-tested hosts (this registry); aot boards are open-ended
@@ -210,6 +210,7 @@ export const POCKET_CAPABILITIES = defineCapabilityRegistry([
   // application-surface composition.
   "display.auxiliary",
   "text.glyphs.baked",
+  "text.glyphs.streamed",
   // Codepoints outside the baked charset still render: the host extends
   // the font atlases at runtime (system-font rasterization + loadFontAtlas
   // reload). Required by any app that accepts arbitrary text input.
@@ -269,6 +270,7 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
       // globalThis.audio (4-stream mixer on one 44.1 kHz normal channel).
       "audio.pcm",
       "text.glyphs.baked",
+      "text.glyphs.streamed",
     ],
   },
   vita: {

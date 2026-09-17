@@ -38,14 +38,13 @@ pocketjs/
 ├─ framework/    Guest: @pocketjs/framework
 │  ├─ src/        the TS runtime (Solid + Vue Vapor renderers, components, input, osk…)
 │  └─ compiler/   the interpreted-path build pipeline (jsx-plugin, tailwind, pak)
-├─ vapor/        Pocket Vapor: the AOT compiler family (Vue Vapor subset → GBA/GB/NES)
 ├─ contracts/    single sources of truth binding the layers
 │  ├─ spec/       op contract, platform contracts, manifest + package spec, gen-rust + gen-c
 │  ├─ generated/  generated C contract headers consumed by native hosts
 │  └─ schema/     published JSON schemas (pocket-2.json)
 ├─ apps/         demo apps (pocket.json manifests; built by tools/build.ts)
 ├─ tools/        every command: build/dev/device/release bun scripts (flat),
-│                plus cli/ (@pocketjs/cli), psplink/, imagegen/, and
+│                plus cli/ (@pocketjs/cli), psplink/, and
 │                symbian/ (isolated GCCE/Qt toolchain + CODA USB transport)
 ├─ tests/        the test suite: *.test.ts flat at the root, plus
 │                e2e/ (PPSSPP, Vita3K drivers), goldens/{web,psp,vita}, tapes/, fixtures/
@@ -63,8 +62,6 @@ New things go where the axis says — never invent a top-level directory:
 - **A new Rust simulation core** → `engine/` (workspace member if it builds on
   desktop; excluded standalone crate if it needs a console toolchain).
 - **A new platform embedding** (ESP32, 3DS, …) → `hosts/<platform>/`.
-- **A new AOT backend** (Vapor gains a console) → `vapor/runtime/<console>/`;
-  the vapor compiler grows a target entry, the top level does not change.
 - **A new demo** → `apps/<name>/` with a `pocket.json`. Standalone products
   keep the `pocket-<name>` separate-repo convention and do not move in.
 - **A new command** → `tools/<name>.ts`. No single-file top-level directories.

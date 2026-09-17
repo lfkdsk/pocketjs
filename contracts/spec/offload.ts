@@ -7,6 +7,9 @@ export const OFFLOAD = Object.freeze({
 });
 
 export interface OffloadOps {
+  /** Device-local provider with independent credits and generation. No pairing
+   * is needed; the host's local capability/path policy controls access. */
+  local?: OffloadOps;
   /** Positive authenticated connection generation; zero/negative = offline. */
   session(): number;
   /** Nonwaiting bounded copy. False means no credit; caller retains work. */

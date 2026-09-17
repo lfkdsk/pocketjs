@@ -3998,3 +3998,220 @@ fn font_revision_changes_only_after_successful_load_and_is_slot_local() {
     assert_eq!(ui.font_atlas_revision(0), 0);
     assert_eq!(ui.font_atlas_revision(255), 0);
 }
+
+fn stream_config(generation: u32, capacity: u16) -> [u8; 20] {
+    let mut b = [0; 20];
+    b[..4].copy_from_slice(&crate::font_stream::CONFIG_MAGIC.to_le_bytes());
+    b[4..8].copy_from_slice(&generation.to_le_bytes());
+    b[8..15].copy_from_slice(&[2, 8, 8, 7, 10, 8, 1]);
+    b[16..18].copy_from_slice(&capacity.to_le_bytes());
+    b
+}
+fn stream_batch(generation: u32, cp: u32, coverage: u8) -> Vec<u8> {
+    let mut b = alloc::vec![0;36];
+    b[..4].copy_from_slice(&crate::font_stream::GLYPH_MAGIC.to_le_bytes());
+    b[4..8].copy_from_slice(&generation.to_le_bytes());
+    b[8..12].copy_from_slice(&[2, 1, 8, 8]);
+    b[12..16].copy_from_slice(&cp.to_le_bytes());
+    b[16] = 8;
+    b[18] = 1;
+    b[20..].fill(coverage);
+    b
+}
+fn streamed_ui(capacity: u16) -> (Ui, i32) {
+    streamed_ui_at_rate(capacity, 60)
+}
+fn streamed_ui_at_rate(capacity: u16, hz: u32) -> (Ui, i32) {
+    let mut ui = Ui::new();
+    assert!(ui.set_tick_rate(hz));
+    assert!(ui.load_font_atlas(&encode_atlas(
+        2,
+        8,
+        8,
+        7,
+        10,
+        2,
+        &[(65, 1, 6), (0xfffd, 0, 8)]
+    )));
+    assert!(ui.font_stream_configure(&stream_config(1, capacity)));
+    let text = ui.create_node(1);
+    ui.insert_before(spec::ROOT_ID, text, 0);
+    ui.set_prop(text, spec::prop::FONT_SLOT, 2.0);
+    ui.set_text(text, "你好");
+    ui.tick();
+    ui.draw();
+    (ui, text)
+}
+fn lease(generation: u32, slot: u8, id: u32, action: u8, text: &str) -> Vec<u8> {
+    let mut b = alloc::vec![0; 16];
+    b[..4].copy_from_slice(&crate::font_stream::BATCH_MAGIC.to_le_bytes());
+    b[4..8].copy_from_slice(&generation.to_le_bytes());
+    b[8] = slot;
+    b[9] = action;
+    b[12..16].copy_from_slice(&id.to_le_bytes());
+    for cp in text.chars() {
+        b.extend_from_slice(&(cp as u32).to_le_bytes());
+    }
+    b
+}
+#[test]
+fn streamed_batches_reserve_union_before_io_and_pin_until_release() {
+    for capacity in [2, 4] {
+        let (mut ui, text) = streamed_ui(capacity);
+        assert_eq!(
+            ui.font_stream_requests(),
+            "[]",
+            "drawing must not submit demand"
+        );
+        assert_eq!(ui.font_stream_batch(&lease(1, 2, 1, 0, "A你你好")), 0);
+        assert_eq!(ui.font_stream_batch(&lease(1, 2, 2, 0, "你")), 0);
+        let excess = if capacity == 2 {
+            "世界"
+        } else {
+            "世界文字"
+        };
+        assert_eq!(ui.font_stream_batch(&lease(1, 2, 3, 0, excess)), -2);
+        assert!(!ui.font_stream_requests().contains("19990"));
+        assert_eq!(ui.font_stream_commit(&stream_batch(1, '你' as u32, 255)), 1);
+        assert_eq!(ui.font_stream_batch(&lease(1, 2, 1, 1, "")), 0);
+        assert_eq!(ui.font_stream_batch(&lease(1, 2, 2, 1, "")), 1);
+        ui.set_text(text, "A");
+        ui.tick();
+        ui.draw();
+        assert_eq!(ui.font_stream_commit(&stream_batch(1, '好' as u32, 170)), 1);
+        assert_eq!(ui.font_stream_batch(&lease(1, 2, 1, 1, "")), 1);
+        assert_eq!(ui.font_stream_batch(&lease(1, 2, 1, 2, "")), 1);
+        assert_eq!(
+            ui.font_stream_batch(&lease(
+                1,
+                2,
+                3,
+                0,
+                if capacity == 2 { "世" } else { "世界文" }
+            )),
+            0
+        );
+        assert_eq!(ui.font_stream_commit(&stream_batch(1, '世' as u32, 85)), 1);
+        assert!(
+            ui.font_atlas(2).unwrap().lookup('你' as u32).is_some(),
+            "overlapping lease keeps its pin"
+        );
+        assert_eq!(ui.font_stream_batch(&lease(1, 2, 2, 1, "")), 1);
+        assert_eq!(ui.measure_text("A世", 2), 14.0);
+    }
+}
+#[test]
+fn streamed_batches_reject_stale_corrupt_cancelled_and_unsupported_glyphs() {
+    let (mut ui, _) = streamed_ui(4);
+    assert_eq!(ui.font_stream_batch(&lease(1, 2, 1, 0, "你好")), 0);
+    assert_eq!(ui.font_stream_commit(&stream_batch(2, '你' as u32, 255)), 0);
+    let mut invalid = stream_batch(1, '你' as u32, 255);
+    invalid[18] = 2;
+    assert_eq!(ui.font_stream_commit(&invalid), 0);
+    for n in 0..36 {
+        assert_eq!(ui.font_stream_commit(&invalid[..n]), 0);
+    }
+    let mut absent = stream_batch(1, '你' as u32, 0);
+    absent[18] = 0;
+    ui.font_stream_commit(&absent);
+    assert_eq!(ui.font_stream_batch(&lease(1, 2, 1, 1, "")), -1);
+    assert!(!ui.font_stream_requests().contains("20320"));
+    assert_eq!(ui.font_stream_batch(&lease(1, 2, 1, 2, "")), 1);
+    assert_eq!(ui.font_stream_commit(&stream_batch(1, '好' as u32, 255)), 0);
+    assert_eq!(ui.font_stream_requests(), "[]");
+    assert!(ui.font_stream_configure(&stream_config(2, 4)));
+    assert_eq!(ui.font_stream_batch(&lease(1, 2, 1, 1, "")), -3);
+    assert_eq!(ui.font_stream_batch(&lease(2, 2, 1, 0, "你")), 0);
+    assert!(ui.font_stream_requests().contains("20320"));
+    assert!(ui.font_stream_configure(&stream_config(0, 0)));
+    assert_eq!(ui.font_atlas(2).unwrap().glyph_count, 2);
+    assert!(ui.font_atlas(2).unwrap().lookup(65).is_some());
+}
+#[test]
+fn streamed_batches_validate_bounds_and_share_request_slots() {
+    let (mut ui, _) = streamed_ui(128);
+    assert!(ui.load_font_atlas(&encode_atlas(
+        3,
+        8,
+        8,
+        7,
+        10,
+        2,
+        &[(0xfffd, 0, 8), (65, 1, 6)]
+    )));
+    let mut config = stream_config(1, 128);
+    config[8] = 3;
+    assert!(ui.font_stream_configure(&config));
+    let text: String = (0x4e00..0x4e64)
+        .map(|cp| char::from_u32(cp).unwrap())
+        .collect();
+    for slot in [2, 3] {
+        assert_eq!(ui.font_stream_batch(&lease(1, slot, 1, 0, &text)), 0);
+    }
+    let first = ui.font_stream_requests();
+    let second = ui.font_stream_requests();
+    assert!(first.contains("[1,2,19968]"));
+    assert!(first.contains("[1,3,19968]"));
+    assert!(!second.contains("19968"));
+    assert!(second.contains("[1,2,19984]"));
+    let valid = lease(1, 2, 2, 0, "A");
+    for n in 0..16 {
+        assert_eq!(ui.font_stream_batch(&valid[..n]), -3);
+    }
+    assert_eq!(ui.font_stream_batch(&lease(1, 2, 0, 0, "A")), -3);
+    assert_eq!(ui.font_stream_batch(&lease(1, 2, 1, 0, "A")), -3);
+    config[18] = 1;
+    assert!(!ui.font_stream_configure(&config));
+}
+
+#[test]
+fn streamed_detach_reclaims_capacity_and_restores_baked_cells_across_slots() {
+    let mut ui = Ui::new();
+    for slot in 0..4 {
+        let mut atlas = encode_atlas(
+            slot,
+            8,
+            8,
+            7,
+            10,
+            2,
+            &[(65, 1, 6), (0xfffd, 0, 8)]
+        );
+        for (i, pixel) in atlas[32..].iter_mut().enumerate() {
+            *pixel = (i + 1) as u8;
+        }
+        assert!(ui.load_font_atlas(&atlas));
+    }
+    let baked = ui.font_atlas(0).unwrap().bitmap.clone();
+    let baseline: usize = (0..4)
+        .map(|s| ui.font_atlas(s).unwrap().bitmap.capacity())
+        .sum();
+    for generation in 1..=3 {
+        for slot in 0..4 {
+            let mut config = stream_config(generation, 4096);
+            config[8] = slot;
+            config[9] = 32;
+            config[10] = 16;
+            assert!(ui.font_stream_configure(&config));
+            // Reopening the same slot must remember the original baked geometry.
+            config[4..8].copy_from_slice(&(generation + 10).to_le_bytes());
+            assert!(ui.font_stream_configure(&config));
+            config[4..8].fill(0);
+            config[16..18].fill(0);
+            assert!(ui.font_stream_configure(&config));
+            let actual: usize = (0..4)
+                .map(|s| ui.font_atlas(s).unwrap().bitmap.capacity())
+                .sum();
+            assert_eq!(
+                actual, baseline,
+                "released slots must not hide retained bitmap allocations"
+            );
+            let atlas = ui.font_atlas(slot).unwrap();
+            assert_eq!((atlas.cell_w, atlas.cell_h), (8, 8));
+            assert_eq!(atlas.bitmap, baked);
+            assert_eq!(atlas.cmap.capacity(), atlas.cmap.len());
+            assert!(ui.font_stream_stats().contains("\"bytes\":0"));
+            assert_eq!(ui.measure_text("AA", slot), 12.0);
+        }
+    }
+}

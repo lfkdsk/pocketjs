@@ -100,6 +100,10 @@ pub mod op {
     pub const SET_COMPOSITOR_SURFACE: u8 = 44;
     pub const HIT_TEST_AUXILIARY: u8 = 45;
     pub const HIT_TEST_BOUNDS_AUXILIARY: u8 = 46;
+    pub const FONT_STREAM_CONFIGURE: u8 = 47;
+    pub const FONT_STREAM_REQUESTS: u8 = 48;
+    pub const FONT_STREAM_COMMIT: u8 = 49;
+    pub const FONT_STREAM_STATS: u8 = 50;
 }
 
 /// Property ids (u8, stable, append-only). Groups:

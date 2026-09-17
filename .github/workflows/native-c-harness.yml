@@ -9,9 +9,22 @@ on:
       - "hosts/ios-legacy/**"
       - "hosts/android/**"
       - "tests/contact-latch.test.ts"
+      - "hosts/esp-idf/components/pocketjs_package/**"
+      - "hosts/esp-idf/tests/host/package_corpus.*"
+      - "tests/idf-package-corpus.test.ts"
+      - "tests/ipodtouch4-installation.test.ts"
+      - "tools/ipodtouch4-installation.ts"
       - "tests/clear-text.test.ts"
       - "tests/clear-ime-loading.test.ts"
-      - "apps/clear/**"
+      - "apps/**"
+      - "assets/**"
+      - "engine/wasm/**"
+      - "hosts/web/wasm-ops.js"
+      - "tests/golden*.ts"
+      - "tests/goldens/web/**"
+      - "tests/tapes/**"
+      - "tests/png.ts"
+      - "tools/tape.ts"
       - "tests/fixtures/contact-latch.c"
       - "engine/ui-cabi/**"
       - "engine/core/**"
@@ -37,9 +50,22 @@ on:
       - "hosts/ios-legacy/**"
       - "hosts/android/**"
       - "tests/contact-latch.test.ts"
+      - "hosts/esp-idf/components/pocketjs_package/**"
+      - "hosts/esp-idf/tests/host/package_corpus.*"
+      - "tests/idf-package-corpus.test.ts"
+      - "tests/ipodtouch4-installation.test.ts"
+      - "tools/ipodtouch4-installation.ts"
       - "tests/clear-text.test.ts"
       - "tests/clear-ime-loading.test.ts"
-      - "apps/clear/**"
+      - "apps/**"
+      - "assets/**"
+      - "engine/wasm/**"
+      - "hosts/web/wasm-ops.js"
+      - "tests/golden*.ts"
+      - "tests/goldens/web/**"
+      - "tests/tapes/**"
+      - "tests/png.ts"
+      - "tools/tape.ts"
       - "tests/fixtures/contact-latch.c"
       - "engine/ui-cabi/**"
       - "engine/core/**"
@@ -88,8 +114,8 @@ jobs:
         run: bun tools/build.ts hero
       - name: Renderer and runtime stage/dispatcher contracts
         run: bun test --conditions=browser tests/quickjs-c-harness.test.ts tests/renderer.test.ts tests/virtual-list.test.ts tests/vue-vapor-dom.test.ts
-      - name: Native contact lifetimes and cancellation
-        run: bun test tests/contact-latch.test.ts
+      - name: Native contacts, package corpus and device installation contracts
+        run: bun test tests/contact-latch.test.ts tests/idf-package-corpus.test.ts tests/ipodtouch4-installation.test.ts
       - name: Build Clear simulator inputs
         run: bun tools/wasm.ts && bun tools/build.ts clear-main --framework=vue-vapor
       - name: Clear input and text chain
@@ -100,3 +126,6 @@ jobs:
         run: bun test tests/ui-cabi-allocator.test.ts
       - name: Contract drift
         run: bun tests/contract.ts
+      - name: Renderer goldens and deterministic replay
+        if: runner.os == 'Linux'
+        run: bun tests/golden.ts && bun run tape:check

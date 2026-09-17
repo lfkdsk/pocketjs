@@ -102,6 +102,8 @@ const SUITE: readonly Stage[] = [
       "tests/offload-provider.test.ts",
       "tests/companion-session.test.ts",
       "tests/resource-cache.test.ts",
+      "tests/font-config.test.ts",
+      "tests/font-archive.test.ts",
       "tests/net-web.test.js",
       "tests/vita-package.test.ts",
       "tests/psp-toolchain.test.ts",
@@ -141,7 +143,7 @@ const SUITE: readonly Stage[] = [
   {
     name: "handheld models and dual output",
     prep: [["bun", "tools/wasm.ts"]],
-    tests: ["tests/handheld-models.test.ts"],
+    tests: ["tests/handheld-models.test.ts", "tests/text-batch.test.ts", "tests/text-cjk.test.ts"],
   },
   {
     name: "vue-sfc journeys",

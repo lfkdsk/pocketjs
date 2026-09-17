@@ -30,3 +30,6 @@ pocketjs-core = { path = "../../engine/core" }
 capture = []
 # PSP-side microsecond timing summary for tools/bench-ppsspp.ts.
 bench = []
+
+# Explicit validation only: mailbox polling introduces main-thread host0 IO.
+devtools-offload = []
