@@ -18,6 +18,7 @@ import {
   RELAY_CODEC,
   RELAY_ERROR,
   RELAY_OP,
+  RELAY_STATUS,
   RELAY_TYPE,
   type RelayProfileEntry,
   type RelayRxLimits,
@@ -989,4 +990,79 @@ test("mutation: flipping one magic byte of the HELLO record rejects at the frame
   expect(pair.provider.phase).toBe("closed");
   expect(pair.provider.getStats().droppedDecodeError).toBe(1);
   expect(pair.provider.getStats().handshakeFailures).toBe(0); // rejected below session layer
+});
+
+// =============================================================================
+// 11. Review 937 test teeth: BUSY rollback, bootNonce echo, pong token
+// =============================================================================
+
+test("T-1 a BUSY ping does not burn a stream-0 seq (the retry is the next seq)", async () => {
+  let busy = false;
+  const pair = makePair({
+    sync: true,
+    sendPolicy: { guest: () => (busy ? "busy" : "accepted") },
+  });
+  await handshake(pair);
+  const seqAfterReady = decode(lastFrames(pair, "guest", 1)[0]).seq;
+  busy = true;
+  pair.clocks.guest.advance(2000); // ping attempt -> BUSY, seq rolled back
+  busy = false;
+  pair.clocks.guest.advance(1500); // retry timer -> the ping is admitted
+  const ping = decode(lastFrames(pair, "guest", 1)[0]);
+  expect(ping.metadata.op).toBe(RELAY_OP.PING);
+  expect(ping.seq).toBe(seqAfterReady + 1);
+});
+
+test("T-2 a HELLO response echoing the wrong bootNonce tears the guest down", async () => {
+  // Donor pair supplies a well-formed provider HELLO response.
+  const donor = makePair({ sync: false });
+  await handshake(donor);
+  const real = decode(donor.wire.find((f) => f.from === "provider"
+    && decode(f).metadata.op === RELAY_OP.HELLO)!);
+
+  // A fresh guest parked in hello-sent, never given the real response.
+  const solo = makePair({ sync: false });
+  solo.guest.hello();
+  expect(solo.guest.phase).toBe("hello-sent");
+
+  const forged = encodeFrame({
+    type: RELAY_TYPE.RESPONSE, codec: 0, session: 0n, seq: 1, stream: 0, correlation: 1,
+    metadata: { ...real.metadata, bootNonce: "f".repeat(32) },
+  }, { maxWireBytes: 4096, codecs: [0] });
+  if (!forged.ok) throw new Error(forged.code);
+  solo.guest.handleRecord(forged.bytes);
+  expect(solo.guest.phase).toBe("closed");
+});
+
+test("T-3 a pong carrying a token we never sent does not satisfy the outstanding ping", async () => {
+  // Sync transport: the real pong is delivered nested inside the ping's
+  // emit, before outstandingPing is assigned, so it is dropped stale and
+  // the ping remains outstanding. A forged seq-3 pong with a wrong token
+  // must then also fail the token match instead of clearing the ping.
+  const pair = makePair({ sync: true, pingIntervalMs: 2000, retryMs: 1500 });
+  pair.guest.hello();
+  expect(pair.guest.phase).toBe("ready");
+  pair.clocks.guest.advance(2000); // guest ping goes out; real pong nests and is dropped
+  const ping = decode(lastFrames(pair, "guest", 1)[0]);
+  expect(ping.metadata.op).toBe(RELAY_OP.PING);
+  const pingsBefore = pair.guest.getStats().pingsSent;
+  expect(pingsBefore).toBe(1);
+
+  // Provider stream 0 sent READY ack (seq 1) then the nested real pong
+  // (seq 2); the forged pong is seq 3 so it passes the inbound-seq check.
+  const wrong = encodeFrame({
+    type: RELAY_TYPE.RESPONSE, codec: 0, session: pair.guest.sessionId,
+    seq: 3, stream: 0, correlation: ping.correlation,
+    metadata: {
+      op: RELAY_OP.PING, status: RELAY_STATUS.OK, final: true,
+      token: (((ping.metadata.token as number) ^ 0x5a5a) >>> 0),
+    },
+  }, { maxWireBytes: 4096, codecs: [0] });
+  if (!wrong.ok) throw new Error(wrong.code);
+  pair.guest.handleRecord(wrong.bytes);
+  expect(pair.guest.phase).toBe("ready");
+
+  // Still outstanding: the next interval must not start a second ping.
+  pair.clocks.guest.advance(2000);
+  expect(pair.guest.getStats().pingsSent).toBe(pingsBefore);
 });
