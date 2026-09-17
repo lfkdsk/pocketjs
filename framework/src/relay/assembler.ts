@@ -27,11 +27,19 @@ export type RelayResourceErrorCode =
   | typeof RELAY_ERROR.BUSY
   | typeof RELAY_ERROR.TOO_LARGE;
 
+/** One assembler table per session/receiver. The §3.7 key is
+ * `(session, stream, REQUEST direction + correlation or subscription,
+ * transfer.id)`: a get correlation and a subscription id are two independent
+ * id spaces (both allocators start at 1), so a `space` discriminator keeps a
+ * correlation 1 from colliding with subscription id 1. Bounded; hostile input
+ * produces a fixed error code, never a throw. */
 export interface RelayChannelKey {
   stream: number;
   /** Correlation of the REQUEST for RESPONSE deliveries, or the
    * subscription id for PUSH deliveries. */
   channel: number;
+  /** Which id space `channel` belongs to. */
+  space: "get" | "push";
 }
 
 export interface RelayChunkLimits {
@@ -44,6 +52,9 @@ export interface RelayChunkLimits {
 export interface RelayChunkInput {
   stream: number;
   channel: number;
+  /** Id space of `channel`: "get" for RESPONSE correlations, "push" for
+   * subscription ids. Must match the reservation. */
+  space: "get" | "push";
   codec: number;
   resource: RelayResourceRef;
   digest?: string;
@@ -68,6 +79,7 @@ export type RelayChunkResult =
 interface Assembly {
   stream: number;
   channel: number;
+  space: "get" | "push";
   /** Reserved ceiling (the request's maxObjectBytes); counted in scratch. */
   reserved: number;
   /** Present once the first chunk commits the real total. */
@@ -118,8 +130,8 @@ export class RelayChunkAssembler {
     }
   }
 
-  private keyOf(stream: number, channel: number): string {
-    return `${stream}:${channel}`;
+  private keyOf(stream: number, channel: number, space: "get" | "push"): string {
+    return `${space === "get" ? "g" : "p"}:${stream}:${channel}`;
   }
 
   /** Whether a reservation of maxTotal would be admitted right now. Used by
@@ -135,14 +147,14 @@ export class RelayChunkAssembler {
    * is fully reserved. */
   reserve(key: RelayChannelKey, maxTotal: number): { ok: true } | { ok: false; code: RelayResourceErrorCode } {
     if (!Number.isSafeInteger(maxTotal) || maxTotal <= 0) return { ok: false, code: RELAY_ERROR.INVALID };
-    const id = this.keyOf(key.stream, key.channel);
+    const id = this.keyOf(key.stream, key.channel, key.space);
     if (this.assemblies.has(id)) return { ok: false, code: RELAY_ERROR.INVALID };
     if (this.assemblies.size >= this.limits.maxAssemblies) return { ok: false, code: RELAY_ERROR.BUSY };
     if (this.stagedBytes() + maxTotal > this.limits.maxScratchBytes) {
       return { ok: false, code: RELAY_ERROR.BUSY };
     }
     this.assemblies.set(id, {
-      stream: key.stream, channel: key.channel, reserved: maxTotal, committed: false,
+      stream: key.stream, channel: key.channel, space: key.space, reserved: maxTotal, committed: false,
       transferId: 0, codec: 0, resource: null as never, total: 0, buffer: null,
       have: 0, lastTransferId: 0,
     });
@@ -155,7 +167,7 @@ export class RelayChunkAssembler {
   push(input: RelayChunkInput): RelayChunkResult {
     const total = hexU64(input.transfer.total);
     const offset = hexU64(input.transfer.offset);
-    const key = this.keyOf(input.stream, input.channel);
+    const key = this.keyOf(input.stream, input.channel, input.space);
     const asm = this.assemblies.get(key);
     if (!asm
       || total === null || offset === null
@@ -219,13 +231,12 @@ export class RelayChunkAssembler {
 
   /** Release a reservation (get terminal consumed, unsubscribe, cancel). */
   release(key: RelayChannelKey): boolean {
-    return this.assemblies.delete(this.keyOf(key.stream, key.channel));
+    return this.assemblies.delete(this.keyOf(key.stream, key.channel, key.space));
   }
 
-  /** Abort every reservation on a stream/correlation (CANCEL terminal). */
-  abortChannel(stream: number, channel: number): number {
-    const key = this.keyOf(stream, channel);
-    return this.assemblies.delete(key) ? 1 : 0;
+  /** Abort one reservation identified by its id space (CANCEL terminal). */
+  abortChannel(key: RelayChannelKey): number {
+    return this.assemblies.delete(this.keyOf(key.stream, key.channel, key.space)) ? 1 : 0;
   }
 
   reset() {

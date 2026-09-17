@@ -13,7 +13,7 @@ import {
   type RelayResourceIncomingFrame,
   type RelayResourceWire,
 } from "../framework/src/relay/resource.ts";
-import { createResourceScheduler } from "../framework/src/resource-cache.ts";
+import { createResourceScheduler, type ResourceResult } from "../framework/src/resource-cache.ts";
 import {
   RELAY_CODEC,
   RELAY_DELIVERY,
@@ -72,7 +72,8 @@ test("verifySha256Digest checks the prefix and hex", () => {
 // ---------------------------------------------------------------------------
 
 interface ChunkOpts {
-  stream?: number; channel?: number; id?: number; offset?: number; total?: number;
+  stream?: number; channel?: number; space?: "get" | "push";
+  id?: number; offset?: number; total?: number;
   data: Uint8Array; final?: boolean; digest?: string; revision?: string; codec?: number;
 }
 
@@ -85,6 +86,7 @@ function chunk(a: RelayChunkAssembler, o: ChunkOpts) {
   return a.push({
     stream: o.stream ?? 1,
     channel: o.channel ?? 1,
+    space: o.space ?? "get",
     codec: o.codec ?? RELAY_CODEC.R5G6B5LE,
     resource: tileRef(o.revision),
     digest: o.digest,
@@ -94,8 +96,8 @@ function chunk(a: RelayChunkAssembler, o: ChunkOpts) {
   });
 }
 
-const reserve = (a: RelayChunkAssembler, channel: number, maxTotal: number, stream = 1) =>
-  a.reserve({ stream, channel }, maxTotal);
+const reserve = (a: RelayChunkAssembler, channel: number, maxTotal: number, stream = 1, space: "get" | "push" = "get") =>
+  a.reserve({ stream, channel, space }, maxTotal);
 
 test("assembler publishes a three-chunk 131072B object only at the final chunk", () => {
   const a = makeAssembler();
@@ -113,7 +115,7 @@ test("assembler publishes a three-chunk 131072B object only at the final chunk",
   expect(p3.resource).toEqual(tileRef());
   // Committed staging bytes were freed at completion; the reservation awaits release.
   expect(a.stats()).toMatchObject({ assemblies: 1, stagedBytes: 131072, peakStagedBytes: 131072, enqueued: 1, published: 1, failed: 0 });
-  expect(a.release({ stream: 1, channel: 1 })).toBe(true);
+  expect(a.release({ stream: 1, channel: 1, space: "get" })).toBe(true);
   expect(a.stats()).toMatchObject({ assemblies: 0, stagedBytes: 0 });
 });
 
@@ -206,8 +208,24 @@ test("abortChannel drops a cancelled request reservation", () => {
   const a = makeAssembler();
   reserve(a, 7, 300, 1);
   reserve(a, 8, 300, 1);
-  expect(a.abortChannel(1, 7)).toBe(1);
+  expect(a.abortChannel({ stream: 1, channel: 7, space: "get" })).toBe(1);
   expect(a.stats()).toMatchObject({ assemblies: 1, stagedBytes: 300 });
+});
+
+test("F3: get correlations and subscription ids are separate assembler id spaces", () => {
+  const a = makeAssembler({ maxAssemblies: 2, maxScratchBytes: 1 << 20 });
+  // get correlation 1 and push subscription id 1 coexist on the same stream.
+  expect(a.reserve({ stream: 1, channel: 1, space: "get" }, 300)).toEqual({ ok: true });
+  expect(a.reserve({ stream: 1, channel: 1, space: "push" }, 300)).toEqual({ ok: true });
+  expect(a.stats().assemblies).toBe(2);
+  // The same id inside one space still rejects as a duplicate reservation.
+  expect(a.reserve({ stream: 1, channel: 1, space: "get" }, 300)).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+  // Chunks land in the space they were reserved for, independently.
+  expect(chunk(a, { channel: 1, space: "get", data: zeros(100), total: 100, id: 1 })).toMatchObject({ complete: true });
+  expect(chunk(a, { channel: 1, space: "push", data: zeros(100), total: 100, id: 1 })).toMatchObject({ complete: true });
+  expect(a.release({ stream: 1, channel: 1, space: "get" })).toBe(true);
+  expect(a.release({ stream: 1, channel: 1, space: "push" })).toBe(true);
+  expect(a.stats().assemblies).toBe(0);
 });
 
 // ---------------------------------------------------------------------------
@@ -531,6 +549,51 @@ test("unsubscribe then a queued push is consumed and dropped", () => {
   });
   for (const f of frames) feed(client, f, RELAY_CODEC.R5G6B5LE);
   expect(published).toBe(0);
+});
+
+test("F3: a subscription id equal to an in-flight get correlation does not collide", () => {
+  const { wire, client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  // Get first: wire correlation 1 reserves the get channel of stream 1.
+  const getResults: ResourceResult<unknown>[] = [];
+  const got = client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+    (r) => getResults.push(r as ResourceResult<unknown>));
+  expect(got).toEqual({ correlation: 1 });
+
+  // Subscribe: correlation 2 on the wire, but the authority allocates
+  // subscription id 1 — an independent id space per §3.6/§3.7.
+  const ended: ({ code: string } | undefined)[] = [];
+  const objects: unknown[] = [];
+  client.subscribe(1, tileRef("r1"), RELAY_DELIVERY.RELIABLE_DELTA, {
+    onObject: (o) => objects.push(o),
+    onEnd: (e) => ended.push(e),
+  }, () => {});
+  const answer = auth.answerSubscribe({
+    stream: 1, correlation: wire.lastRequest().correlation, metadata: wire.lastRequest().metadata,
+  });
+  expect((answer.metadata.value as { subscription: number }).subscription).toBe(1);
+  feed(client, answer);
+
+  // The subscription must survive and be registered in its own id space.
+  expect(ended).toEqual([]);
+  expect(client.subscription(1)).toBeDefined();
+
+  // Pushes on subscription 1 deliver while get correlation 1 is still open.
+  for (const f of auth.chunkObject({
+    type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: 1,
+    ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64),
+  })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  expect(objects.length).toBe(1);
+
+  // The in-flight get completes through its own channel and is not killed by
+  // the overlapping subscription id.
+  for (const f of auth.chunkObject({
+    type: RELAY_TYPE.RESPONSE, stream: 1, correlation: 1,
+    ref: tileRef("r1"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64),
+  })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  expect(getResults.length).toBe(1);
+  expect(getResults[0].ok).toBe(true);
+  expect(client.stats().pending).toBe(0);
 });
 
 test("invalidate scope=revision removes the local entry and fences an in-flight get", () => {
