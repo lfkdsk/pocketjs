@@ -9,8 +9,19 @@ import {
   verifyFrameTape,
   wrapRelayTransport,
   type RelayFrameDirection,
+  type RelayFrameTransport,
+  type RelayFrameWrapOptions,
+  type RelayRecordingTransport,
 } from "../framework/src/relay/tape.ts";
 import { decodeFrame } from "../framework/src/relay/frame.ts";
+
+/** Enabled wrap with the union narrowed to the recording transport. */
+function recording<T extends RelayFrameTransport>(
+  inner: T,
+  options: Omit<RelayFrameWrapOptions, "enabled"> = {},
+): RelayRecordingTransport<T> {
+  return wrapRelayTransport(inner, { ...options, enabled: true }) as RelayRecordingTransport<T>;
+}
 
 type MutableTape = {
   kind: "relay-frame"; v: 1; session: string;
@@ -151,7 +162,7 @@ test("enabled wrapper records both directions and delegates every byte", async (
     send: (f: Uint8Array) => sent.push(f),
     recv: () => inbox.shift() ?? null,
   };
-  const t = wrapRelayTransport(inner, { enabled: true, session: 0x0102030405060708n });
+  const t = recording(inner, { session: 0x0102030405060708n });
   expect(t).not.toBe(inner);
   if (!("relayRecorder" in t)) throw new Error("enabled wrapper should carry a recorder");
   t.send(ping);
@@ -319,6 +330,179 @@ test("replay: wrong direction, extra frame, and early stop each report their cod
   expect(v.divergence!.code).toBe("incomplete");
   expect(v.divergence!.index).toBe(1);
 });
+
+// --- review 964 F1: recording never changes observable transport behavior ----
+// R5 §3.11: partial record loss marks the trace incomplete; the recorder is
+// a passive observer and must not suppress, delay, or reorder a live frame.
+
+test("enabled wrapper delivers a foreign-session frame and marks the trace incomplete (CE1)", async () => {
+  const ping = await loadBin("ping");   // session 0102030405060708
+  const hello = await loadBin("hello"); // bootstrap session 0
+  const sent: Uint8Array[] = [];
+  const inner = {
+    send: (f: Uint8Array) => sent.push(f),
+    recv: () => null as Uint8Array | null,
+  };
+  const t = recording(inner, { session: 0x0102030405060708n });
+  t.send(ping);
+  // Pre-fix this threw "frame session 0000…0 does not match tape session"
+  // and the frame never reached inner.send.
+  expect(() => t.send(hello)).not.toThrow();
+  expect(sent).toEqual([ping, hello]); // both frames crossed the wire
+  const rec = t.relayRecorder;
+  expect(rec.framesRecorded).toBe(1); // the foreign frame was not appended
+  expect(rec.incomplete).not.toBeNull();
+  expect(rec.incomplete!.index).toBe(1);
+  expect(rec.incomplete!.reason).toMatch(/does not match tape session/);
+  const tape = rec.toTape();
+  expect(tape.incomplete?.reason).toMatch(/does not match tape session/);
+  // R5 §3.11: an incomplete trace is neither a conformance pass nor a replay.
+  const v = verifyFrameTape(tape);
+  expect(v.ok).toBe(false);
+  expect(v.divergence!.code).toBe("tape-incomplete");
+  expect(() => createRelayFrameReplay(tape)).toThrow(/incomplete trace/);
+  // After the first loss no later frame is appended; the wire stays live.
+  t.send(ping);
+  expect(sent).toHaveLength(3);
+  expect(t.relayRecorder.framesRecorded).toBe(1);
+});
+
+test("frame cap marks the trace incomplete without stopping sends (CE1b)", async () => {
+  const ping = await loadBin("ping");
+  const sent: Uint8Array[] = [];
+  const inner = {
+    send: (f: Uint8Array) => sent.push(f),
+    recv: () => null as Uint8Array | null,
+  };
+  const t = recording(inner, { session: 0x0102030405060708n, maxFrames: 2 });
+  t.send(ping); t.send(ping);
+  expect(() => t.send(ping)).not.toThrow(); // pre-fix: "frame cap 2 reached"
+  expect(sent).toHaveLength(3);
+  expect(t.relayRecorder.framesRecorded).toBe(2);
+  expect(t.relayRecorder.incomplete?.index).toBe(2);
+  expect(t.relayRecorder.incomplete?.reason).toMatch(/frame cap 2 reached/);
+  // The two stored frames are a clean prefix and still verify individually.
+  const tape = t.relayRecorder.toTape();
+  expect(tape.frames).toHaveLength(2);
+  expect(tape.incomplete?.index).toBe(2);
+});
+
+test("HELLO->assigned-session boundary: every frame delivered, trace marked incomplete (CE6)", async () => {
+  const hello = await loadBin("hello");
+  const helloResp = await loadBin("hello-response");
+  const ping = await loadBin("ping");
+  const sent: Uint8Array[] = [];
+  const inbox = [helloResp, ping]; // response on session 0, then assigned-session frame
+  const inner = {
+    send: (f: Uint8Array) => sent.push(f),
+    recv: () => inbox.shift() ?? null,
+  };
+  const t = recording(inner); // unpinned: HELLO pins 0
+  expect(() => t.send(hello)).not.toThrow();
+  expect(t.recv()).toBe(helloResp);
+  // Pre-fix the first assigned-session frame was dropped and send() threw.
+  expect(() => t.send(ping)).not.toThrow();
+  expect(sent).toEqual([hello, ping]);
+  const rec = t.relayRecorder;
+  expect(rec.toTape().session).toBe("0000000000000000");
+  expect(rec.framesRecorded).toBe(2); // hello out + hello-response in
+  expect(rec.incomplete?.index).toBe(2);
+  expect(rec.incomplete?.reason).toMatch(/does not match tape session/);
+  // The post-boundary inbound frame is delivered but not appended either.
+  expect(t.recv()).toBe(ping);
+  expect(rec.framesRecorded).toBe(2);
+});
+
+test("a seq-0 frame is delivered on the wire and latches incomplete instead of throwing", async () => {
+  const zeroSeq = await loadBin("seq-zero"); // complete PRLY record, same session, seq 0
+  const sent: Uint8Array[] = [];
+  const inner = {
+    send: (f: Uint8Array) => sent.push(f),
+    recv: () => null as Uint8Array | null,
+  };
+  const t = recording(inner, { session: 0x0102030405060708n });
+  expect(() => t.send(zeroSeq)).not.toThrow();
+  expect(sent).toEqual([zeroSeq]);
+  expect(t.relayRecorder.framesRecorded).toBe(0);
+  expect(t.relayRecorder.incomplete?.reason).toMatch(/seq is 0/);
+});
+
+test("a recv()d foreign-session frame is returned and the trace marked incomplete", async () => {
+  const hello = await loadBin("hello");
+  const inner = { send: () => {}, recv: () => hello };
+  const t = recording(inner, { session: 0x0102030405060708n });
+  expect(t.recv()).toBe(hello); // the caller gets the bytes regardless
+  expect(t.relayRecorder.incomplete?.reason).toMatch(/does not match tape session/);
+});
+
+test("when inner.send throws the error propagates and nothing is recorded", async () => {
+  const ping = await loadBin("ping");
+  const boom = new Error("wire down");
+  const inner = { send: () => { throw boom; }, recv: () => null };
+  const t = recording(inner, { session: 0x0102030405060708n });
+  expect(() => t.send(ping)).toThrow(boom); // recording does not swallow transport errors
+  expect(t.relayRecorder.framesRecorded).toBe(0);
+  expect(t.relayRecorder.incomplete).toBeNull(); // a failed send is not a record loss
+});
+
+test("enabled and disabled wrappers deliver the same frame sequence (observable behavior)", async () => {
+  const ping = await loadBin("ping");
+  const credit = await loadBin("credit");
+  const mk = () => {
+    const sent: Uint8Array[] = [];
+    const inbox = [credit];
+    return {
+      sent,
+      inner: { send: (f: Uint8Array) => sent.push(f), recv: () => inbox.shift() ?? null },
+    };
+  };
+  const off = mk();
+  wrapRelayTransport(off.inner).send(ping);
+  (wrapRelayTransport(off.inner).recv());
+
+  const on = mk();
+  const t = recording(on.inner, { session: 0x0102030405060708n });
+  t.send(ping);
+  t.recv();
+  // The wire sees the same sends with and without recording.
+  expect(on.sent).toEqual(off.sent);
+  expect(on.sent[0]).toBe(ping);
+});
+
+test("an incomplete trace round-trips through parseFrameTape; a structurally bad marker is rejected", async () => {
+  const ping = await loadBin("ping");
+  const t = recording(
+    { send: () => {}, recv: () => null },
+    { session: 0x0102030405060708n, maxFrames: 1 },
+  );
+  t.send(ping);
+  t.send(ping); // cap -> incomplete at index 1
+  const text = stringifyFrameTape(t.relayRecorder.toTape());
+  const parsed = parseFrameTape(text);
+  expect(parsed.incomplete?.index).toBe(1);
+  expect(parsed.incomplete?.reason).toMatch(/frame cap/);
+  const badMarker = (mut: (o: { incomplete?: unknown }) => void) => () => {
+    const o = JSON.parse(text) as { incomplete?: unknown };
+    mut(o);
+    return parseFrameTape(JSON.stringify(o));
+  };
+  expect(badMarker((o) => { o.incomplete = "yes"; })).toThrow(/incomplete must be an object/);
+  expect(badMarker((o) => { o.incomplete = { index: -1, reason: "x" }; })).toThrow(/incomplete.index/);
+  expect(badMarker((o) => { o.incomplete = { index: 1, reason: "" }; })).toThrow(/incomplete.reason/);
+  expect(badMarker((o) => { o.incomplete = { index: 99, reason: "x" }; })).toThrow(/incomplete.index/);
+});
+
+test("a trace that loses every frame before the first valid record cannot be serialized", async () => {
+  const hello = await loadBin("hello");
+  const t = recording(
+    { send: () => {}, recv: () => null },
+    { session: 0x0102030405060708n },
+  );
+  t.send(hello); // foreign session, zero valid entries captured
+  expect(() => t.relayRecorder.toTape()).toThrow(/lost its frame before any valid record/);
+});
+
+// ------------------------------------------------------------------------------
 
 test("benchmark: record + serialize 10,000 frames", async () => {
   const ping = await loadBin("ping");

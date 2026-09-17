@@ -21,7 +21,13 @@
  *   const text = stringifyFrameTape(t.relayRecorder!.toTape());
  *
  * With recording off (the default) wrapRelayTransport RETURNS inner itself:
- * no wrapper frame and no hash work sits on the path.
+ * no wrapper frame and no hash work sits on the path. With recording on the
+ * wrapper transmits first and records only after the transport call
+ * succeeds, so the recorder sits off the live path: every frame is sent or
+ * returned even when it cannot be recorded (wrong session, seq 0, frame
+ * cap). The first frame that cannot be recorded latches an `incomplete`
+ * marker onto the tape instead; R5 §3.11 requires a partially lost trace to
+ * be marked incomplete and never replayed as deterministic.
  *
  * Replay drives a fake transport over the same send/recv script: recv()
  * hands back the next recorded inbound record and send() hashes the next
@@ -133,6 +139,14 @@ export type RelayFrameTapeTuple = readonly [
   sha256Hex: string,
 ];
 
+export interface RelayFrameTapeIncomplete {
+  /** Number of complete entries captured before the loss; the frames that
+   * are present form a clean prefix of the wire record. */
+  readonly index: number;
+  /** Why the next frame could not be recorded (the recorder rule). */
+  readonly reason: string;
+}
+
 export interface RelayFrameTape {
   readonly kind: "relay-frame";
   readonly v: 1;
@@ -140,6 +154,10 @@ export interface RelayFrameTape {
    * tape. Every entry's frame header carries this session. */
   readonly session: string;
   readonly frames: readonly RelayFrameTapeTuple[];
+  /** Present when record loss occurred (R5 §3.11: partial record loss marks
+   * the trace incomplete). Such a trace verifies as not-OK and must not be
+   * replayed as a deterministic script. Absent on a complete trace. */
+  readonly incomplete?: RelayFrameTapeIncomplete;
 }
 
 /** Implementation cap for the in-memory recorder; the full facts track in
@@ -179,18 +197,37 @@ export interface RelayFrameRecorderOptions {
   maxFrames?: number;
 }
 
+/** First record-loss marker for a passive capture. R5 §3.11: when partial
+ * record loss happens the trace is marked incomplete rather than producing a
+ * broken deterministic replay. */
+export interface RelayFrameIncompleteState {
+  /** Entries captured before the loss; the stored frames are a clean prefix
+   * of the wire record up to this index. */
+  readonly index: number;
+  /** The recorder rule the lost frame violated. */
+  readonly reason: string;
+}
+
 /** Passive observer of one session's complete wire records. Allocates no
- * hash state and performs no work unless note() is called; construct one
- * only when recording is enabled (Q7 default off). */
+ * hash state and performs no work unless note()/observe() is called;
+ * construct one only when recording is enabled (Q7 default off).
+ *
+ * Two entry points: note() enforces the tape rules and throws (the strict
+ * API for direct use); observe() never throws and latches the first failure
+ * as `incomplete` instead, which is the path the transport wrapper uses so
+ * recording cannot change live-path behavior. */
 export class RelayFrameRecorder {
   private _framesRecorded = 0;
   private _bytesRecorded = 0;
   private readonly entries: [RelayFrameDirection, number, string, string][] = [];
   private readonly maxFrames: number;
   private pinnedSession: bigint | null;
+  private _incomplete: RelayFrameIncompleteState | null = null;
 
   get framesRecorded(): number { return this._framesRecorded; }
   get bytesRecorded(): number { return this._bytesRecorded; }
+  /** First record-loss marker, or null on a still-complete capture. */
+  get incomplete(): RelayFrameIncompleteState | null { return this._incomplete; }
 
   constructor(options: RelayFrameRecorderOptions = {}) {
     this.maxFrames = options.maxFrames ?? DEFAULT_MAX_FRAMES;
@@ -222,8 +259,34 @@ export class RelayFrameRecorder {
   noteOut(frame: Uint8Array): void { this.note(frame, "out"); }
   noteIn(frame: Uint8Array): void { this.note(frame, "in"); }
 
+  /** Passive entry point for the transport wrapper. Returns whether the
+   * frame was appended. Never throws: a rejected frame latches the first
+   * loss as `incomplete` and is omitted, and no later frame is appended, so
+   * the captured entries stay a clean single-session prefix (R5 §3.11:
+   * partial loss marks the trace incomplete; the live transport keeps
+   * carrying every frame). */
+  observe(frame: Uint8Array, direction: RelayFrameDirection): boolean {
+    if (this._incomplete) return false;
+    try {
+      this.note(frame, direction);
+      return true;
+    } catch (e) {
+      this._incomplete = { index: this.entries.length, reason: (e as Error).message };
+      return false;
+    }
+  }
+
+  observeOut(frame: Uint8Array): boolean { return this.observe(frame, "out"); }
+  observeIn(frame: Uint8Array): boolean { return this.observe(frame, "in"); }
+
   toTape(): RelayFrameTape {
     if (this.entries.length === 0) {
+      if (this._incomplete) {
+        throw new Error(
+          `relay-tape: cannot serialize a trace that lost its frame before any valid record `
+            + `(${this._incomplete.reason})`,
+        );
+      }
       throw new Error("relay-tape: cannot serialize a tape with no frames");
     }
     return {
@@ -231,6 +294,7 @@ export class RelayFrameRecorder {
       v: 1,
       session: this.pinnedSession!.toString(16).padStart(16, "0"),
       frames: this.entries.map((e) => [...e] as RelayFrameTapeTuple),
+      ...(this._incomplete ? { incomplete: { ...this._incomplete } } : {}),
     };
   }
 }
@@ -257,7 +321,10 @@ export interface RelayRecordingTransport<T extends RelayFrameTransport> extends 
 
 /** Wrap a complete-record transport. Disabled (default): returns inner
  * itself, so the hot path keeps its original object identity and gains no
- * per-frame work. Enabled: send/recv copy through the recorder. */
+ * per-frame work. Enabled: every frame crosses the wire first and is handed
+ * to the recorder only after the transport call succeeds, so a recorder
+ * rejection (session change, seq 0, frame cap) marks the trace incomplete —
+ * it never suppresses, delays, or reorders a frame (R5 §3.11 record mode). */
 export function wrapRelayTransport<T extends RelayFrameTransport>(
   inner: T,
   options: RelayFrameWrapOptions = {},
@@ -267,12 +334,12 @@ export function wrapRelayTransport<T extends RelayFrameTransport>(
   const wrapped = {
     relayRecorder: recorder,
     send(frame: Uint8Array): void {
-      recorder.noteOut(frame);
       inner.send(frame);
+      recorder.observeOut(frame);
     },
     recv(): Uint8Array | null {
       const frame = inner.recv();
-      if (frame) recorder.noteIn(frame);
+      if (frame) recorder.observeIn(frame);
       return frame ?? null;
     },
   } as RelayRecordingTransport<T>;
@@ -324,7 +391,22 @@ export function parseFrameTape(text: string): RelayFrameTape {
     }
     frames.push([direction, seq, frameHex, digest]);
   }
-  return { kind: "relay-frame", v: 1, session: o.session, frames };
+  let incomplete: RelayFrameTapeIncomplete | undefined;
+  if (o.incomplete !== undefined) {
+    const why = "relay-tape: incomplete";
+    if (typeof o.incomplete !== "object" || o.incomplete === null || Array.isArray(o.incomplete)) {
+      throw new Error(`${why} must be an object`);
+    }
+    const m = o.incomplete as Record<string, unknown>;
+    if (typeof m.index !== "number" || !Number.isInteger(m.index) || m.index < 0 || m.index > frames.length) {
+      throw new Error(`${why}.index must be an integer in 0..frames.length`);
+    }
+    if (typeof m.reason !== "string" || m.reason.length === 0) {
+      throw new Error(`${why}.reason must be a non-empty string`);
+    }
+    incomplete = { index: m.index, reason: m.reason };
+  }
+  return { kind: "relay-frame", v: 1, session: o.session, frames, ...(incomplete ? { incomplete } : {}) };
 }
 
 // --- verify / replay ----------------------------------------------------------
@@ -334,7 +416,8 @@ export type RelayFrameDivergenceCode =
   | "direction" // send/recv happened where the tape expected the opposite
   | "record" // frame bytes are not one complete PRLY record
   | "unexpected" // a frame was sent after the tape ran out
-  | "incomplete"; // replay ended with tape entries left
+  | "incomplete" // replay ended with tape entries left
+  | "tape-incomplete"; // the trace itself carries a record-loss marker
 
 export interface RelayFrameDivergence {
   /** Tuple index of the first frame that disagreed. */
@@ -355,8 +438,23 @@ export interface RelayFrameTapeVerdict {
 }
 
 /** Check every tuple's record shape and sha256 in capture order. Returns
- * the first divergence (index + seq) — the --assert semantics. */
+ * the first divergence (index + seq) — the --assert semantics. A trace that
+ * carries a record-loss marker is not OK regardless of its stored prefix
+ * (R5 §3.11: partial loss bars a deterministic verdict). */
 export function verifyFrameTape(tape: RelayFrameTape): RelayFrameTapeVerdict {
+  if (tape.incomplete) {
+    return {
+      ok: false,
+      frames: tape.incomplete.index,
+      divergence: {
+        index: tape.incomplete.index,
+        direction: "out",
+        seq: 0,
+        code: "tape-incomplete",
+        detail: `trace marked incomplete after ${tape.incomplete.index} recorded frame(s): ${tape.incomplete.reason}`,
+      },
+    };
+  }
   for (let i = 0; i < tape.frames.length; i++) {
     const [direction, seq, frameHex, digest] = tape.frames[i];
     let bytes: Uint8Array;
@@ -409,8 +507,16 @@ export interface RelayFrameReplay {
 }
 
 /** Build the fake transport a replayed session stack drives. Entry bytes
- * are verified lazily at the send/recv step that consumes them. */
+ * are verified lazily at the send/recv step that consumes them. A trace
+ * carrying a record-loss marker is refused: R5 §3.11 says partial loss must
+ * not manufacture a deterministic replay. */
 export function createRelayFrameReplay(tape: RelayFrameTape): RelayFrameReplay {
+  if (tape.incomplete) {
+    throw new Error(
+      `relay-tape: refusing to replay an incomplete trace `
+        + `(${tape.incomplete.index} recorded frame(s); ${tape.incomplete.reason})`,
+    );
+  }
   let i = 0;
   let first: RelayFrameDivergence | null = null;
 
