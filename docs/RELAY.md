@@ -492,5 +492,28 @@ bun tests/contract.ts
 nine `example-*` vectors reproduce the R5 draft's Map/Term/Vault worked
 frames byte-for-byte (48-byte header hex and total length pinned).
 `constants.json` is the snapshot the C and Rust layers compare against;
-`engine/core/src/spec.rs` regenerates from the same spec through
-`bun contracts/spec/gen-rust.ts`.
+`engine/core/src/spec.rs` and `engine/crates/pocket-relay/src/generated.rs`
+regenerate from the same spec through `bun contracts/spec/gen-rust.ts`.
+
+## The Rust frame layer
+
+`engine/crates/pocket-relay` is the Rust half of the frame layer. It is
+`#![no_std]` and allocates nothing: `decode` borrows the caller's record and
+returns the metadata and data regions as slices, `encode_into` writes a
+caller-owned buffer, and `RecordReader` reassembles split transport input
+inside a buffer the caller supplies, whose length is the wire ceiling. The
+default `std` feature adds one thing, the `std::error::Error` impls; `hosts/psp`
+builds `--no-default-features`, and the crate compiles for
+`thumbv7em-none-eabi` and `wasm32-unknown-unknown` as well as the desktop
+target.
+
+**The crate reads no JSON.** `BAD_METADATA` and `BAD_ENVELOPE` are in its error
+enum because they are part of the shared vocabulary, but `decode` never returns
+them — the layer that parses metadata does. The six vectors expecting those two
+codes are asserted to pass the header checks, which is where the handoff sits.
+
+```sh
+cargo test -p pocket-relay                       # 41 tests, 46 vectors
+cargo build -p pocket-relay --no-default-features --target thumbv7em-none-eabi
+cargo test -p pocket-relay --release --test throughput -- --ignored --nocapture
+```
