@@ -23,6 +23,7 @@ import {
   isSidebandFrame,
   type RelayPriority,
   type RelayReceived,
+  type RelayStreamAlloc,
 } from "../framework/src/relay/credit.ts";
 
 // R5 §3.9 proposal numbers (contracts/spec/relay.ts RELAY_LIMITS).
@@ -800,6 +801,97 @@ test("receive sideband: business records and non-whitelisted stream-0 ops stay o
   expect(isSidebandFrame(mgmtDec.frame)).toBe(false);
   expect(rx.ingestSideband(mgmtDec.frame, mgmt.length).code).toBe(RELAY_P3_ERROR.SIDEBAND_FORBIDDEN);
   expect(rx.ingest(mgmtDec.frame, mgmt.length).ok).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// Step 7 — guards for review 963 surviving mutants M2/M6/M8/M9 (blocker B2)
+// ---------------------------------------------------------------------------
+
+test("mutation guard M2: admission counts queued BYTES, not just frames (mixed-size queue)", () => {
+  const bigMeta = {
+    op: "resource.get",
+    resource: { kind: 2, ns: "n", key: "k".repeat(40), rendition: "r" },
+  };
+  const bigBody = prepareFrameBody({ type: RELAY_TYPE.REQUEST, stream: 1, metadata: bigMeta });
+  if (!bigBody.ok) throw new Error(bigBody.code);
+  const bigW = bigBody.body.wireBytes;
+  expect(bigW).toBeGreaterThan(GET_WIRE);
+  // Three frame slots, byte space for exactly the one big queued frame.
+  const ep = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 3, bytes: bigW } }]);
+  expect(ep.sender.admit({
+    type: RELAY_TYPE.REQUEST, stream: 1, correlation: 1, metadata: bigMeta,
+  }).ok).toBe(true);
+  // A smaller second frame fits the frame count (2 <= 3) and fits the byte
+  // cap on its own, but queued-big + new-small exceeds slice bytes.
+  const second = ep.sender.admit({
+    type: RELAY_TYPE.REQUEST, stream: 1, correlation: 2, metadata: GET_META,
+  });
+  expect(second.ok).toBe(false);
+  expect(second.code).toBe(RELAY_P3_ERROR.BUSY);
+  expect(ep.sender.queuedFrames(1)).toBe(1);
+});
+
+test("mutation guard M6: the released FRAMES counter cannot move backwards while bytes stay in range", () => {
+  const ledger = new RelayCreditLedger(ATTACH.frames, ATTACH.bytes, controlSlice());
+  expect(ledger.allocate(1, { frames: 2, bytes: 8192 }).ok).toBe(true);
+  expect(ledger.charge(1, 4096).ok).toBe(true);
+  expect(ledger.release(1, 1n, 4096n).ok).toBe(true);
+  // Bytes hold the same cumulative value (monotonic and <= sent); only the
+  // frames counter retreats. A frames-only check must reject this.
+  const backwards = ledger.release(1, 0n, 4096n);
+  expect(backwards.ok).toBe(false);
+  expect(backwards.code).toBe(RELAY_P3_ERROR.CREDIT_RANGE);
+  expect(ledger.releasedTotals(1)).toEqual({ frames: 1, bytes: 4096 });
+});
+
+test("mutation guard M8: a failed charge at selection consumes no seq (charge precedes seq allocation)", () => {
+  const ep = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 2 * GET_WIRE } }]);
+  expect(ep.sender.admit({
+    type: RELAY_TYPE.REQUEST, stream: 1, correlation: 1, metadata: GET_META,
+  }).ok).toBe(true);
+
+  // Admission guarantees a queued head is chargeable, so the only way to
+  // observe pump's internal order is to fault the charge while peekHead()
+  // still sees room (it reads ledger.available, a different method). The
+  // frame stays queued; correct code charges first, so no seq is spent.
+  const ledger = ep.sender.ledgerView();
+  const realCharge = ledger.charge.bind(ledger);
+  let failNext = true;
+  (ledger as { charge: typeof ledger.charge }).charge = (stream, wireBytes) =>
+    failNext ? { ok: false, code: RELAY_P3_ERROR.BUSY } : realCharge(stream, wireBytes);
+
+  const failed = ep.sender.pump();
+  expect(failed.ok).toBe(false);
+  expect(failed.code).toBe(RELAY_P3_ERROR.BUSY);
+  expect(ep.sender.queuedFrames(1)).toBe(1); // not dequeued
+  failNext = false;
+
+  const pumped = ep.sender.pump();
+  expect(pumped.ok).toBe(true);
+  expect(pumped.frames.length).toBe(1);
+  const dec = decodeFrame(pumped.frames[0]);
+  if (!dec.ok) throw new Error(dec.code);
+  expect(dec.frame.seq).toBe(1); // a seq spent before the failed charge would leave 2
+});
+
+test("mutation guard M9: one pump delivers at most one frame across streams and round-rotates", () => {
+  const slices = new Map<number, RelayStreamAlloc>([
+    [0, controlSlice()],
+    [1, { frames: 2, bytes: 2 * GET_WIRE }],
+    [2, { frames: 2, bytes: 2 * GET_WIRE }],
+  ]);
+  const rx = new RelayReceiver(SESSION, slices, new RelayCreditTable(), RELAY_LIMITS.maxStreams, 1);
+  const ingest = (stream: number) => {
+    const bytes = wireRecord(stream, 1, stream, GET_META);
+    const dec = decodeFrame(bytes);
+    if (!dec.ok) throw new Error(dec.code);
+    expect(rx.ingest(dec.frame, bytes.length).ok).toBe(true);
+  };
+  ingest(1);
+  ingest(2);
+  expect(rx.pump().map((r) => r.handle)).toEqual(["1:1"]);
+  expect(rx.pump().map((r) => r.handle)).toEqual(["2:1"]);
+  expect(rx.pump()).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
