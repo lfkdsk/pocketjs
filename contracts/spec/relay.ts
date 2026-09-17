@@ -304,7 +304,10 @@ export interface RelayHelloRequestMetadata extends RelayFrameMetadata {
   transport?: RelayTransportDesc;
 }
 
-/** Companion -> device selection, still on session 0. [R5-P02] */
+/** Companion -> device selection, still on session 0. [R5-P02]
+ * `codecs` is the exact negotiated intersection (peer order); the §3.2
+ * field table selects codecs "按双方交集选择" but the response field list
+ * in step 3 omitted it — see RELAY-P2-VERIFY erratum E2. */
 export interface RelayHelloResponseMetadata extends RelayFrameMetadata {
   op: typeof RELAY_OP.HELLO;
   status: typeof RELAY_STATUS.OK | typeof RELAY_STATUS.ERROR;
@@ -314,9 +317,20 @@ export interface RelayHelloResponseMetadata extends RelayFrameMetadata {
   session: string; // 16 lowercase hex chars, nonzero
   selected: RelayProtocolVersion;
   profiles: RelayProfileEntry[]; // the exact selected subset
+  codecs?: number[]; // the exact negotiated codec intersection
   grants: string[]; // authorized app namespaces
   rxLimits: RelayRxLimits;
   transport?: RelayTransportDesc;
+}
+
+/** Final error response on the bootstrap/control stream; carries a stable
+ * RELAY_ERROR code and never the selection fields. [R5-P02/P06] */
+export interface RelayControlErrorMetadata extends RelayFrameMetadata {
+  op: string;
+  status: typeof RELAY_STATUS.ERROR;
+  final: true;
+  bootNonce?: string; // hello errors echo the client nonce
+  error: RelayErrorBody;
 }
 
 /** Device confirms the selected parameters on the new session. [R5-P02] */
@@ -447,6 +461,34 @@ const versionSchema: JsonSchema = {
   additionalItems: false,
 };
 
+const errorBodySchema: JsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["code", "message"],
+  properties: {
+    code: { type: "string", minLength: 1, maxLength: 32 },
+    // 160 matches RELAY_LIMITS.errorMessageMaxBytes (declared below with
+    // the other numeric limits); keep the two in sync.
+    message: { type: "string", minLength: 1, maxBytes: 160 },
+    retryAfterMs: u32,
+  },
+};
+
+/** Final error RESPONSE for a control op: op + error body only. */
+function controlErrorSchema(op: string): JsonSchema {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "status", "final", "error"],
+    properties: {
+      op: { const: op },
+      status: { const: RELAY_STATUS.ERROR },
+      final: { const: true },
+      error: errorBodySchema,
+    },
+  };
+}
+
 /** Schemas for the §3.2/§3.6 control messages. All are strict: unknown
  * properties reject. Session-layer code applies the schema matching
  * metadata.op before acting on the message. */
@@ -481,12 +523,27 @@ export const RELAY_METADATA_SCHEMAS: Readonly<Record<string, JsonSchema>> = Obje
       session: { ...hex16, not: { const: "0000000000000000" } },
       selected: versionSchema,
       profiles: { type: "array", items: profileEntrySchema },
+      codecs: { type: "array", items: u16 },
       grants: { type: "array", items: { type: "string", minLength: 1 } },
       rxLimits: rxLimitsSchema,
       transport: transportSchema,
-      error: { type: "object" },
     },
   },
+  [`${RELAY_OP.HELLO}.error`]: {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "status", "final", "error"],
+    properties: {
+      op: { const: RELAY_OP.HELLO },
+      status: { const: RELAY_STATUS.ERROR },
+      final: { const: true },
+      bootNonce: hex32,
+      error: errorBodySchema,
+    },
+  },
+  [`${RELAY_OP.READY}.error`]: controlErrorSchema(RELAY_OP.READY),
+  [`${RELAY_OP.OPEN}.error`]: controlErrorSchema(RELAY_OP.OPEN),
+  [`${RELAY_OP.PING}.error`]: controlErrorSchema(RELAY_OP.PING),
   [`${RELAY_OP.READY}.request`]: {
     type: "object",
     additionalProperties: false,
