@@ -53,8 +53,7 @@ describe("tape --assert schema (pure validator)", () => {
     let doc = validDoc();
     delete (doc as Partial<typeof doc>).app;
     reject(doc, /"app"/);
-    doc = { ...validDoc(), app: 42 };
-    reject(doc, /"app"/);
+    reject({ ...validDoc(), app: 42 }, /"app"/);
     doc = { ...validDoc(), app: "wrong-app" };
     reject(doc, /wrong-app/);
   });

@@ -104,6 +104,12 @@
   "covers/refl-im-main.png": {
     "linear": true
   },
+  "covers/cover-text-cjk-main.png": {
+    "linear": true
+  },
+  "covers/refl-text-cjk-main.png": {
+    "linear": true
+  },
   "covers/cover-vue-sfc-lab-main.png": {
     "linear": true
   },

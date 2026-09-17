@@ -1,9 +1,8 @@
 /*
- * Regression lock for the texture-upload + draw path reported in issue #415
- * ("d211-linux: rendering a PSM 5650 texture kills the app"). The issue could
- * not be reproduced on x86_64 (see findings/verify-L5-415.md); this fixture
- * drives the exact software raster the d211-linux host (PR #407) links
- * through its C ABI, with no JavaScript and no framebuffer device:
+ * Host-side coverage for the texture pattern reported in issue #415
+ * ("d211-linux: rendering a PSM 5650 texture kills the app"). This fixture
+ * drives the shared software raster through its C ABI, with no JavaScript
+ * and no framebuffer device. It does not reproduce the device environment:
  *
  *   ui_create_node(image)
  *   ui_upload_img_entry (IMG entry baked by framework/compiler/pak.ts)
@@ -23,12 +22,11 @@
 
 #include "pocket_ui_cabi.h"
 
-/* PR #407 adds these three declarations to pocket_ui_cabi.h; the symbols
+/* PR #407 adds this declaration to pocket_ui_cabi.h; the symbol
  * already ship in the main-branch archive (engine/ui-cabi/src/lib.rs,
  * ui_render_scaled/ui_render_incremental_scaled). The d211 device calls
  * ui_render_incremental_scaled(POCKET_RASTER_DENSITY). Drop these once the
  * PR #407 header lands in main. */
-const uint8_t *ui_render_scaled(uint32_t scale);
 const uint8_t *ui_render_incremental_scaled(uint32_t scale);
 
 #include <stdint.h>
@@ -164,7 +162,7 @@ static int run_fullscreen(uint32_t psm, const char *name) {
   ui_set_prop(root, PROP_HEIGHT, 480.0);
 
   int failures = 0;
-  int32_t tiles[2];
+  int32_t tiles[2] = {-1, -1};
   const int tile_x[2] = {0, 288};
   for (int t = 0; t < 2; t++) {
     int32_t image = ui_create_node(NODE_IMAGE);

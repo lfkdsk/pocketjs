@@ -224,6 +224,7 @@ describe("platform registry", () => {
       "input.cursor",
       "audio.pcm",
       "text.glyphs.baked",
+      "text.glyphs.streamed",
     ]);
     expect(POCKET_TARGETS.vita.capabilities).toEqual([
       "input.analog.left",
@@ -542,6 +543,7 @@ describe("semantic resolution", () => {
       library: [true, true, false, true],
       motions: [true, true, false, true],
       music: [true, true, false, true],
+      "text-cjk": [true, false, false, false],
       note: [false, false, true, true],
       notifications: [true, true, false, true],
       settings: [true, true, false, true],

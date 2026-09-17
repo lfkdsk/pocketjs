@@ -81,12 +81,16 @@ export function createOffloadClient(ops: OffloadOps) {
 }
 
 let client: ReturnType<typeof createOffloadClient> | undefined;
+let localClient: ReturnType<typeof createOffloadClient> | undefined;
 /** No synchronous FS, DB, DNS or socket operation is exposed to the guest. */
-export function offload() {
-  if (client) return client;
-  const ops = (globalThis as unknown as { offload?: OffloadOps }).offload;
+export function offload(provider: "companion" | "local" = "companion") {
+  if (provider === "local" && localClient) return localClient;
+  if (provider === "companion" && client) return client;
+  const root = (globalThis as unknown as { offload?: OffloadOps }).offload;
+  const ops = provider === "local" ? root?.local : root;
   if (!ops) throw new Error("Host does not implement io.offload");
-  client = createOffloadClient(ops);
-  registerServicePump(() => client!.step());
-  return client;
+  const next = createOffloadClient(ops);
+  if (provider === "local") localClient = next; else client = next;
+  registerServicePump(() => next.step());
+  return next;
 }

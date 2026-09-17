@@ -48,6 +48,7 @@ pub struct Atlas {
     /// `raster_density`.
     pub cell_w: u32,
     pub cell_h: u32,
+    pub(crate) texture_cell_w: u32,
     /// Logical px from cell top to the baseline.
     pub baseline: u32,
     /// Default logical line advance in px.
@@ -57,7 +58,8 @@ pub struct Atlas {
     pub slot: u8,
     pub flags: u8,
     pub glyph_count: u16,
-    cmap: Vec<CmapEntry>,
+    pub(crate) cmap: Vec<CmapEntry>,
+    pub(crate) stream: Option<crate::font_stream::Stream>,
     /// Coverage cells: glyphCount x (cellH*density) x (cellW*density)
     /// alpha bytes, left-to-right.
     pub bitmap: Vec<u8>,
@@ -134,8 +136,16 @@ impl Atlas {
             flags,
             glyph_count,
             cmap,
+            stream: None,
+            texture_cell_w: cell_w,
             bitmap,
         })
+    }
+
+    /// GPU cells omit transparent right-hand archive padding. Source coverage
+    /// retains its fixed row stride; this width includes every resident ink pixel.
+    pub fn texture_coverage_width(&self) -> u32 {
+        self.texture_cell_w * self.raster_density as u32
     }
 
     /// Binary-search the cmap. `None` = unmapped codepoint (caller decides
@@ -203,6 +213,7 @@ impl Atlas {
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphPos {
     pub gid: u16,
+    pub codepoint: u32,
     pub x: f32,
     pub y: f32,
 }
@@ -296,6 +307,10 @@ impl Fonts {
         self.slots.get(slot as usize)?.as_ref()
     }
 
+    pub(crate) fn atlas_mut(&mut self, slot: u8) -> Option<&mut Atlas> {
+        self.slots.get_mut(slot as usize)?.as_mut()
+    }
+
     /// (gid, advance, xoff) for a codepoint; a miss resolves to gid 0 (tofu,
     /// cell width advance) and bumps the miss counter.
     fn glyph(&self, atlas: &Atlas, cp: u32) -> (u16, f32, f32) {
@@ -303,7 +318,7 @@ impl Fonts {
             Some(e) => (e.gid, e.advance as f32, e.xoff as f32),
             None => {
                 self.misses.set(self.misses.get().wrapping_add(1));
-                (0, atlas.cell_w as f32, 0.0)
+                (0, atlas.stream.as_ref().map_or(atlas.cell_w as f32, |s| s.advance as f32), 0.0)
             }
         }
     }
@@ -498,6 +513,7 @@ impl Fonts {
                 // LSB accents) — place it at pen - xoff so ink lands at pen.
                 out.push(GlyphPos {
                     gid,
+                    codepoint: ch as u32,
                     x: pen - xoff,
                     y,
                 });

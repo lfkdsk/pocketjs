@@ -277,6 +277,11 @@ export const OP = {
   hitTestBoundsAuxiliary: 46, // bounds-only twin for auxiliary touch facts.
   //                      Same semantics as hitTestBounds; never searches
   //                      primary. Hosts omit both ops without the capability.
+  // Optional text.glyphs.streamed: bounded CPU handoff, never filesystem I/O.
+  fontStreamConfigure: 47, // (PFS1 bytes) -> bool; attach/detach a slot cache.
+  fontStreamRequests: 48, // () -> JSON of at most 32 [generation,slot,scalar] misses.
+  fontStreamCommit: 49, // (PFG1 bytes) -> accepted count, at most four cells.
+  fontStreamStats: 50, // () -> JSON: residency, visible misses, eviction counters.
 } as const;
 
 // ---------------------------------------------------------------------------

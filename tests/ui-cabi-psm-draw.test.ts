@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Issue #415: "d211-linux: rendering a PSM 5650 texture kills the app". The
-// crash never reproduced on x86_64 (findings/verify-L5-415.md); this test
-// locks the shared upload + software-raster path the d211 host (PR #407)
-// links: the C ABI drives 5650/4444/8888 textures through an 8x8 image and
+// Host-side coverage for the texture pattern reported in issue #415.
+// This exercises the shared upload + software-raster path through the C
+// ABI; it does not establish whether the d211 device crash is fixed.
+// The C ABI drives 5650/4444/8888 textures through an 8x8 image and
 // the issue's two 512x512 pow2 tiles, against both the release archive
 // (the device build configuration) and a debug archive (debug_assertions and
 // integer-overflow checks, panic=abort like release).

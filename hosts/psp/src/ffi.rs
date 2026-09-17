@@ -19,6 +19,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libquickjs_sys::*;
+extern "C" {
+    fn JS_ParseJSON(
+        ctx: *mut JSContext,
+        buf: *const core::ffi::c_char,
+        len: usize,
+        filename: *const core::ffi::c_char,
+    ) -> JSValue;
+}
 use pocketjs_core::Ui;
 
 static mut UI: Option<Ui> = None;
@@ -941,6 +949,7 @@ unsafe extern "C" fn js_offload_session(
     _: i32,
     _: *mut JSValue,
 ) -> JSValue {
+    crate::offload::start();
     JS_NewInt32(ctx, crate::offload::session())
 }
 unsafe extern "C" fn js_offload_submit(
@@ -976,6 +985,192 @@ unsafe extern "C" fn js_offload_take(
         None => JS_UNDEFINED,
     }
 }
+
+unsafe extern "C" fn js_local_session(
+    ctx: *mut JSContext,
+    _: JSValue,
+    _: i32,
+    _: *mut JSValue,
+) -> JSValue {
+    crate::offload_local::start();
+    JS_NewInt32(ctx, crate::offload_local::session())
+}
+unsafe extern "C" fn js_local_take(
+    ctx: *mut JSContext,
+    _: JSValue,
+    _: i32,
+    _: *mut JSValue,
+) -> JSValue {
+    match crate::offload_local::take() {
+        Some(s) => JS_NewStringLen(ctx, s.as_ptr(), s.len()),
+        None => JS_UNDEFINED,
+    }
+}
+unsafe fn local_number(ctx: *mut JSContext, obj: JSValue, key: &[u8]) -> u32 {
+    let v = JS_GetPropertyStr(ctx, obj, key.as_ptr() as *const _);
+    let mut n = 0;
+    JS_ToInt32(ctx, &mut n, v);
+    JS_FreeValue(ctx, v);
+    n as u32
+}
+unsafe fn local_string(ctx: *mut JSContext, obj: JSValue, key: &[u8]) -> String {
+    let v = JS_GetPropertyStr(ctx, obj, key.as_ptr() as *const _);
+    let mut n = 0;
+    let p = JS_ToCStringLen2(ctx, &mut n, v, 0);
+    let s = if !p.is_null() && n <= 4096 {
+        String::from_utf8_lossy(core::slice::from_raw_parts(p as *const u8, n)).into_owned()
+    } else {
+        String::new()
+    };
+    if !p.is_null() {
+        JS_FreeCString(ctx, p);
+    }
+    JS_FreeValue(ctx, v);
+    s
+}
+unsafe extern "C" fn js_local_submit(
+    ctx: *mut JSContext,
+    _: JSValue,
+    n: i32,
+    a: *mut JSValue,
+) -> JSValue {
+    if n < 1 {
+        return JS_NewBool(ctx, false);
+    }
+    let mut len = 0;
+    let p = JS_ToCStringLen2(ctx, &mut len, *a, 0);
+    if p.is_null() {
+        return JS_NewBool(ctx, false);
+    }
+    if len > 4096 {
+        JS_FreeCString(ctx, p);
+        return JS_NewBool(ctx, false);
+    }
+    let obj = JS_ParseJSON(ctx, p, len, b"local request\0".as_ptr() as *const _);
+    JS_FreeCString(ctx, p);
+    if JS_IsException(obj) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return JS_NewBool(ctx, false);
+    }
+    let mut r = crate::offload_local::Request::empty();
+    r.id = local_number(ctx, obj, b"id\0");
+    let method = local_string(ctx, obj, b"method\0");
+    let payload = local_string(ctx, obj, b"payload\0");
+    let version = local_number(ctx, obj, b"v\0");
+    JS_FreeValue(ctx, obj);
+    if version != 1 || r.id == 0 {
+        return JS_NewBool(ctx, false);
+    }
+    r.op = match method.as_str() {
+        "font.open" => 1,
+        "font.glyphs" => 2,
+        "font.stats" => 3,
+        "fs.read-text" => 4,
+        "font.close" => 5,
+        _ => 0,
+    };
+    if r.op == 1 || r.op == 4 {
+        if payload.len() >= 128 {
+            return JS_NewBool(ctx, false);
+        }
+        r.path[..payload.len()].copy_from_slice(payload.as_bytes());
+    }
+    if r.op == 2 {
+        // QuickJS requires buf[buf_len] == 0 even when a length is supplied.
+        // A Rust String does not carry that terminator; allocator reuse after
+        // a UTF-8 file read otherwise makes valid glyph requests fail parsing.
+        let Ok(json) = alloc::ffi::CString::new(payload.as_bytes()) else {
+            return JS_NewBool(ctx, false);
+        };
+        let args = JS_ParseJSON(
+            ctx,
+            json.as_ptr(),
+            payload.len(),
+            b"font batch\0".as_ptr() as *const _,
+        );
+        if JS_IsException(args) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            return JS_NewBool(ctx, false);
+        }
+        r.generation = local_number(ctx, args, b"generation\0");
+        let slot = local_number(ctx, args, b"slot\0");
+        let cps = JS_GetPropertyStr(ctx, args, b"scalars\0".as_ptr() as *const _);
+        let count = local_number(ctx, cps, b"length\0");
+        if count > 0 && count <= 4 && slot < 24 {
+            r.count = count as u8;
+            r.slot = slot as u8;
+            for i in 0..count {
+                let key = [b'0' + i as u8, 0];
+                r.cps[i as usize] = local_number(ctx, cps, &key);
+            }
+        }
+        JS_FreeValue(ctx, cps);
+        JS_FreeValue(ctx, args);
+        if r.count == 0 {
+            return JS_NewBool(ctx, false);
+        }
+    }
+    JS_NewBool(ctx, crate::offload_local::submit(r))
+}
+unsafe extern "C" fn js_font_stream_configure(
+    ctx: *mut JSContext,
+    _: JSValue,
+    n: i32,
+    a: *mut JSValue,
+) -> JSValue {
+    let ok = if n > 0 {
+        buffer_bytes(ctx, *a)
+            .map(|(p, l)| ui().font_stream_configure(core::slice::from_raw_parts(p, l)))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    JS_NewBool(ctx, ok)
+}
+unsafe extern "C" fn js_font_stream_commit(
+    ctx: *mut JSContext,
+    _: JSValue,
+    n: i32,
+    a: *mut JSValue,
+) -> JSValue {
+    let count = if n > 0 {
+        buffer_bytes(ctx, *a)
+            .map(|(p, l)| ui().font_stream_commit(core::slice::from_raw_parts(p, l)))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    JS_NewInt32(ctx, count as i32)
+}
+unsafe extern "C" fn js_font_stream_requests(
+    ctx: *mut JSContext,
+    _: JSValue,
+    _: i32,
+    _: *mut JSValue,
+) -> JSValue {
+    let s = ui().font_stream_requests();
+    JS_NewStringLen(ctx, s.as_ptr(), s.len())
+}
+unsafe extern "C" fn js_font_stream_batch(
+    ctx: *mut JSContext, _: JSValue, n: i32, a: *mut JSValue,
+) -> JSValue {
+    let result = if n > 0 {
+        buffer_bytes(ctx, *a)
+            .map(|(p, l)| ui().font_stream_batch(core::slice::from_raw_parts(p, l)))
+            .unwrap_or(-3)
+    } else { -3 };
+    JS_NewInt32(ctx, result)
+}
+unsafe extern "C" fn js_font_stream_stats(
+    ctx: *mut JSContext,
+    _: JSValue,
+    _: i32,
+    _: *mut JSValue,
+) -> JSValue {
+    let s = ui().font_stream_stats();
+    JS_NewStringLen(ctx, s.as_ptr(), s.len())
+}
+
 /// A string argument as bytes, or None when absent/undefined. The caller
 /// frees every returned pointer with JS_FreeCString.
 unsafe fn arg_bytes(ctx: *mut JSContext, argc: i32, argv: *mut JSValue, i: isize) -> Option<(*const i8, &'static [u8])> {
@@ -1054,11 +1249,15 @@ pub unsafe fn register(
     sprites: &[crate::pak::SpriteReg],
 ) {
     if crate::offload::enabled() {
-        crate::offload::start();
         let io = JS_NewObject(ctx);
         add_fn(ctx, io, b"session\0", js_offload_session, 0);
         add_fn(ctx, io, b"submit\0", js_offload_submit, 1);
         add_fn(ctx, io, b"take\0", js_offload_take, 0);
+        let local = JS_NewObject(ctx);
+        add_fn(ctx, local, b"session\0", js_local_session, 0);
+        add_fn(ctx, local, b"submit\0", js_local_submit, 1);
+        add_fn(ctx, local, b"take\0", js_local_take, 0);
+        JS_SetPropertyStr(ctx, io, b"local\0".as_ptr() as *const _, local);
         add_fn(ctx, io, b"uploadCoverage\0", js_offload_upload_coverage, 6);
         add_fn(ctx, io, b"uploadIndexedImage\0", js_offload_upload_indexed, 4);
         JS_SetPropertyStr(ctx, global, b"offload\0".as_ptr() as *const _, io);
@@ -1087,6 +1286,11 @@ pub unsafe fn register(
     add_fn(ctx, ui_obj, b"setCursorPos\0", js_set_cursor_pos, 2);
     add_fn(ctx, ui_obj, b"loadStyles\0", js_load_styles, 1);
     add_fn(ctx, ui_obj, b"loadFontAtlas\0", js_load_font_atlas, 1);
+    add_fn(ctx, ui_obj, b"fontStreamConfigure\0", js_font_stream_configure, 1);
+    add_fn(ctx, ui_obj, b"fontStreamCommit\0", js_font_stream_commit, 1);
+    add_fn(ctx, ui_obj, b"fontStreamRequests\0", js_font_stream_requests, 0);
+    add_fn(ctx, ui_obj, b"fontStreamStats\0", js_font_stream_stats, 0);
+    add_fn(ctx, ui_obj, b"fontStreamBatch\0", js_font_stream_batch, 1);
     add_fn(ctx, ui_obj, b"measureText\0", js_measure_text, 2);
     // DevTools ops + mailbox transport (docs/DEVTOOLS.md; debug-only, default-off).
     add_fn(ctx, ui_obj, b"debugInspect\0", js_debug_inspect, 1);

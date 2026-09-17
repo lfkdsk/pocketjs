@@ -57,7 +57,7 @@ export async function createWasmUi(wasm, options = {}) {
     else if (viewportWidth !== FB_W || viewportHeight !== FB_H) {
       throw new Error("this pocketjs.wasm predates ui_set_viewport — rebuild it: bun tools/wasm.ts");
     }
-    if (auxiliary) {
+  if (auxiliary) {
       if (!ex.ui_create_auxiliary_surface) throw new Error("Rebuild pocketjs.wasm for auxiliary output");
       auxiliaryRoot = ex.ui_create_auxiliary_surface(...auxiliary);
       if (!auxiliaryRoot) throw new Error("Could not create auxiliary output");
@@ -129,6 +129,17 @@ export async function createWasmUi(wasm, options = {}) {
     debugPause: (on) => ex.ui_debug_pause(on ? 1 : 0),
     debugStep: () => ex.ui_debug_step(),
   };
+  if (ex.ui_font_stream_configure) {
+    ops.fontStreamConfigure = (buf) => !!withBytes(buf, (p, l) => ex.ui_font_stream_configure(p, l));
+    ops.fontStreamCommit = (buf) => withBytes(buf, (p, l) => ex.ui_font_stream_commit(p, l));
+    ops.fontStreamBatch = (buf) => withBytes(buf, (p, l) => ex.ui_font_stream_batch(p, l));
+    const streamJSON = (fn) => {
+      const n = fn();
+      return new TextDecoder().decode(new Uint8Array(ex.memory.buffer, ex.ui_font_stream_json_ptr(), n));
+    };
+    ops.fontStreamRequests = () => streamJSON(ex.ui_font_stream_requests);
+    ops.fontStreamStats = () => streamJSON(ex.ui_font_stream_stats);
+  }
   if (auxiliary) {
     ops.hitTestAuxiliary = (x, y) => ex.ui_hit_test_auxiliary(x, y);
     ops.hitTestBoundsAuxiliary = (x, y) => ex.ui_hit_test_bounds_auxiliary(x, y);

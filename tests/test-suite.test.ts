@@ -35,6 +35,9 @@ const STAGE_EXCLUSIONS: Readonly<Record<string, { workflow: string }>> = {
   "tests/ui-cabi-allocator.test.ts": {
     workflow: ".github/workflows/native-c-harness.yml",
   },
+  "tests/ui-cabi-psm-draw.test.ts": {
+    workflow: ".github/workflows/native-c-harness.yml",
+  },
 };
 
 describe("declared test suite", () => {

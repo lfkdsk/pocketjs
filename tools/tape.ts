@@ -332,18 +332,18 @@ function loadAssertHashes(path: string, app: string, frameCount: number): string
   try {
     raw = readFileSync(path, "utf8");
   } catch (err) {
-    fail(`cannot read --assert file ${path}: ${(err as Error).message}`);
+    return fail(`cannot read --assert file ${path}: ${(err as Error).message}`);
   }
   let doc: unknown;
   try {
     doc = JSON.parse(raw);
   } catch (err) {
-    fail(`${path}: invalid JSON: ${(err as Error).message}`);
+    return fail(`${path}: invalid JSON: ${(err as Error).message}`);
   }
   try {
     return parseAssertHashes(doc, path, app, frameCount);
   } catch (err) {
-    fail((err as Error).message);
+    return fail((err as Error).message);
   }
 }
 

@@ -35,12 +35,10 @@ const SUITE: readonly Stage[] = [
     script: ["bun", "tests/contract.ts"],
   },
   {
-    // One tests/*.test.ts file is deliberately absent from every stage:
-    // ui-cabi-allocator.test.ts needs the nightly toolchain pinned by
-    // engine/ui-cabi/rust-toolchain.toml and runs under
-    // .github/workflows/native-c-harness.yml instead ("bun test
-    // tests/ui-cabi-allocator.test.ts"). tests/test-suite.test.ts pins that
-    // single registered exclusion.
+    // The C ABI allocator and PSM draw tests need the nightly toolchain
+    // pinned by engine/ui-cabi/rust-toolchain.toml. They run under
+    // .github/workflows/native-c-harness.yml; tests/test-suite.test.ts
+    // verifies these exclusions against that workflow.
     name: "unit",
     // wasm-auxiliary.test.ts loads hosts/web/pocketjs.wasm.
     prep: [["bun", "tools/wasm.ts"]],
@@ -65,7 +63,6 @@ const SUITE: readonly Stage[] = [
       "tests/host-layout.test.ts",
       "tests/quickjs-c-harness.test.ts",
       "tests/native-source.test.ts",
-      "tests/ui-cabi-psm-draw.test.ts",
       "tests/3ds-profile.test.ts",
       "tests/media-service.test.ts",
       "tests/media.test.ts",
@@ -119,6 +116,8 @@ const SUITE: readonly Stage[] = [
       "tests/offload-provider.test.ts",
       "tests/companion-session.test.ts",
       "tests/resource-cache.test.ts",
+      "tests/font-config.test.ts",
+      "tests/font-archive.test.ts",
       "tests/net-web.test.js",
       "tests/web-system-host.test.ts",
       "tests/wasm-auxiliary.test.ts",
@@ -162,7 +161,7 @@ const SUITE: readonly Stage[] = [
   {
     name: "handheld models and dual output",
     prep: [["bun", "tools/wasm.ts"]],
-    tests: ["tests/handheld-models.test.ts"],
+    tests: ["tests/handheld-models.test.ts", "tests/text-batch.test.ts", "tests/text-cjk.test.ts"],
   },
   {
     // Session golden: a 180-frame deterministic replay hashed per frame.

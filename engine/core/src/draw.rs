@@ -2586,6 +2586,9 @@ impl<'a> Walker<'a> {
             if n == u16::MAX as u32 {
                 break;
             }
+            if !atlas.stream_visible(g.codepoint, g.gid) {
+                continue;
+            }
             dl.words.push(xy_word(rx, ry));
             dl.words.push(g.gid as u32);
             n += 1;
