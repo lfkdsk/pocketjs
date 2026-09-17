@@ -1,0 +1,781 @@
+import { expect, test } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import {
+  RELAY_EFFECT,
+  RELAY_ERROR,
+  RELAY_LIMITS,
+  RELAY_OP,
+  RELAY_TYPE,
+} from "../contracts/spec/relay.ts";
+import { decodeFrame, encodePreparedFrame, prepareFrameBody } from "../framework/src/relay/frame.ts";
+import {
+  RELAY_P3_ERROR,
+  RELAY_PRIORITY,
+  RelayCreditLedger,
+  RelayCreditTable,
+  RelayReceiver,
+  RelayRequestTable,
+  RelaySender,
+  RelaySideband,
+  clipUtf8Bytes,
+  type RelayPriority,
+} from "../framework/src/relay/credit.ts";
+
+// R5 §3.9 proposal numbers (contracts/spec/relay.ts RELAY_LIMITS).
+const ATTACH = { frames: RELAY_LIMITS.controlWindowFrames, bytes: RELAY_LIMITS.controlWindowBytes };
+const SESSION = 0x0102030405060708n;
+
+// Minimal legal REQUEST metadata; slice math uses its real encoded wire size.
+const GET_META = {
+  op: "resource.get",
+  resource: { kind: 1, ns: "ns", key: "k", rendition: "r" },
+};
+const GET_WIRE = (() => {
+  const p = prepareFrameBody({ type: RELAY_TYPE.REQUEST, stream: 1, metadata: GET_META });
+  if (!p.ok) throw new Error(p.code);
+  return p.body.wireBytes;
+})();
+
+const controlSlice = () => ({ frames: 2, bytes: 2 * RELAY_LIMITS.controlMaxWireBytes });
+
+/** Builds a complete wire record for receive-side tests. */
+function wireRecord(
+  stream: number,
+  seq: number,
+  correlation: number,
+  metadata: Record<string, unknown>,
+  type: number = RELAY_TYPE.REQUEST,
+): Uint8Array {
+  const body = prepareFrameBody({ type, stream, metadata }, { maxWireBytes: 65536 });
+  if (!body.ok) throw new Error(body.code);
+  const enc = encodePreparedFrame(body.body, { session: SESSION, seq, correlation });
+  if (!enc.ok) throw new Error(enc.code);
+  return enc.bytes;
+}
+
+/** One endpoint: sender on its own send ledger/window, receiver on the
+ * matching granted slices, and a credit table that turns releases into
+ * outbound relay.credit sideband frames. */
+class Endpoint {
+  sideband = new RelaySideband();
+  creditTable = new RelayCreditTable();
+  sender: RelaySender;
+  receiver: RelayReceiver;
+  requests = new RelayRequestTable();
+  slices = new Map<number, { frames: number; bytes: number }>();
+
+  constructor(
+    session: bigint,
+    streamSlices: Array<{ stream: number; slice: { frames: number; bytes: number } }>,
+    opts: { framesPerPump?: number; deliveryPerPump?: number } = {},
+  ) {
+    this.sender = new RelaySender(session, this.sideband, {
+      windowFrames: ATTACH.frames,
+      windowBytes: ATTACH.bytes,
+      controlSlice: controlSlice(),
+      maxWireBytes: RELAY_LIMITS.controlMaxWireBytes,
+      framesPerPump: opts.framesPerPump ?? ATTACH.frames,
+      bytesPerPump: ATTACH.bytes,
+    }, this.creditTable);
+    this.slices.set(0, controlSlice());
+    for (const { stream, slice } of streamSlices) {
+      const opened = this.sender.openStream(stream, slice);
+      if (!opened.ok) throw new Error(opened.code);
+      this.slices.set(stream, slice);
+    }
+    this.receiver = new RelayReceiver(
+      session, this.slices, this.creditTable, RELAY_LIMITS.maxStreams, opts.deliveryPerPump ?? 1,
+    );
+  }
+}
+
+/** Moves A's pumped frames to B (relay.credit applied, normal frames
+ * ingested) and delivers one staged frame per B pump round. */
+function transport(from: Endpoint, to: Endpoint): string[] {
+  const pumped = from.sender.pump();
+  if (!pumped.ok) throw new Error(pumped.code);
+  for (const bytes of pumped.frames) {
+    const dec = decodeFrame(bytes);
+    if (!dec.ok) throw new Error(dec.code);
+    const f = dec.frame;
+    if (f.type === RELAY_TYPE.PUSH && f.metadata.op === RELAY_OP.CREDIT) {
+      const applied = to.sender.applyCredit({
+        targetStream: f.metadata.targetStream as number,
+        framesReleased: f.metadata.framesReleased as string,
+        bytesReleased: f.metadata.bytesReleased as string,
+      });
+      if (!applied.ok) throw new Error(applied.code);
+      continue;
+    }
+    const ingested = to.receiver.ingest(f, bytes.length);
+    if (!ingested.ok) throw new Error(ingested.code);
+  }
+  return to.receiver.pump().map((r) => r.handle);
+}
+
+// ---------------------------------------------------------------------------
+// Step 1 — ledger, cumulative credit, sideband whitelist
+// ---------------------------------------------------------------------------
+
+test("credit ledger: charge only inside the per-stream slice; relay.credit is cumulative and bounded by sent", () => {
+  const ledger = new RelayCreditLedger(ATTACH.frames, ATTACH.bytes, controlSlice());
+  expect(ledger.allocate(1, { frames: 2, bytes: 8192 }).ok).toBe(true);
+  expect(ledger.allocate(2, { frames: 4, bytes: 8192 }).ok).toBe(true);
+  // control 2 + stream1 2 + stream2 4 = 8 frames; one more slice rejects.
+  expect(ledger.allocate(3, { frames: 1, bytes: 1 }).code).toBe(RELAY_P3_ERROR.STREAM_LIMIT);
+
+  expect(ledger.charge(1, 4096).ok).toBe(true);
+  expect(ledger.charge(1, 4096).ok).toBe(true);
+  const third = ledger.charge(1, 4096);
+  expect(third.ok).toBe(false);
+  expect(third.code).toBe(RELAY_P3_ERROR.BUSY);
+  expect(ledger.inFlight(1)).toEqual({ frames: 2, bytes: 8192 });
+
+  // Byte bound trips before the frame bound on an oversized frame.
+  expect(ledger.charge(2, 8193).code).toBe(RELAY_P3_ERROR.BUSY);
+
+  // Cumulative release of one frame frees one slot.
+  expect(ledger.release(1, 1n, 4096n).ok).toBe(true);
+  expect(ledger.inFlight(1)).toEqual({ frames: 1, bytes: 4096 });
+  // Repeating the same cumulative values is a no-op.
+  expect(ledger.release(1, 1n, 4096n).ok).toBe(true);
+  expect(ledger.inFlight(1)).toEqual({ frames: 1, bytes: 4096 });
+  // Counvers must not move backwards.
+  expect(ledger.release(1, 0n, 0n).code).toBe(RELAY_P3_ERROR.CREDIT_RANGE);
+  // Counters must not exceed what this side sent.
+  expect(ledger.release(1, 9n, 8192n).code).toBe(RELAY_P3_ERROR.CREDIT_RANGE);
+  expect(ledger.release(1, 2n, 9999n).code).toBe(RELAY_P3_ERROR.CREDIT_RANGE);
+});
+
+test("credit ledger: per-stream slices never sum past the attachment window; reset ids never reopen", () => {
+  const ledger = new RelayCreditLedger(ATTACH.frames, ATTACH.bytes, controlSlice());
+  expect(ledger.allocate(1, { frames: 6, bytes: 24576 }).ok).toBe(true);
+  // control 2 + 6 = 8 frames / 32768 bytes; nothing more fits.
+  expect(ledger.allocate(2, { frames: 1, bytes: 1 }).code).toBe(RELAY_P3_ERROR.STREAM_LIMIT);
+  ledger.markDead(1);
+  expect(ledger.isDead(1)).toBe(true);
+  expect(ledger.allocate(1, { frames: 1, bytes: 1 }).code).toBe(RELAY_P3_ERROR.STREAM_LIMIT);
+});
+
+test("sideband: only credit/ping/reset/CANCEL, at most two 256B slots, no normal window borrowed", () => {
+  const sideband = new RelaySideband();
+  let seq = 0;
+  const allocSeq = () => ({ ok: true as const, seq: ++seq });
+
+  const cancel = prepareFrameBody({
+    type: RELAY_TYPE.CANCEL, stream: 0,
+    metadata: { op: RELAY_OP.REQUEST_CANCEL, targetStream: 1, reason: "user" },
+  }, { maxWireBytes: 256 });
+  if (!cancel.ok) throw new Error(cancel.code);
+  expect(sideband.admit(cancel.body, 7).ok).toBe(true);
+
+  const credit = prepareFrameBody({
+    type: RELAY_TYPE.PUSH, stream: 0,
+    metadata: {
+      op: RELAY_OP.CREDIT, targetStream: 1,
+      framesReleased: "0000000000000001", bytesReleased: "0000000000001000",
+    },
+  }, { maxWireBytes: 256 });
+  if (!credit.ok) throw new Error(credit.code);
+  expect(sideband.admit(credit.body, 0).ok).toBe(true);
+
+  // Third slot: the lane is full (two slots).
+  const ping = prepareFrameBody(
+    { type: RELAY_TYPE.REQUEST, stream: 0, metadata: { op: RELAY_OP.PING, token: 1 } },
+    { maxWireBytes: 256 },
+  );
+  if (!ping.ok) throw new Error(ping.code);
+  expect(sideband.admit(ping.body, 1).code).toBe(RELAY_P3_ERROR.SIDEBAND_FULL);
+
+  // Business data never rides the sideband.
+  const business = prepareFrameBody({ type: RELAY_TYPE.REQUEST, stream: 1, metadata: GET_META });
+  if (!business.ok) throw new Error(business.code);
+  expect(sideband.admit(business.body, 5).code).toBe(RELAY_P3_ERROR.SIDEBAND_FORBIDDEN);
+
+  const drained = sideband.drain(SESSION, allocSeq);
+  expect(drained.frames.length).toBe(2);
+  const first = decodeFrame(drained.frames[0]);
+  if (!first.ok) throw new Error(first.code);
+  expect(first.frame.stream).toBe(0);
+  expect(first.frame.seq).toBe(1);
+  expect(first.frame.correlation).toBe(7);
+});
+
+test("sideband: a frame over 256 bytes is SIDEBAND_LARGE; the reason clips at 64 UTF-8 bytes", () => {
+  const sideband = new RelaySideband();
+  const reason = clipUtf8Bytes("é".repeat(100), RELAY_LIMITS.cancelReasonMaxBytes);
+  expect(new TextEncoder().encode(reason).length).toBeLessThanOrEqual(RELAY_LIMITS.cancelReasonMaxBytes);
+  // 200 bytes of metadata plus the 48-byte header cannot fit a 256B slot.
+  const big = prepareFrameBody({
+    type: RELAY_TYPE.PUSH, stream: 0,
+    metadata: { op: RELAY_OP.RESET, targetStream: 1, reason: "x".repeat(200) },
+  }, { maxWireBytes: 4096 });
+  if (!big.ok) throw new Error(big.code);
+  expect(big.body.wireBytes).toBeGreaterThan(256);
+  expect(sideband.admit(big.body, 0).code).toBe(RELAY_P3_ERROR.SIDEBAND_LARGE);
+});
+
+// ---------------------------------------------------------------------------
+// Step 2 — send planner: bounded admission, BUSY, priority, FIFO, seq rule
+// ---------------------------------------------------------------------------
+
+test("sender: seq exists only once a frame is selected (one-per-pump proves allocation timing)", () => {
+  const ep = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 4, bytes: 16384 } }], { framesPerPump: 1 });
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 1, metadata: GET_META }).ok).toBe(true);
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 2, metadata: GET_META }).ok).toBe(true);
+  const first = ep.sender.pump();
+  expect(first.frames.length).toBe(1);
+  let d = decodeFrame(first.frames[0]);
+  if (!d.ok) throw new Error(d.code);
+  expect(d.frame.seq).toBe(1);
+  // The still-queued second frame has no seq until this pump selects it.
+  const second = ep.sender.pump();
+  expect(second.frames.length).toBe(1);
+  d = decodeFrame(second.frames[0]);
+  if (!d.ok) throw new Error(d.code);
+  expect(d.frame.seq).toBe(2);
+  expect(ep.sender.queuedFrames(1)).toBe(0);
+});
+
+test("sender: seq allocates at selection after charging; queued+new admission; BUSY does not enqueue", () => {
+  const ep = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 2 * GET_WIRE } }]);
+  const admit = (corr: number) => ep.sender.admit({
+    type: RELAY_TYPE.REQUEST, stream: 1, correlation: corr, metadata: GET_META,
+  });
+  expect(admit(1).ok).toBe(true);
+  expect(admit(2).ok).toBe(true);
+  // No frame is in flight yet, but queued+new (2 queued + 1) exceeds the
+  // 2-frame slice: BUSY, and nothing enters the queue.
+  const third = admit(3);
+  expect(third.code).toBe(RELAY_P3_ERROR.BUSY);
+  expect(ep.sender.queuedFrames(1)).toBe(2);
+
+  const pumped = ep.sender.pump();
+  expect(pumped.frames.length).toBe(2);
+  const seqs = pumped.frames.map((b) => {
+    const d = decodeFrame(b);
+    if (!d.ok) throw new Error(d.code);
+    return { seq: d.frame.seq, corr: d.frame.correlation };
+  });
+  // FIFO inside the stream; seq starts at 1 per (session, stream).
+  expect(seqs).toEqual([{ seq: 1, corr: 1 }, { seq: 2, corr: 2 }]);
+  expect(ep.sender.ledgerView().inFlight(1)).toEqual({ frames: 2, bytes: 2 * GET_WIRE });
+  // Window full: still BUSY.
+  expect(admit(3).code).toBe(RELAY_P3_ERROR.BUSY);
+});
+
+test("sender: priority bands select first, streams round-robin inside a band, FIFO never breaks inside a stream", () => {
+  // control 2 + stream1 3 + stream2 3 = 8 frames.
+  const ep = new Endpoint(SESSION, [
+    { stream: 1, slice: { frames: 3, bytes: 12288 } },
+    { stream: 2, slice: { frames: 3, bytes: 12288 } },
+  ]);
+  const a = (stream: number, corr: number, priority: RelayPriority) =>
+    ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream, correlation: corr, priority, metadata: GET_META });
+  // Stream queues end up s1=[10,11,13], s2=[12,14,15].
+  expect(a(1, 10, RELAY_PRIORITY.CONTROL).ok).toBe(true);
+  expect(a(2, 12, RELAY_PRIORITY.VISIBLE).ok).toBe(true);
+  expect(a(1, 11, RELAY_PRIORITY.VISIBLE).ok).toBe(true);
+  expect(a(2, 14, RELAY_PRIORITY.VISIBLE).ok).toBe(true);
+  expect(a(1, 13, RELAY_PRIORITY.VISIBLE).ok).toBe(true);
+  expect(a(2, 15, RELAY_PRIORITY.PREFETCH).ok).toBe(true);
+
+  const order = ep.sender.pump().frames.map((b) => {
+    const d = decodeFrame(b);
+    if (!d.ok) throw new Error(d.code);
+    return { stream: d.frame.stream, corr: d.frame.correlation };
+  });
+  // Control band first; VISIBLE alternates s1/s2 starting at the lowest
+  // stream id; PREFETCH leaves last. Per-stream FIFO: s1 10,11,13 s2 12,14,15.
+  expect(order.map((o) => o.corr)).toEqual([10, 11, 12, 13, 14, 15]);
+});
+
+test("sender: a big head blocked on byte credit does not stall a smaller frame on another stream", () => {
+  const bigMeta = {
+    op: "resource.get",
+    resource: { kind: 2, ns: "n", key: "k".repeat(40), rendition: "r" },
+  };
+  const bigBody = prepareFrameBody({ type: RELAY_TYPE.REQUEST, stream: 1, metadata: bigMeta });
+  if (!bigBody.ok) throw new Error(bigBody.code);
+  const bigW = bigBody.body.wireBytes;
+  const ep = new Endpoint(SESSION, [
+    { stream: 1, slice: { frames: 2, bytes: bigW } },
+    { stream: 2, slice: { frames: 2, bytes: 2 * GET_WIRE } },
+  ]);
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 1, metadata: bigMeta }).ok).toBe(true);
+  const first = ep.sender.pump();
+  expect(first.frames.length).toBe(1); // big frame in flight fills stream 1 bytes
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 2, metadata: bigMeta }).code)
+    .toBe(RELAY_P3_ERROR.BUSY);
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 2, correlation: 3, metadata: GET_META }).ok).toBe(true);
+  const second = ep.sender.pump();
+  expect(second.frames.length).toBe(1);
+  const d = decodeFrame(second.frames[0]);
+  if (!d.ok) throw new Error(d.code);
+  expect(d.frame.stream).toBe(2);
+});
+
+test("sender: CANCEL and relay.reset ride the sideband past a full normal window and consume no normal credit", () => {
+  const ep = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 1, bytes: 8192 } }]);
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 1, metadata: GET_META }).ok).toBe(true);
+  expect(ep.sender.pump().frames.length).toBe(1);
+  expect(ep.sender.cancel(1, 1, "user navigated away").ok).toBe(true);
+  expect(ep.sender.sendReset(1, "resync").ok).toBe(true);
+  const pumped = ep.sender.pump();
+  expect(pumped.frames.length).toBe(2);
+  for (const bytes of pumped.frames) {
+    const d = decodeFrame(bytes);
+    if (!d.ok) throw new Error(d.code);
+    expect(d.frame.stream).toBe(0);
+  }
+  expect(ep.sender.ledgerView().inFlight(0)).toEqual({ frames: 0, bytes: 0 });
+  expect(ep.sender.ledgerView().inFlight(1)).toEqual({ frames: 1, bytes: GET_WIRE });
+});
+
+// ---------------------------------------------------------------------------
+// Step 3 — bounded receive: busy backpressure, seq gaps, release-only credit
+// ---------------------------------------------------------------------------
+
+test("receiver: a full window returns WINDOW_OVERFLOW (nothing dropped); canIngest gates the transport", () => {
+  const creditTable = new RelayCreditTable();
+  const slices = new Map([[0, controlSlice()], [1, { frames: 2, bytes: 2 * GET_WIRE }]]);
+  const rx = new RelayReceiver(SESSION, slices, creditTable);
+  const frame = (seq: number) => {
+    const bytes = wireRecord(1, seq, seq, GET_META);
+    const dec = decodeFrame(bytes);
+    if (!dec.ok) throw new Error(dec.code);
+    return { bytes, frame: dec.frame };
+  };
+  const f1 = frame(1), f2 = frame(2);
+  expect(rx.canIngest(1, f1.bytes.length)).toBe(true);
+  expect(rx.ingest(f1.frame, f1.bytes.length).ok).toBe(true);
+  expect(rx.ingest(f2.frame, f2.bytes.length).ok).toBe(true);
+  // The transport must stop reading here: the peer is out of granted window.
+  const f3 = frame(3);
+  expect(rx.canIngest(1, f3.bytes.length)).toBe(false);
+  const overflow = rx.ingest(f3.frame, f3.bytes.length);
+  expect(overflow.code).toBe(RELAY_P3_ERROR.WINDOW_OVERFLOW);
+  // f3 was never consumed; staging holds exactly the two granted frames.
+  expect(rx.occupancyStream(1)).toEqual({ frames: 2, bytes: 2 * GET_WIRE });
+
+  // Delivery is at most one frame per pump call; release is the only credit
+  // point. A second pump delivers the next staged frame.
+  expect(rx.pump().map((r) => r.handle)).toEqual(["1:1"]);
+  expect(rx.pump().map((r) => r.handle)).toEqual(["1:2"]);
+  expect(rx.pump().length).toBe(0);
+  expect(rx.release("1:1").ok).toBe(true);
+  expect(creditTable.counters(1)).toEqual({ frames: 1n, bytes: BigInt(GET_WIRE) });
+});
+
+test("receiver: a seq gap stops the stream; a stream-0 seq error ends the session", () => {
+  const creditTable = new RelayCreditTable();
+  const slices = new Map([[0, controlSlice()], [1, { frames: 8, bytes: 32768 }]]);
+  const rx = new RelayReceiver(SESSION, slices, creditTable);
+  const business = (seq: number) => {
+    const bytes = wireRecord(1, seq, seq, GET_META);
+    const dec = decodeFrame(bytes);
+    if (!dec.ok) throw new Error(dec.code);
+    return dec.frame;
+  };
+  const control = (seq: number) => {
+    // PUSH on stream 0 only needs a grammar-valid op at the frame layer.
+    const bytes = wireRecord(0, seq, 0, { op: "x" }, RELAY_TYPE.PUSH);
+    const dec = decodeFrame(bytes);
+    if (!dec.ok) throw new Error(dec.code);
+    return dec.frame;
+  };
+  expect(rx.ingest(business(1), 100).ok).toBe(true);
+  expect(rx.ingest(business(3), 100).code).toBe(RELAY_P3_ERROR.SEQ_GAP);
+  // The stream stays stopped: the missing frame arriving later is rejected.
+  expect(rx.ingest(business(2), 100).code).toBe(RELAY_P3_ERROR.SEQ_GAP);
+  // A seq error on stream 0 is session-fatal.
+  expect(rx.ingest(control(2), 100).code).toBe(RELAY_P3_ERROR.SESSION_FATAL);
+  expect(rx.sessionFatal).toBe(true);
+});
+
+test("loopback: a 600-frame burst admits only to the window cap, BUSY demand retries after credit, nothing lost", () => {
+  const a = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 2 * GET_WIRE } }]);
+  const b = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 2 * GET_WIRE } }]);
+
+  const TOTAL = 600;
+  let maxInFlightFrames = 0;
+  let maxInFlightBytes = 0;
+  let busy = 0;
+  // Finite unsubmitted demand the upper layer retains (§3.9: the protocol
+  // itself never grows an unbounded retry queue).
+  const waiting: number[] = [];
+  let next = 1;
+  const fill = () => {
+    while (next <= TOTAL || waiting.length > 0) {
+      const corr = waiting.length > 0 ? waiting[0]! : next;
+      const r = a.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: corr, metadata: GET_META });
+      if (!r.ok) {
+        expect(r.code).toBe(RELAY_P3_ERROR.BUSY);
+        if (waiting.length === 0) { waiting.push(next); next++; }
+        busy++;
+        break;
+      }
+      if (waiting.length > 0) waiting.shift();
+      else next++;
+    }
+  };
+
+  fill();
+  const deliveredSeqs: number[] = [];
+  let guard = 0;
+  while (deliveredSeqs.length < TOTAL && guard++ < 10000) {
+    // Peak is measured the instant A's frames are charged and on the wire,
+    // before B consumes anything or returns credit.
+    const handles = transport(a, b);
+    const peak = a.sender.ledgerView().inFlight(1);
+    maxInFlightFrames = Math.max(maxInFlightFrames, peak.frames);
+    maxInFlightBytes = Math.max(maxInFlightBytes, peak.bytes);
+    for (const h of handles) {
+      const released = b.receiver.release(h);
+      if (!released.ok) throw new Error(released.code);
+      deliveredSeqs.push(Number(h.split(":")[1]));
+    }
+    // B returns cumulative credit; A's window unwinds and more demand admits.
+    transport(b, a);
+    fill();
+  }
+  expect(deliveredSeqs.length).toBe(TOTAL);
+  expect(busy).toBeGreaterThan(0);
+  expect(maxInFlightFrames).toBeLessThanOrEqual(2);
+  expect(maxInFlightBytes).toBeLessThanOrEqual(2 * GET_WIRE);
+  // Every request crossed exactly once, in stream-FIFO order.
+  expect(deliveredSeqs.every((s, i) => s === i + 1)).toBe(true);
+  console.log(`relay 600-frame burst: BUSY admissions=${busy}, max in-flight=${maxInFlightFrames} frames / ${maxInFlightBytes} bytes (frame wire ${GET_WIRE}B)`);
+});
+
+// ---------------------------------------------------------------------------
+// Step 4 — reset and CANCEL terminal semantics
+// ---------------------------------------------------------------------------
+
+test("relay.reset: queued and in-flight requests fail, session state releases, the stream never reopens", () => {
+  // Two frames per pump leaves corr 3/4 queued while 1/2 are on the wire.
+  const a = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 4, bytes: 16384 } }], { framesPerPump: 2 });
+  const b = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 4, bytes: 16384 } }]);
+  for (const corr of [1, 2, 3, 4]) {
+    expect(a.requests.admit(1).ok).toBe(true);
+    expect(a.sender.admit({
+      type: RELAY_TYPE.REQUEST, stream: 1, correlation: corr, metadata: GET_META,
+      association: { kind: "correlation", id: corr },
+    }).ok).toBe(true);
+  }
+  // Per-pump delivery is one frame; one is outstanding, one staged, two queued.
+  const handles = transport(a, b);
+  expect(handles).toEqual(["1:1"]);
+
+  const failedQueued = a.sender.applyReset(1);
+  expect(failedQueued.map((f) => f.id).sort()).toEqual([3, 4]);
+  const failedRequests = a.requests.failStream(1);
+  expect(failedRequests.length).toBe(4);
+  expect(a.requests.active).toBe(0);
+  expect(a.sender.openStream(1, { frames: 1, bytes: 1 }).code).toBe(RELAY_P3_ERROR.STREAM_LIMIT);
+
+  // Receiver reset discards the outstanding plus staged frame with credit.
+  const reset = b.receiver.applyReset(1, "resync");
+  if (!reset.ok) throw new Error(reset.code);
+  expect(reset.failed).toBe(2);
+  expect(b.creditTable.counters(1)?.frames).toBe(2n);
+  // A later frame on the abandoned id drops as late and still credits.
+  const bytes = wireRecord(1, 3, 5, GET_META);
+  const dec = decodeFrame(bytes);
+  if (!dec.ok) throw new Error(dec.code);
+  const ingested = b.receiver.ingest(dec.frame, bytes.length);
+  expect(ingested.ok).toBe(true);
+  if (ingested.ok) expect(ingested.late).toBe(true);
+  expect(b.receiver.occupancyStream(1)).toEqual({ frames: 0, bytes: 0 });
+});
+
+test("CANCEL race A: the result is already in flight — success terminal stands, no second terminal", () => {
+  const provider = new RelayRequestTable();
+  expect(provider.admitKnown(1, 42).ok).toBe(true);
+  const t1 = provider.terminal(42, { status: "ok", final: true, effect: RELAY_EFFECT.NONE });
+  if (!t1.ok) throw new Error(t1.code);
+  expect(t1.first).toBe(true);
+  // CANCEL arrives after the terminal was sent: interest is withdrawn but
+  // the provider neither replaces nor repeats the terminal.
+  expect(provider.cancel(42).ok).toBe(true);
+  const t2 = provider.terminal(42, {
+    status: "error", final: true, errorCode: RELAY_ERROR.CANCELLED, effect: RELAY_EFFECT.NONE,
+  });
+  expect(t2.code).toBe(RELAY_P3_ERROR.ALREADY_TERMINAL);
+  // A repeat CANCEL while the terminal is still pending neither errors nor
+  // produces a second terminal; then consumption frees the single slot.
+  expect(provider.cancel(42).ok).toBe(true);
+  const consumed = provider.consumeTerminal(42);
+  expect(consumed.ok).toBe(true);
+  if (consumed.ok) expect(consumed.state.terminal?.status).toBe("ok");
+  expect(provider.active).toBe(0);
+});
+
+test("CANCEL race B: cancel first — the one terminal is CANCELLED/none; the slot frees on consume only", () => {
+  const client = new RelayRequestTable();
+  expect(client.admit(1).ok).toBe(true); // correlation 1
+  expect(client.cancel(1).ok).toBe(true);
+  expect(client.get(1)?.cancelRequested).toBe(true);
+  expect(client.active).toBe(1); // timeout/cancel does not return the slot
+  const t = client.terminal(1, {
+    status: "error", final: true, errorCode: RELAY_ERROR.CANCELLED, effect: RELAY_EFFECT.NONE,
+  });
+  expect(t.ok).toBe(true);
+  expect(client.active).toBe(1);
+  expect(client.consumeTerminal(1).ok).toBe(true);
+  expect(client.active).toBe(0);
+  // A duplicated terminal after the slot released cannot be recorded twice.
+  const dup = client.terminal(1, {
+    status: "error", final: true, errorCode: RELAY_ERROR.CANCELLED, effect: RELAY_EFFECT.NONE,
+  });
+  expect(dup.code).toBe(RELAY_P3_ERROR.UNKNOWN_REQUEST);
+});
+
+test("CANCEL: late chunks after the terminal pass seq/credit accounting and drop without delivery", () => {
+  // control 2 + business 6 = the 8-frame attachment window.
+  const b = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 6, bytes: 24576 } }]);
+  const ingest = (seq: number) => {
+    const bytes = wireRecord(1, seq, 7, GET_META);
+    const dec = decodeFrame(bytes);
+    if (!dec.ok) throw new Error(dec.code);
+    return b.receiver.ingest(dec.frame, bytes.length, { kind: "correlation", id: 7 });
+  };
+  expect(ingest(1).ok).toBe(true);
+  expect(ingest(2).ok).toBe(true);
+  // Both pre-terminal chunks deliver and release normally.
+  for (const expected of ["1:1", "1:2"]) {
+    const [handle] = b.receiver.pump().map((r) => r.handle);
+    expect(handle).toBe(expected);
+    expect(b.receiver.release(handle).ok).toBe(true);
+  }
+  // The one terminal is consumed: association 7 is finished.
+  b.receiver.markFinished("correlation", 7);
+  const late1 = ingest(3);
+  expect(late1.ok).toBe(true);
+  if (late1.ok) expect(late1.late).toBe(true);
+  const late2 = ingest(4);
+  expect(late2.ok).toBe(true);
+  if (late2.ok) expect(late2.late).toBe(true);
+  // All four frames returned credit; neither late chunk was delivered.
+  expect(b.creditTable.counters(1)).toEqual({ frames: 4n, bytes: BigInt(4 * GET_WIRE) });
+  expect(b.receiver.pump().length).toBe(0);
+  // Seq still advances through late chunks: a hole is an error, not a drop.
+  expect(ingest(6).code).toBe(RELAY_P3_ERROR.SEQ_GAP);
+});
+
+test("request table: maxPending=8; cancel does not release a slot; 2 slots reservable for input/control", () => {
+  const table = new RelayRequestTable();
+  for (let i = 0; i < RELAY_LIMITS.maxPending; i++) expect(table.admit(1).ok).toBe(true);
+  expect(table.admit(1).code).toBe(RELAY_P3_ERROR.PENDING_FULL);
+  const reserved = new RelayRequestTable();
+  for (let i = 0; i < 6; i++) expect(reserved.admit(1, 2).ok).toBe(true);
+  expect(reserved.admit(1, 2).code).toBe(RELAY_P3_ERROR.PENDING_FULL);
+  expect(table.cancel(1).ok).toBe(true);
+  expect(table.active).toBe(8);
+  table.terminal(1, {
+    status: "error", final: true, errorCode: RELAY_ERROR.CANCELLED, effect: RELAY_EFFECT.NONE,
+  });
+  expect(table.consumeTerminal(1).ok).toBe(true);
+  expect(table.active).toBe(7);
+});
+
+// ---------------------------------------------------------------------------
+// Step 5 — property invariant, benchmark, mutation probe
+// ---------------------------------------------------------------------------
+
+test("sideband: ping request and pong response are whitelisted; a worker turn drains at most 2 frames/512B", () => {
+  const ep = new Endpoint(SESSION, [], { framesPerPump: 2 });
+  expect(ep.sender.sendPing(1, 0xabcdef).ok).toBe(true);
+  expect(ep.sender.sendPong(1, 0xabcdef).ok).toBe(true);
+  const out = ep.sender.pump().frames;
+  expect(out.length).toBe(2);
+  const req = decodeFrame(out[0]);
+  const res = decodeFrame(out[1]);
+  if (!req.ok || !res.ok) throw new Error("decode");
+  expect(req.frame.type).toBe(RELAY_TYPE.REQUEST);
+  expect(req.frame.metadata.op).toBe(RELAY_OP.PING);
+  expect(res.frame.type).toBe(RELAY_TYPE.RESPONSE);
+  expect(res.frame.metadata.status).toBe("ok");
+  expect(res.frame.metadata.final).toBe(true);
+  // Sideband traffic leaves no normal-window debt on either ledger view.
+  expect(ep.sender.ledgerView().inFlight(0)).toEqual({ frames: 0, bytes: 0 });
+});
+
+test("credit table: repeated releases merge into one cumulative row; dirty rows build relay.credit bodies", () => {
+  const table = new RelayCreditTable();
+  expect(table.note(1, 1, 100).ok).toBe(true);
+  expect(table.note(1, 2, 200).ok).toBe(true); // merges, no new row
+  expect(table.size).toBe(1);
+  expect(table.counters(1)).toEqual({ frames: 3n, bytes: 300n });
+  expect(table.note(2, 1, 64).ok).toBe(true);
+  const rows = table.takeDirty();
+  expect(rows.map((r) => r.stream).sort()).toEqual([1, 2]);
+  // The built frame is a stream-0 PUSH carrying cumulative hex counters.
+  const row1 = rows.find((x) => x.stream === 1)!;
+  const built = encodePreparedFrame(row1.body, { session: SESSION, seq: 1, correlation: 0 });
+  if (!built.ok) throw new Error(built.code);
+  const dec = decodeFrame(built.bytes);
+  if (!dec.ok) throw new Error(dec.code);
+  expect(dec.frame.type).toBe(RELAY_TYPE.PUSH);
+  expect(dec.frame.stream).toBe(0);
+  expect(dec.frame.metadata).toEqual({
+    op: RELAY_OP.CREDIT, targetStream: 1,
+    framesReleased: "0000000000000003", bytesReleased: "000000000000012c",
+  });
+  table.clearDirty([1, 2]);
+  expect(table.takeDirty().length).toBe(0);
+});
+
+test("credit table: bounded to nine rows (stream 0 plus eight nonzero streams)", () => {
+  const table = new RelayCreditTable();
+  for (let s = 0; s <= RELAY_LIMITS.maxStreams; s++) expect(table.note(s, 1, 1).ok).toBe(true);
+  expect(table.size).toBe(9);
+  const overflow = table.note(99, 1, 1);
+  expect(overflow.ok).toBe(false);
+  expect(overflow.code).toBe(RELAY_P3_ERROR.CREDIT_TABLE_FULL);
+});
+
+test("sender: admission rejects the wrong correlation for a type before any credit or seq is spent", () => {
+  const ep = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 4, bytes: 16384 } }]);
+  // REQUEST without correlation.
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, metadata: GET_META }).code)
+    .toBe(RELAY_P3_ERROR.BAD_CORRELATION);
+  // PUSH with a correlation.
+  expect(ep.sender.admit({ type: RELAY_TYPE.PUSH, stream: 1, correlation: 9, metadata: { op: "x" } }).code)
+    .toBe(RELAY_P3_ERROR.BAD_CORRELATION);
+  expect(ep.sender.queuedFrames(1)).toBe(0);
+});
+
+test("sender: ordinary stream-0 management frames consume the normal control slice; only the whitelist rides sideband", () => {  const ep = new Endpoint(SESSION, []); // control slice only: 2 frames
+  const openMeta = {
+    op: RELAY_OP.OPEN, app: "app", namespace: "ns",
+    profile: { name: "pocket-map", version: 1 },
+  };
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 0, correlation: 1, priority: RELAY_PRIORITY.CONTROL, metadata: openMeta }).ok).toBe(true);
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 0, correlation: 2, priority: RELAY_PRIORITY.CONTROL, metadata: openMeta }).ok).toBe(true);
+  // The control slice is two normal frames; a third normal frame is BUSY.
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 0, correlation: 3, priority: RELAY_PRIORITY.CONTROL, metadata: openMeta }).code)
+    .toBe(RELAY_P3_ERROR.BUSY);
+  const out = ep.sender.pump();
+  expect(out.frames.length).toBe(2);
+  const controlBytes = out.frames.reduce((n, b) => n + b.length, 0);
+  // Ordinary stream-0 management frames are counted on the normal ledger
+  // (§3.9: "stream0 的普通管理 frame 也计数，sideband 白名单除外").
+  expect(ep.sender.ledgerView().inFlight(0)).toEqual({ frames: 2, bytes: controlBytes });
+});
+
+test("property: window consumed never exceeds granted under randomized charge/release operations", () => {  for (let run = 0; run < 40; run++) {
+    const ledger = new RelayCreditLedger(ATTACH.frames, ATTACH.bytes, controlSlice());
+    const sliceFrames = 1 + ((Math.random() * 4) | 0);
+    const sliceBytes = sliceFrames * 4096;
+    expect(ledger.allocate(1, { frames: sliceFrames, bytes: sliceBytes }).ok).toBe(true);
+    let sent = 0;
+    let released = 0;
+    for (let i = 0; i < 500; i++) {
+      const inFlight = sent - released;
+      if (inFlight < sliceFrames && Math.random() < 0.7) {
+        expect(ledger.charge(1, 4096).ok).toBe(true);
+        sent++;
+      } else if (released < sent && Math.random() < 0.5) {
+        const advance = 1 + ((Math.random() * (sent - released)) | 0);
+        released += advance;
+        expect(ledger.release(1, BigInt(released), BigInt(released * 4096)).ok).toBe(true);
+      }
+      const inf = ledger.inFlight(1);
+      expect(inf.frames).toBe(sent - released);
+      expect(inf.bytes).toBe(inf.frames * 4096);
+      expect(inf.frames).toBeGreaterThanOrEqual(0);
+      expect(inf.frames).toBeLessThanOrEqual(sliceFrames);
+    }
+  }
+});
+
+test("property: receiver occupancy never exceeds the granted window and every release is accounted exactly once", () => {
+  for (let run = 0; run < 40; run++) {
+    const capFrames = 2 + ((Math.random() * 3) | 0);
+    const table = new RelayCreditTable();
+    const slices = new Map([[0, controlSlice()], [1, { frames: capFrames, bytes: capFrames * GET_WIRE }]]);
+    const rx = new RelayReceiver(SESSION, slices, table);
+    let seq = 1;
+    let credited = 0;
+    const outstanding: string[] = [];
+    for (let i = 0; i < 400; i++) {
+      if (rx.canIngest(1, GET_WIRE) && Math.random() < 0.75) {
+        const bytes = wireRecord(1, seq, seq, GET_META);
+        const dec = decodeFrame(bytes);
+        if (!dec.ok) throw new Error(dec.code);
+        const ing = rx.ingest(dec.frame, bytes.length);
+        expect(ing.ok).toBe(true);
+        seq++;
+      }
+      for (const r of rx.pump()) outstanding.push(r.handle);
+      if (outstanding.length > 0 && Math.random() < 0.6) {
+        const handle = outstanding.shift()!;
+        expect(rx.release(handle).ok).toBe(true);
+        credited++;
+      }
+      const occ = rx.occupancyStream(1);
+      expect(occ.frames).toBeGreaterThanOrEqual(0);
+      expect(occ.frames).toBeLessThanOrEqual(capFrames);
+      expect(occ.bytes).toBe(occ.frames * GET_WIRE);
+      // Before the first release no row exists; afterwards counters match.
+      expect(table.counters(1)?.frames ?? 0n).toBe(BigInt(credited));
+      expect(table.counters(1)?.bytes ?? 0n).toBe(BigInt(credited * GET_WIRE));
+    }
+  }
+});
+
+test("benchmark: per-frame ledger bookkeeping over 100,000 charge/release operations", () => {
+  const ledger = new RelayCreditLedger(1024, 1 << 24, { frames: 512, bytes: 1 << 23 });
+  expect(ledger.allocate(1, { frames: 512, bytes: 1 << 23 }).ok).toBe(true);
+  const n = 100_000;
+  let window = 0;
+  const start = performance.now();
+  for (let i = 1; i <= n; i++) {
+    const charged = ledger.charge(1, 4096);
+    if (!charged.ok) throw new Error(charged.code);
+    window++;
+    if (window === 512) {
+      const r = ledger.release(1, BigInt(i), BigInt(i * 4096));
+      if (!r.ok) throw new Error(r.code);
+      window = 0;
+    }
+  }
+  const ms = performance.now() - start;
+  const usPerOp = (ms / n) * 1000;
+  console.log(`relay ledger charge/release n=${n}: ${ms.toFixed(1)} ms (${usPerOp.toFixed(3)} µs/frame)`);
+  expect(usPerOp).toBeLessThan(50);
+});
+
+test("mutation probe: removing the +1 frame check in charge() lets a third frame past a 2-frame window", async () => {
+  const sourceUrl = new URL("../framework/src/relay/credit.ts", import.meta.url);
+  const original = await Bun.file(sourceUrl).text();
+  const needle = "if (usedF + 1n > BigInt(a.frames) || usedB + BigInt(wireBytes) > BigInt(a.bytes))";
+  const mutant = "if (usedF + 0n > BigInt(a.frames) || usedB + BigInt(wireBytes) > BigInt(a.bytes))";
+  expect(original.includes(needle)).toBe(true);
+  // The mutant keeps the same relative imports (./frame.ts, contracts), so it
+  // lives beside the source for the duration of this test and is removed in
+  // finally. The byte bound is given a large slice so only the frame-count
+  // comparison is under test.
+  const dir = new URL(".", sourceUrl).pathname;
+  const mutatedPath = join(dir, `credit-mut-${process.pid}.ts`);
+  try {
+    writeFileSync(mutatedPath, original.replace(needle, mutant), "utf8");
+    const mutated = await import(`${pathToFileURL(mutatedPath).href}?v=${Date.now()}`);
+    const bad: RelayCreditLedger = new mutated.RelayCreditLedger(8, 1 << 24, { frames: 2, bytes: 1 << 23 });
+    bad.allocate(1, { frames: 2, bytes: 1 << 23 });
+    expect(bad.charge(1, 4096).ok).toBe(true);
+    expect(bad.charge(1, 4096).ok).toBe(true);
+    expect(bad.charge(1, 4096).ok).toBe(true); // mutant: over-admits
+
+    const good = new RelayCreditLedger(8, 1 << 24, { frames: 2, bytes: 1 << 23 });
+    good.allocate(1, { frames: 2, bytes: 1 << 23 });
+    expect(good.charge(1, 4096).ok).toBe(true);
+    expect(good.charge(1, 4096).ok).toBe(true);
+    expect(good.charge(1, 4096).code).toBe(RELAY_P3_ERROR.BUSY);
+  } finally {
+    rmSync(mutatedPath, { force: true });
+  }
+});
