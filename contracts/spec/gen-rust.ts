@@ -50,6 +50,7 @@ import {
   NET_METHODS,
   NET_OP,
 } from "./net.ts";
+import { relayConstantsSnapshot } from "./relay.ts";
 import {
   ANALOG_CENTER,
   ANIMATABLE,
@@ -583,6 +584,61 @@ export function generateRust(): string {
   for (const [name, v] of Object.entries(NET_ERROR)) {
     put(`    pub const ERROR_${screaming(name)}: &str = ${JSON.stringify(v)};`);
   }
+  put("}");
+  put("");
+
+  // --- relay (contracts/spec/relay.ts) ---------------------------------------
+  // R5 Relay L1 framing constants. The C and Rust frame layers consume the
+  // same values; tests/contract.ts guards this block against
+  // tests/fixtures/relay/constants.json generated from relay.ts.
+  const relay = relayConstantsSnapshot();
+  put("pub mod relay {");
+  put(`    pub const VERSION: u8 = ${relay.version};`);
+  put(`    pub const MAGIC: [u8; 4] = [${relay.magic.join(", ")}];`);
+  put(`    pub const MAGIC_TEXT: &str = ${JSON.stringify(relay.magicText)};`);
+  put("");
+  put("    pub mod frame {");
+  for (const [k, v] of Object.entries(relay.frame)) {
+    put(`        pub const ${screaming(k)}: u32 = ${v};`);
+  }
+  put("    }");
+  put("    pub mod header {");
+  for (const [field, loc] of Object.entries(relay.header)) {
+    const o = loc as { offset: number; width: number };
+    put(`        /// ${field}: offset ${o.offset}, width ${o.width}`);
+    put(`        pub const ${screaming(field)}_OFFSET: usize = ${o.offset};`);
+    put(`        pub const ${screaming(field)}_WIDTH: usize = ${o.width};`);
+  }
+  put("    }");
+  // Enum objects already use UPPER_SNAKE keys (emit verbatim); bounds
+  // objects use camelCase keys (convert via screaming).
+  const enumModule = (name: string, obj: Record<string, unknown>, ty: string) => {
+    put(`    pub mod ${name} {`);
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === "number") put(`        pub const ${k}: ${ty} = ${v};`);
+      else put(`        pub const ${k}: &str = ${JSON.stringify(v)};`);
+    }
+    put("    }");
+  };
+  const boundsModule = (name: string, obj: Record<string, unknown>) => {
+    put(`    pub mod ${name} {`);
+    for (const [k, v] of Object.entries(obj)) {
+      put(`        pub const ${screaming(k)}: u32 = ${v};`);
+    }
+    put("    }");
+  };
+  enumModule("type_", relay.types as Record<string, unknown>, "u8");
+  enumModule("frame_error", relay.frameErrors as Record<string, unknown>, "&str");
+  enumModule("error", relay.errors as Record<string, unknown>, "&str");
+  enumModule("status", relay.status as Record<string, unknown>, "&str");
+  enumModule("effect", relay.effect as Record<string, unknown>, "&str");
+  enumModule("op", relay.ops as Record<string, unknown>, "&str");
+  enumModule("codec", relay.codecs as Record<string, unknown>, "u16");
+  enumModule("kind", relay.kinds as Record<string, unknown>, "u8");
+  boundsModule("resource", relay.resource as Record<string, unknown>);
+  boundsModule("handshake", relay.handshake as Record<string, unknown>);
+  boundsModule("limits", relay.limits as Record<string, unknown>);
+  put(`    pub const OP_PATTERN: &str = ${JSON.stringify(relay.opPattern)};`);
   put("}");
 
   return L.join("\n") + "\n";
