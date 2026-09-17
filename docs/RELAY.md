@@ -217,6 +217,16 @@ PUSH frames go to `onCredit`/`onReset` hooks, and OPEN authorization is an
 reassembled by `RelayRecordDecoder` before they reach the machine, and a
 record over the advertised bound destroys the connection without allocating.
 
+**`RelayByteChannel.send` is an admission decision: it returns `false` only
+when the frame was not taken.** A node `socket.write()` that returns `false`
+has already queued the bytes and will still flush them, so
+`relaySocketChannel` checks `writableLength + frameSize` against
+`writableHighWaterMark` before writing (`socketCanAdmit`) and returns
+`busy` without writing; a frame on an empty queue that alone reaches the
+mark is still written, after which sends are busy until the queue drains.
+Reporting a queued frame as busy would make the session roll its seq back
+and reuse it on the retry, putting a duplicate seq on the wire.
+
 ## Tests and vectors
 
 The cross-language vectors are generated, not hand-edited:

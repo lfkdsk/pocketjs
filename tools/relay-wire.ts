@@ -43,12 +43,15 @@ export type {
 } from "../framework/src/relay/session.ts";
 export type { RelayDecodedFrame } from "../framework/src/relay/frame.ts";
 
-/** An authenticated ordered byte channel. `send` applies backpressure by
- * returning false (the session retries later); it throws/returns-false on
- * a dead channel. The adapter keeps the underlying socket. */
+/** An authenticated ordered byte channel. `send` is an admission decision:
+ * it returns false only when the frame was not taken, so the session may
+ * keep its seq and retry later. Returning false after the bytes already
+ * entered an underlying queue is wrong — the frame would be delivered and a
+ * retry would reuse the seq. A dead channel returns false (or throws). The
+ * adapter keeps the underlying socket. */
 export interface RelayByteChannel {
   /** Write one whole reassembled record. Returns false when the transport
-   * has no queue room right now ("busy"). */
+   * has no queue room right now ("busy") and the frame was not written. */
   send(bytes: Uint8Array): boolean;
   readonly peer: RelayPeerContext;
   onData(callback: (chunk: Uint8Array) => void): void;
@@ -165,6 +168,24 @@ export function attachRelayChannel(session: RelaySession, channel: RelayByteChan
 
 // --- node:net channel and listener ------------------------------------------
 
+/** Admission check for one frame on a node writable stream.
+ *
+ * `socket.write()` returning false is backpressure *after* the bytes have
+ * entered the stream's queue: the frame will still be flushed, so it cannot
+ * be reported as "not admitted" (the session rolls the seq back on busy and
+ * a retry puts the same seq on the wire twice). A frame is admitted only
+ * when the existing queue plus the frame stays under the high-water mark;
+ * with a non-empty queue at the cap the frame is refused before it is
+ * written. A frame that alone reaches the mark on an empty queue is still
+ * written (the queue drains and later sends return busy until it does). */
+export function socketCanAdmit(
+  socket: Pick<Socket, "writableLength" | "writableHighWaterMark">,
+  bytes: Uint8Array,
+): boolean {
+  const buffered = socket.writableLength;
+  return buffered === 0 || buffered + bytes.length < socket.writableHighWaterMark;
+}
+
 /** Adapt a connected (and authenticated) TCP socket to RelayByteChannel. */
 export function relaySocketChannel(socket: Socket, peer: RelayPeerContext): RelayByteChannel {
   let closed = socket.destroyed;
@@ -174,7 +195,12 @@ export function relaySocketChannel(socket: Socket, peer: RelayPeerContext): Rela
     get closed() { return closed; },
     send(bytes) {
       if (closed || socket.destroyed || !socket.writable) return false;
-      return socket.write(bytes);
+      if (!socketCanAdmit(socket, bytes)) return false;
+      // The frame is inside the stream's ordered queue now and will be
+      // flushed; never relay write()'s post-queue false, which falsely
+      // claims the frame was not admitted.
+      socket.write(bytes);
+      return true;
     },
     onData(callback) {
       socket.on("data", (chunk: Buffer) => callback(chunk));

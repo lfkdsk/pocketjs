@@ -4,6 +4,7 @@ import {
   attachRelayProvider,
   relaySocketChannel,
   serveRelayTcp,
+  socketCanAdmit,
 } from "../tools/relay-wire.ts";
 import {
   createRelaySession,
@@ -11,7 +12,6 @@ import {
 } from "../framework/src/relay/session.ts";
 import { RelayRecordDecoder } from "../framework/src/relay/frame.ts";
 import { RELAY_LIMITS, type RelayProtocolVersion, type RelayRxLimits } from "../contracts/spec/relay.ts";
-
 const RX: RelayRxLimits = {
   maxWireBytes: 4096, maxMetaBytes: 2048, windowFrames: 8, windowBytes: 32768,
   maxPending: 8, maxObjectBytes: 131072, maxAssemblies: 2, maxScratchBytes: 262144,
@@ -41,9 +41,10 @@ test("relay-wire: a provider over TCP completes the six-step handshake and an OP
     socket.once("error", reject);
   });
 
+  const guestChannel = relaySocketChannel(socket, { id: "companion", grants: ["pocket-map"] });
   const guestAdapter: RelayTransportAdapter = {
-    peer: { id: "companion", grants: ["pocket-map"] },
-    trySend: (bytes) => (socket.write(bytes) ? "accepted" : "busy"),
+    peer: guestChannel.peer,
+    trySend: (bytes) => (guestChannel.send(bytes) ? "accepted" : "busy"),
   };
   const guest = createRelaySession({
     role: "guest",
@@ -137,9 +138,10 @@ test("relay-wire: a PING sent over the real socket is answered", async () => {
   // Large ping interval so the machine does not ping first; drive one ping
   // manually through a tiny wrapper clock is unnecessary — use the public
   // stats: after READY, schedule a ping via a near-zero interval instead.
+  const guestChannel = relaySocketChannel(socket, { id: "companion", grants: ["pocket-map"] });
   const guestAdapter: RelayTransportAdapter = {
-    peer: { id: "companion", grants: ["pocket-map"] },
-    trySend: (bytes) => (socket.write(bytes) ? "accepted" : "busy"),
+    peer: guestChannel.peer,
+    trySend: (bytes) => (guestChannel.send(bytes) ? "accepted" : "busy"),
   };
   const guest = createRelaySession({
     role: "guest",
@@ -169,4 +171,88 @@ test("relay-wire: a PING sent over the real socket is answered", async () => {
   socket.destroy();
   await server.close();
   expect(guest.getStats().pingsReceived).toBeGreaterThan(0);
+});
+
+// --- Review 937 B-3: send() is an admission decision, not write()'s hint -----
+
+/** Minimal Socket stand-in recording writes and exposing a controllable
+ *  queue, so the admission boundary is deterministic (no kernel buffer). */
+function fakeSocket(highWaterMark: number, queued: { bytes: number }) {
+  const writes: number[] = [];
+  const socket = {
+    destroyed: false,
+    writable: true,
+    get writableLength() { return queued.bytes; },
+    writableHighWaterMark: highWaterMark,
+    setNoDelay() {},
+    write(bytes: Uint8Array) { writes.push(bytes.length); queued.bytes += bytes.length; return queued.bytes < highWaterMark; },
+    on() { return socket; },
+    once() { return socket; },
+    destroy() { socket.destroyed = true; },
+    writes,
+  };
+  return socket as unknown as Socket & { writes: number[] };
+}
+
+test("B-3 channel: a busy frame is refused before socket.write and admitted again after drain", () => {
+  const queued = { bytes: 0 };
+  const socket = fakeSocket(128 * 1024, queued);
+  const channel = relaySocketChannel(socket, { id: "p", grants: [] });
+  const chunk = new Uint8Array(64 * 1024);
+
+  // First 64 KiB: empty queue, admitted even though it alone reaches half
+  // the mark; it is written exactly once, in order.
+  expect(channel.send(chunk)).toBe(true);
+  expect(socket.writes).toEqual([chunk.length]);
+
+  // Second 64 KiB would meet/exceed the mark with a non-empty queue: busy
+  // must mean "not taken" — write() is not called a second time.
+  expect(channel.send(chunk)).toBe(false);
+  expect(socket.writes).toEqual([chunk.length]);
+
+  // Once the queue drains, the same frame is admitted and written.
+  queued.bytes = 0;
+  expect(channel.send(chunk)).toBe(true);
+  expect(socket.writes).toEqual([chunk.length, chunk.length]);
+});
+
+test("B-3 socketCanAdmit: admission is queued==0 or queued+frame strictly below the mark", () => {
+  const s = (writableLength: number, writableHighWaterMark: number) =>
+    ({ writableLength, writableHighWaterMark }) as Pick<Socket, "writableLength" | "writableHighWaterMark">;
+  const frame = new Uint8Array(4096);
+  expect(socketCanAdmit(s(0, 16384), frame)).toBe(true);
+  expect(socketCanAdmit(s(8192, 16384), frame)).toBe(true);   // 12288 < 16384
+  expect(socketCanAdmit(s(12288, 16384), frame)).toBe(false); // 16384 == mark
+  expect(socketCanAdmit(s(16000, 16384), frame)).toBe(false); // over mark
+});
+
+test("B-3 loopback: the frame whose send() returns busy is never delivered to the peer", async () => {
+  // Real node:net, peer paused (Review 937 busy-896 invariant). If "busy"
+  // meant not-admitted, the peer can never receive the busy frame.
+  let serverSocket: Socket | undefined;
+  const server = createServer((s) => { serverSocket = s; s.pause(); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const port = (server.address() as { port: number }).port;
+  const client = await new Promise<Socket>((r) => {
+    const c = connect(port, "127.0.0.1", () => r(c));
+  });
+  const channel = relaySocketChannel(client, { id: "peer", grants: [] });
+
+  let total = 0;
+  let busyAt = -1;
+  const CHUNK = 64 * 1024;
+  for (let i = 0; i < 400 && busyAt < 0; i++) {
+    const frame = new Uint8Array(CHUNK).fill(i & 0xff);
+    if (!channel.send(frame)) busyAt = i;
+  }
+  expect(busyAt).toBeGreaterThanOrEqual(0);
+
+  await new Promise<void>((done) => {
+    serverSocket!.on("data", (c: Buffer) => { total += c.length; });
+    serverSocket!.resume();
+    setTimeout(done, 1500);
+  });
+  channel.destroy(); client.destroy(); await new Promise<void>((r) => server.close(() => r()));
+  console.log(`first busy at frame #${busyAt}; bytes delivered = ${total}; admitted cap = ${busyAt * CHUNK}`);
+  expect(total).toBeLessThanOrEqual(busyAt * CHUNK);
 });
