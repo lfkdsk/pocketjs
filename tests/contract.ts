@@ -14,6 +14,7 @@
 import { generateC } from "../contracts/spec/gen-c.ts";
 import { generateRust } from "../contracts/spec/gen-rust.ts";
 import { withGeneratedExports } from "../tools/gen-exports.ts";
+import { relayConstantsSnapshot } from "../contracts/spec/relay.ts";
 import {
   abgr,
   animBit,
@@ -59,6 +60,23 @@ check(
   "contracts/generated/pocket_spec.h matches spec.ts",
   "run `bun contracts/spec/gen-c.ts` and commit the result",
 );
+
+// ---- (e) relay constants: spec.ts, constants.json and generated spec.rs -----
+//
+// The TS/C/Rust frame layers share one byte-level vector set. The committed
+// tests/fixtures/relay/constants.json is the snapshot C and Rust compare
+// against; regenerate it together with the vectors via
+// `bun tests/fixtures/relay/generate.ts`.
+
+const relayJsonPath = new URL("../tests/fixtures/relay/constants.json", import.meta.url).pathname;
+const relayJsonText = await Bun.file(relayJsonPath).text().catch(() => null);
+check(
+  relayJsonText !== null && relayJsonText === JSON.stringify(relayConstantsSnapshot(), null, 2) + "\n",
+  "tests/fixtures/relay/constants.json matches contracts/spec/relay.ts",
+  "run `bun tests/fixtures/relay/generate.ts` and commit the result",
+);
+// The relay constants are also emitted into engine/core/src/spec.rs by
+// gen-rust.ts; the whole generated file is already byte-guarded by check (a).
 
 // ---- (c) package.json exports match the subpath registry ---------------------
 
