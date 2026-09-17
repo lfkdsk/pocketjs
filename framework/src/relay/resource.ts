@@ -558,30 +558,42 @@ export class RelayResourceClient {
     data: Uint8Array, digest: string | undefined, value: unknown, baseRevision: string | undefined) {
     const revision = ref.revision;
     if (!revision) { this.failSubscription(sub.id, { code: RELAY_ERROR.INVALID }); return; }
-    let resyncRequired = sub.resyncRequired;
+    const object: RelayPublishedObject = { ref, codec, data, value, digest };
 
     if (sub.delivery === RELAY_DELIVERY.RELIABLE_DELTA) {
-      // A delta applies only when its base is exactly the revision we hold.
-      // After an invalidate the fence is empty; the first delta then needs a
-      // full snapshot instead of guessing the base (§3.7 STALE_BASE).
-      if (baseRevision !== undefined && (sub.revision === undefined || baseRevision !== sub.revision)) {
-        sub.resyncRequired = true;
-        resyncRequired = true;
-      }
-      if (resyncRequired) {
-        sub.handler.onObject({ ref, codec, data, value, digest }, { resyncRequired: true });
+      if (baseRevision !== undefined) {
+        // A delta applies only when its base is exactly the held revision.
+        // A mismatch never moves the base: the object is delivered marked for
+        // resync and recovery waits for a full snapshot (§3.7, no guessed base).
+        if (sub.resyncRequired || sub.revision === undefined || baseRevision !== sub.revision) {
+          sub.resyncRequired = true;
+          sub.handler.onObject(object, { resyncRequired: true });
+          return;
+        }
+        sub.revision = revision;
+        if (ref.revision) this.storeEntry(ref);
+        sub.handler.onObject(object, { resyncRequired: false });
         return;
       }
-    } else {
-      // latest-snapshot: re-delivering the held revision is idempotent; seq
-      // order already guarantees newer revisions arrive later.
-      if (sub.revision !== undefined && revision === sub.revision) return;
+      // Full snapshot: the §3.7 recovery. It re-establishes the base on any
+      // revision and clears the flag, so the next matching delta applies. The
+      // object at the resync boundary is delivered marked resyncRequired: the
+      // consumer replaces state with the snapshot instead of applying a delta.
+      const marked = sub.resyncRequired;
+      sub.revision = revision;
+      sub.resyncRequired = false;
+      if (ref.revision) this.storeEntry(ref);
+      sub.handler.onObject(object, { resyncRequired: marked });
+      return;
     }
 
+    // latest-snapshot: re-delivering the held revision is idempotent; seq
+    // order already guarantees newer revisions arrive later.
+    if (sub.revision !== undefined && revision === sub.revision) return;
     sub.revision = revision;
     sub.resyncRequired = false;
     if (ref.revision) this.storeEntry(ref);
-    sub.handler.onObject({ ref, codec, data, value, digest }, { resyncRequired });
+    sub.handler.onObject(object, { resyncRequired: false });
   }
 
   private failSubscription(id: number, error: RelayResourceError): void {

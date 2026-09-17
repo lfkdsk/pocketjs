@@ -700,6 +700,67 @@ test("invalidate after subscribe forces resync on the next delta", () => {
   expect(marks).toEqual([true]);
 });
 
+test("F2: a full snapshot re-bases a resyncing reliable-delta subscription", () => {
+  const { wire, client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  const marks: { revision?: string; resync: boolean }[] = [];
+  client.subscribe(1, tileRef("r1"), RELAY_DELIVERY.RELIABLE_DELTA, {
+    onObject: (o, ctx) => marks.push({ revision: o.ref.revision, resync: ctx.resyncRequired }),
+  }, () => {});
+  feed(client, auth.answerSubscribe({ stream: 1, correlation: wire.lastRequest().correlation, metadata: wire.lastRequest().metadata }));
+  const subscription = 1; // the authority's first subscription id
+
+  // The key is invalidated: the client drops its base and wants a resync.
+  client.applyInvalidate({
+    op: RELAY_OP.RESOURCE_INVALIDATE, resource: tileRef("r1"),
+    args: { scope: RELAY_INVALIDATE_SCOPE.KEY },
+  });
+
+  // §3.7 recovery: a full snapshot carries no baseRevision.
+  for (const f of auth.chunkObject({
+    type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription,
+    ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64),
+  })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  expect(client.subscription(subscription)?.revision).toBe("r2");
+  expect(client.subscription(subscription)?.resyncRequired).toBe(false);
+
+  // A delta on the snapshot base applies cleanly.
+  for (const f of auth.chunkObject({
+    type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription,
+    ref: tileRef("r3"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64), baseRevision: "r2",
+  })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+
+  // The boundary snapshot is delivered marked; later objects are clean.
+  expect(marks).toEqual([
+    { revision: "r2", resync: true },
+    { revision: "r3", resync: false },
+  ]);
+});
+
+test("F2: a delta alone never clears the resync flag; recovery needs the snapshot", () => {
+  const { wire, client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  const marks: boolean[] = [];
+  client.subscribe(1, tileRef("r1"), RELAY_DELIVERY.RELIABLE_DELTA, {
+    onObject: (_o, ctx) => marks.push(ctx.resyncRequired),
+  }, () => {});
+  feed(client, auth.answerSubscribe({ stream: 1, correlation: wire.lastRequest().correlation, metadata: wire.lastRequest().metadata }));
+  client.applyInvalidate({
+    op: RELAY_OP.RESOURCE_INVALIDATE, resource: tileRef("r1"),
+    args: { scope: RELAY_INVALIDATE_SCOPE.KEY },
+  });
+  // Two deltas while resyncing: both stay marked and the base never advances.
+  for (const revision of ["r2", "r3"]) {
+    for (const f of auth.chunkObject({
+      type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: 1,
+      ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64), baseRevision: "r1",
+    })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  }
+  expect(marks).toEqual([true, true]);
+  expect(client.subscription(1)?.revision).toBeUndefined();
+  expect(client.subscription(1)?.resyncRequired).toBe(true);
+});
+
 // ---------------------------------------------------------------------------
 // release (remote lease) and evict (local, no ACK — Q5)
 // ---------------------------------------------------------------------------
