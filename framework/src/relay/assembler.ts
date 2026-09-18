@@ -14,7 +14,11 @@
  * The frame layer already guarantees contiguous, deduplicated seq delivery
  * per stream. One channel (a get correlation, or a subscription id) carries
  * at most one assembly at a time; the transfer id therefore identifies the
- * object within a channel and must not repeat (§3.7 "transfer ID 不复用"). */
+ * object within a channel and must not repeat (§3.7 "transfer ID 不复用").
+ * The authority allocates transfer ids from one monotonic session counter
+ * and frames of one channel arrive in send order, so the bounded check is
+ * "greater than the previous object's id on this channel": a reuse is never
+ * greater and is rejected with O(1) state (review 1070 M3). */
 
 import {
   RELAY_ERROR,
@@ -91,8 +95,9 @@ interface Assembly {
   total: number;
   buffer: Uint8Array | null;
   have: number;
-  /** Transfer id of the previous completed object on this channel; never
-   * reused. */
+  /** Transfer id of the previous completed object on this channel; the next
+   * object's id must be greater (ids are allocated monotonically and never
+   * reused). */
   lastTransferId: number;
 }
 
@@ -184,7 +189,7 @@ export class RelayChunkAssembler {
     if (!asm.committed) {
       // First chunk commits the real total against the reservation.
       if (offsetN !== 0) return this.reject(key, RELAY_ERROR.INVALID);
-      if (input.transfer.id === asm.lastTransferId) return this.reject(key, RELAY_ERROR.INVALID);
+      if (input.transfer.id <= asm.lastTransferId) return this.reject(key, RELAY_ERROR.INVALID);
       if (totalN > asm.reserved) return this.reject(key, RELAY_ERROR.TOO_LARGE);
       asm.committed = true;
       asm.transferId = input.transfer.id;

@@ -963,6 +963,38 @@ test("M1: two refs whose fields contain the old delimiter are two identities in 
 });
 
 // ---------------------------------------------------------------------------
+// Review 1070 M3: transfer ids increase on a channel; a non-adjacent reuse rejects
+// ---------------------------------------------------------------------------
+
+test("M3: on one push channel the transfer ids 1, 2, 1 reject the third object; a lower id after a higher one rejects too", () => {
+  // Review 1070's NONADJACENT_TRANSFER_REUSE probe: only the immediately
+  // previous id was remembered, so 1, 2, 1 completed three objects.
+  const a = new RelayChunkAssembler({ maxAssemblies: 1, maxScratchBytes: 64 });
+  expect(a.reserve({ stream: 1, channel: 7, space: "push" }, 64)).toEqual({ ok: true });
+  const ref: RelayResourceRef = { kind: RELAY_KIND.TILE, ns: "n", key: "k", revision: "r", rendition: "x" };
+  const push = (id: number) => a.push({
+    stream: 1, channel: 7, space: "push", codec: RELAY_CODEC.OPAQUE_BYTES, resource: ref,
+    final: true, transfer: { id, offset: hex16(0), total: hex16(8) }, data: zeros(8),
+  });
+  expect(push(1)).toMatchObject({ ok: true, complete: true });
+  expect(push(2)).toMatchObject({ ok: true, complete: true });
+  expect(push(1)).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+  // The rejection dropped the channel's reservation, as every INVALID does.
+  expect(a.stats()).toMatchObject({ assemblies: 0, published: 2, failed: 1 });
+
+  // Ids are allocated monotonically, so a lower id after a higher one is a
+  // reuse of an already-passed id and rejects as well; a higher id proceeds.
+  expect(a.reserve({ stream: 1, channel: 8, space: "push" }, 64)).toEqual({ ok: true });
+  const push8 = (id: number) => a.push({
+    stream: 1, channel: 8, space: "push", codec: RELAY_CODEC.OPAQUE_BYTES, resource: ref,
+    final: true, transfer: { id, offset: hex16(0), total: hex16(8) }, data: zeros(8),
+  });
+  expect(push8(5)).toMatchObject({ ok: true, complete: true });
+  expect(push8(9)).toMatchObject({ ok: true, complete: true });
+  expect(push8(7)).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+});
+
+// ---------------------------------------------------------------------------
 // Review 1070 M2: generation markers are bounded by entries + pending gets
 // ---------------------------------------------------------------------------
 
