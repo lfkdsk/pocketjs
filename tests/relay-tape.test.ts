@@ -635,3 +635,85 @@ test("benchmark: record + serialize 10,000 frames", async () => {
   expect(parseFrameTape(text).frames).toHaveLength(10_000);
   expect(ms).toBeLessThan(5000);
 });
+
+// --- review 1070 N3: verify and replay share the identity and order rules ----
+
+test("N3: a forged document session fails replay at index 0, as it fails verification", async () => {
+  // Review 1070's TAPE_INTEGRITY_GAPS probe: the forged tape failed
+  // verifyFrameTape but replayed OK, because replay never compared the
+  // document session with the header.
+  const ping = await loadBin("ping");
+  const rec = new RelayFrameRecorder({ session: 0x0102030405060708n });
+  rec.noteOut(ping);
+  const forged = { ...rec.toTape(), session: "00000000000000ff" };
+  expect(verifyFrameTape(forged).ok).toBe(false);
+  const replay = createRelayFrameReplay(forged);
+  replay.send(ping);
+  const v = replay.result();
+  expect(v.ok).toBe(false);
+  expect(v.divergence!.code).toBe("record");
+  expect(v.divergence!.index).toBe(0);
+  expect(v.divergence!.detail).toMatch(/does not match tape session/);
+});
+
+test("N3: a tuple seq that disagrees with the header seq is a record divergence for both verify and replay", async () => {
+  const ping = await loadBin("ping"); // header seq 3
+  const rec = new RelayFrameRecorder({ session: 0x0102030405060708n });
+  rec.noteOut(ping);
+  const lie = JSON.parse(stringifyFrameTape(rec.toTape())) as MutableTape;
+  lie.frames[0][1] = 999;
+  const tape = parseFrameTape(JSON.stringify(lie));
+  const v = verifyFrameTape(tape);
+  expect(v.ok).toBe(false);
+  expect(v.divergence).toMatchObject({ index: 0, seq: 999, code: "record" });
+  expect(v.divergence!.detail).toMatch(/tuple seq 999 does not match header seq 3/);
+  const replay = createRelayFrameReplay(tape);
+  replay.send(ping);
+  expect(replay.result().divergence).toMatchObject({ index: 0, seq: 999, code: "record" });
+});
+
+test("N3: an empty tape is not a verdict: verify reports empty and replay refuses to build", () => {
+  const empty = parseFrameTape(JSON.stringify({ kind: "relay-frame", v: 1, session: "0102030405060708", frames: [] }));
+  const v = verifyFrameTape(empty);
+  expect(v.ok).toBe(false);
+  expect(v.frames).toBe(0);
+  expect(v.divergence!.code).toBe("empty");
+  expect(() => createRelayFrameReplay(empty)).toThrow(/no frames/);
+});
+
+test("N3: within one (direction, stream) seq must increase in capture order; other streams and directions are independent", async () => {
+  const ready = await loadBin("ready"); // out, stream 0, seq 1
+  const ping = await loadBin("ping");   // out, stream 0, seq 3
+  const get = await loadBin("get");     // out, stream 1, seq 1
+  const credit = await loadBin("credit"); // in, stream 0, seq 4
+  const session = 0x0102030405060708n;
+
+  // Increasing (1, 3) on out/stream 0 is accepted: a tape wrapped after
+  // READY starts above 1 and gaps between recorded frames of one lane are
+  // not required to be contiguous. Stream 1 and the inbound lane keep their
+  // own cursors.
+  const ok = new RelayFrameRecorder({ session });
+  ok.noteOut(ready); ok.noteOut(get); ok.noteOut(ping); ok.noteIn(credit);
+  expect(verifyFrameTape(ok.toTape()).ok).toBe(true);
+  const replayOk = createRelayFrameReplay(ok.toTape());
+  replayOk.send(ready); replayOk.send(get); replayOk.send(ping);
+  expect(Buffer.compare(Buffer.from(replayOk.recv()!), Buffer.from(credit))).toBe(0);
+  expect(replayOk.result().ok).toBe(true);
+
+  // The same frames with ping before ready: seq 3 then 1 on out/stream 0.
+  const swapped = JSON.parse(stringifyFrameTape(ok.toTape())) as MutableTape;
+  [swapped.frames[0], swapped.frames[2]] = [swapped.frames[2], swapped.frames[0]];
+  const tape = parseFrameTape(JSON.stringify(swapped));
+  const v = verifyFrameTape(tape);
+  expect(v.ok).toBe(false);
+  expect(v.divergence).toMatchObject({ index: 2, seq: 1, code: "order" });
+  expect(v.divergence!.detail).toMatch(/out stream 0 seq 1 after seq 3/);
+  const replay = createRelayFrameReplay(tape);
+  replay.send(ping); replay.send(get); replay.send(ready);
+  expect(replay.result().divergence).toMatchObject({ index: 2, seq: 1, code: "order" });
+
+  // A repeated seq on one lane is an order divergence as well.
+  const twice = new RelayFrameRecorder({ session });
+  twice.noteOut(ping); twice.noteOut(ping);
+  expect(verifyFrameTape(twice.toTape()).divergence).toMatchObject({ index: 1, code: "order" });
+});
