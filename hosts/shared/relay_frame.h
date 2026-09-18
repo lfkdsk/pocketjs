@@ -6,8 +6,9 @@
  * compares these macros against tests/fixtures/relay/constants.json and feeds
  * the shared byte vectors through relay_frame_decode.
  *
- * Scope: header fields, the length identity, negotiated limits, and a UTF-8
- * check over the metadata region. This layer does not parse JSON. Metadata
+ * Scope: header fields, the length identity, negotiated limits, the CANCEL
+ * stream rule (§3.6: header stream 0), and a UTF-8 check over the metadata
+ * region. This layer does not parse JSON. Metadata
  * bytes reach the caller as a view into the caller's record, so JSON
  * structure and semantics (root object, duplicate keys, number grammar,
  * surrogate escapes) and the §3.6 envelope rules (op/status/final,
