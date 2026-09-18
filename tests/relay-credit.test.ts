@@ -9,7 +9,13 @@ import {
   RELAY_OP,
   RELAY_TYPE,
 } from "../contracts/spec/relay.ts";
-import { decodeFrame, encodePreparedFrame, prepareFrameBody, type RelayDecodedFrame } from "../framework/src/relay/frame.ts";
+import {
+  RELAY_FRAME_ERROR,
+  decodeFrame,
+  encodePreparedFrame,
+  prepareFrameBody,
+  type RelayDecodedFrame,
+} from "../framework/src/relay/frame.ts";
 import {
   RELAY_P3_ERROR,
   RELAY_PRIORITY,
@@ -1287,4 +1293,26 @@ test("beginSession (§3.9 credit row, a session change voids everything): lane s
   expect(fresh.frame.session).toBe(NEXT);
   expect(fresh.frame.seq).toBe(1);
   expect(b.receiver.ingest(fresh.frame, fresh.bytes.length).ok).toBe(true);
+});
+
+test("sender (§3.9 control wire): a normal frame of exactly 4096 wire bytes admits; one byte more is refused at admission and nothing is queued", () => {
+  const cap = RELAY_LIMITS.controlMaxWireBytes;
+  expect(cap).toBe(4096);
+  const ep = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 2 * cap } }]);
+  // A resource.get whose key is padded so the wire record (4-byte length
+  // prefix + 44-byte header + metadata) is exactly `wireBytes` long.
+  const getOf = (wireBytes: number) => {
+    const meta = (key: string) => ({ op: "resource.get", resource: { kind: 1, ns: "ns", key, rendition: "r" } });
+    const probe = prepareFrameBody({ type: RELAY_TYPE.REQUEST, stream: 1, metadata: meta("k") }, { maxWireBytes: 65536 });
+    if (!probe.ok) throw new Error(probe.code);
+    return meta("k".repeat(1 + wireBytes - probe.body.wireBytes));
+  };
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 1, metadata: getOf(cap) }).ok).toBe(true);
+  const over = ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 2, metadata: getOf(cap + 1) });
+  expect(over.ok).toBe(false);
+  expect(over.code).toBe(RELAY_FRAME_ERROR.WIRE_TOO_LARGE);
+  expect(ep.sender.queuedFrames(1)).toBe(1);
+  const [only] = pumpDecoded(ep);
+  expect(only.bytes.length).toBe(cap);
+  expect(only.frame.seq).toBe(1);
 });
