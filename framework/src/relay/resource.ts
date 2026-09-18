@@ -22,7 +22,9 @@ import {
   RELAY_DELIVERY,
   RELAY_ERROR,
   RELAY_EVICT_REASON,
+  RELAY_FRAME,
   RELAY_INVALIDATE_SCOPE,
+  RELAY_LIMITS,
   RELAY_OP,
   RELAY_STATUS,
   RELAY_TYPE,
@@ -781,19 +783,45 @@ export interface RelayResourceEnvelope {
   correlation: number;
   metadata: Record<string, unknown>;
   data?: Uint8Array;
+  /** Data codec of a data-bearing envelope; absent or NONE without data. */
+  codec?: number;
 }
+
+/** What chunkObject produced: the frames of one object, or the negotiated
+ * limit the object's metadata cannot fit under. */
+export type RelayChunkPlan =
+  | { ok: true; frames: RelayResourceEnvelope[] }
+  | {
+      ok: false;
+      code: typeof RELAY_ERROR.TOO_LARGE;
+      /** The per-chunk metadata size the chunker computed. */
+      metaBytes: number;
+      /** Which negotiated ceiling refused it. */
+      limit: "maxMetaBytes" | "maxWireBytes";
+      message: string;
+    };
 
 /** Provider-side resource registry and chunker. It validates and answers
  * resource REQUESTs and builds PUSH/INVALIDATE frames; the L1 provider pump
- * owns transmission, seq and credit. */
+ * owns transmission, seq and credit. `maxWireBytes`/`maxMetaBytes` are the
+ * negotiated receiver limits of the attachment the frames will ride. */
 export class RelayResourceAuthority {
   private readonly subscriptionIds = new RelayIdAllocator();
   private readonly leaseIds = new RelayIdAllocator();
   private readonly transferIds = new RelayIdAllocator();
   private readonly subscriptions = new Map<number, RelayAuthoritySubscription>();
   private readonly leases = new Set<number>();
+  private readonly maxWireBytes: number;
+  private readonly maxMetaBytes: number;
 
-  constructor(private readonly opts: { maxWireBytes: number } = { maxWireBytes: 65536 }) {}
+  constructor(opts: { maxWireBytes?: number; maxMetaBytes?: number } = {}) {
+    this.maxWireBytes = opts.maxWireBytes ?? RELAY_LIMITS.defaultMaxWireBytes;
+    this.maxMetaBytes = opts.maxMetaBytes ?? RELAY_LIMITS.defaultMaxMetaBytes;
+    if (!Number.isSafeInteger(this.maxWireBytes) || this.maxWireBytes < RELAY_FRAME.headerBytes
+      || !Number.isSafeInteger(this.maxMetaBytes) || this.maxMetaBytes < 0) {
+      throw new Error("Invalid relay authority limits");
+    }
+  }
 
   answerSubscribe(frame: { stream: number; correlation: number; metadata: Record<string, unknown> }):
     RelayResourceEnvelope {
@@ -875,7 +903,14 @@ export class RelayResourceAuthority {
 
   /** Chunk one complete object into data-bearing frames. Every chunk repeats
    * resource/transfer/total/digest; offsets run contiguously from 0; the
-   * transfer id is freshly allocated and never reused. */
+   * transfer id is freshly allocated and never reused.
+   *
+   * Each chunk is sized against both negotiated receiver limits: its
+   * metadata must fit `maxMetaBytes` and header + metadata + data must fit
+   * `maxWireBytes`. The metadata size does not depend on the chunk (offsets
+   * and totals are fixed-width hex), so a metadata object over the ceiling
+   * cannot be helped by smaller chunks: the plan is refused as TOO_LARGE and
+   * the authority answers the request with that error (review 1070 B2). */
   chunkObject(input: {
     type: typeof RELAY_TYPE.RESPONSE | typeof RELAY_TYPE.PUSH;
     stream: number;
@@ -887,11 +922,11 @@ export class RelayResourceAuthority {
     value?: Record<string, unknown>;
     /** Reliable-delta base; top-level metadata, never inside value (§3.4). */
     baseRevision?: string;
-  }): RelayResourceEnvelope[] {
+  }): RelayChunkPlan {
     const transferId = this.transferIds.allocate();
     const total = input.data.length;
     const digest = `sha256:${sha256Hex(input.data)}`;
-    const metaFor = (offset: number, dataLen: number, final: boolean): Record<string, unknown> => {
+    const metaFor = (offset: number, final: boolean): Record<string, unknown> => {
       const meta: Record<string, unknown> = input.type === RELAY_TYPE.PUSH
         ? { op: "resource.push", resource: input.ref, subscription: input.subscription, final }
         : { op: RELAY_OP.RESOURCE_GET, resource: input.ref, status: RELAY_STATUS.OK, final };
@@ -901,37 +936,48 @@ export class RelayResourceAuthority {
       meta.digest = digest;
       return meta;
     };
-    const frames: RelayResourceEnvelope[] = [];
+    const metaBytes = (meta: Record<string, unknown>) => stringToUtf8(JSON.stringify(meta)).length;
+    // `final` is the only chunk-dependent field ("true" vs "false"); the two
+    // sizes bound every chunk's metadata.
+    const metaFinal = metaBytes(metaFor(0, true));
+    const metaMore = metaBytes(metaFor(0, false));
+    const header = RELAY_FRAME.headerBytes;
+    const refuse = (size: number, limit: "maxMetaBytes" | "maxWireBytes"): RelayChunkPlan => ({
+      ok: false, code: RELAY_ERROR.TOO_LARGE, metaBytes: size, limit,
+      message: limit === "maxMetaBytes"
+        ? `chunk metadata ${size} bytes exceeds maxMetaBytes ${this.maxMetaBytes}`
+        : `chunk metadata ${size} bytes leaves no data room under maxWireBytes ${this.maxWireBytes}`,
+    });
+    const envelope = (offset: number, dataLen: number, final: boolean): RelayResourceEnvelope => ({
+      type: input.type, stream: input.stream, correlation: input.correlation,
+      metadata: metaFor(offset, final),
+      data: input.data.subarray(offset, offset + dataLen),
+      codec: dataLen ? input.codec : RELAY_CODEC.NONE,
+    });
     if (total === 0) {
-      frames.push({
-        type: input.type, stream: input.stream, correlation: input.correlation,
-        metadata: metaFor(0, 0, true), data: new Uint8Array(0),
-      });
-      return frames;
+      if (metaFinal > this.maxMetaBytes) return refuse(metaFinal, "maxMetaBytes");
+      if (header + metaFinal > this.maxWireBytes) return refuse(metaFinal, "maxWireBytes");
+      return { ok: true, frames: [envelope(0, 0, true)] };
     }
+    const frames: RelayResourceEnvelope[] = [];
     let offset = 0;
     while (offset < total) {
-      // Size the data region from the metadata length at this offset (the
-      // hex offset width is fixed at 16, so all chunks share it).
       const remaining = total - offset;
-      let dataLen = remaining;
-      let final = false;
-      for (;;) {
-        final = offset + dataLen === total;
-        const metaLen = stringToUtf8(JSON.stringify(metaFor(offset, dataLen, final))).length;
-        const fits = 48 + metaLen + dataLen <= this.opts.maxWireBytes;
-        if (fits || dataLen === 0) break;
-        dataLen = Math.max(0, this.opts.maxWireBytes - 48 - metaLen);
+      if (header + metaFinal + remaining <= this.maxWireBytes) {
+        // The rest fits one final chunk.
+        if (metaFinal > this.maxMetaBytes) return refuse(metaFinal, "maxMetaBytes");
+        frames.push(envelope(offset, remaining, true));
+        offset = total;
+        continue;
       }
-      if (dataLen === 0) throw new Error("relay metadata alone exceeds maxWireBytes");
-      frames.push({
-        type: input.type, stream: input.stream, correlation: input.correlation,
-        metadata: metaFor(offset, dataLen, final),
-        data: input.data.subarray(offset, offset + dataLen),
-      });
+      // A non-final chunk takes every data byte the wire ceiling leaves.
+      if (metaMore > this.maxMetaBytes) return refuse(metaMore, "maxMetaBytes");
+      const dataLen = this.maxWireBytes - header - metaMore;
+      if (dataLen < 1) return refuse(metaMore, "maxWireBytes");
+      frames.push(envelope(offset, dataLen, false));
       offset += dataLen;
     }
-    return frames;
+    return { ok: true, frames };
   }
 
   /** Build an authority INVALIDATE. Namespace scope may name only an ns;
