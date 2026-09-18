@@ -615,6 +615,21 @@ metadataCorruption({
   },
   errorCode: RELAY_FRAME_ERROR.BAD_METADATA,
 });
+// The UTF-8 rule covers exactly the metaBytes region. Built from a frame that
+// carries data: the metadata's closing brace becomes a two-byte lead and the
+// first data byte becomes its continuation byte, so a validator that scanned
+// past the region boundary would see one well-formed sequence and accept.
+const codec1 = vectors.find(v => v.name === "data-codec1-json") as ValidVector;
+const codec1Bytes = legalBytes(codec1);
+invalidFromBase({
+  name: "meta-utf8-cut-at-data", base: codec1, baseBytes: codec1Bytes,
+  mutate: b => {
+    const metaEnd = 48 + new DataView(b.buffer, b.byteOffset).getUint32(36, true);
+    b[metaEnd - 1] = 0xc3; // last metadata byte: a lead that needs one more
+    b[metaEnd] = 0xa9;     // first data byte: the continuation that would complete it
+  },
+  errorCode: RELAY_FRAME_ERROR.BAD_METADATA,
+});
 metadataCorruption({
   name: "meta-duplicate-key",
   body: (s, e, b) => {

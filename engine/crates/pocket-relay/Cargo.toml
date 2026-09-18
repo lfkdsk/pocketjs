@@ -9,7 +9,8 @@
 #
 # Constants come from contracts/spec/relay.ts through gen-rust.ts
 # (src/generated.rs); tests/contract.ts byte-guards that file. There is no JSON
-# here — frame metadata crosses this layer as an unparsed byte slice.
+# here — frame metadata crosses this layer as an unparsed byte slice, checked
+# to be valid UTF-8 and nothing more.
 
 [package]
 name = "pocket-relay"

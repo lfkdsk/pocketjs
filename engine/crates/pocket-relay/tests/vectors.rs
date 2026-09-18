@@ -7,14 +7,14 @@
 
 mod common;
 
-use common::{Case, DEFERRED_TO_METADATA_LAYER, VECTORS};
-use pocket_relay::{decode, encode_into, FrameError, FrameInput, FrameOptions, RecordReader,
-    HEADER_BYTES};
+use common::{Case, UPPER_LAYER_ONLY, VECTORS};
+use pocket_relay::{decode, encode_into, EncodeError, FrameError, FrameInput, FrameOptions,
+    RecordReader, HEADER_BYTES};
 
 #[test]
 fn links_every_vector_in_the_index() {
     common::assert_covers_index();
-    assert_eq!(VECTORS.len(), 46, "P1 committed 46 vectors");
+    assert_eq!(VECTORS.len(), 47, "P1 committed 46 vectors; P6f added meta-utf8-cut-at-data");
 }
 
 #[test]
@@ -53,20 +53,30 @@ fn decodes_every_vector_to_its_pinned_outcome() {
                 assert_eq!(h.wire_bytes(), case.wire_bytes as u64, "{}: wireBytes", case.name);
                 legal += 1;
             }
-            Err(code) if DEFERRED_TO_METADATA_LAYER.contains(&code.as_str()) => {
-                // This crate reads no JSON, so these records are well-formed at
-                // the frame layer by construction; the session layer above
-                // refuses them. Asserting the header passes keeps the handoff
-                // honest: if one of these ever became a header-level defect,
-                // this assertion would notice.
+            Err(code) if UPPER_LAYER_ONLY.contains(&case.name) => {
+                // This crate reads no JSON, so these records pass the frame
+                // layer and the session layer above refuses them. Asserting
+                // that keeps the handoff honest: the metadata handed up is
+                // valid UTF-8, and if one of these ever became a frame-level
+                // defect this assertion would notice.
+                assert!(
+                    code == "BAD_METADATA" || code == "BAD_ENVELOPE",
+                    "{}: {code} is not a metadata-layer code",
+                    case.name
+                );
                 let frame = got.unwrap_or_else(|e| {
                     panic!(
-                        "{}: {code} is a metadata-layer refusal, but the header was rejected with {}",
+                        "{}: {code} is a metadata-layer refusal, but the frame was rejected with {}",
                         case.name,
                         e.as_str()
                     )
                 });
                 assert!(!frame.meta.is_empty(), "{}: a metadata defect implies metadata", case.name);
+                assert!(
+                    std::str::from_utf8(frame.meta).is_ok(),
+                    "{}: the layer above receives valid UTF-8",
+                    case.name
+                );
                 deferred += 1;
             }
             Err(code) => {
@@ -78,7 +88,90 @@ fn decodes_every_vector_to_its_pinned_outcome() {
             }
         }
     }
-    assert_eq!((legal, refused, deferred), (23, 17, 6), "vector census");
+    assert_eq!((legal, refused, deferred), (23, 19, 5), "vector census");
+}
+
+/// Vectors whose defect lives in bytes the encoder writes itself, or is a
+/// receiver-side pin the encoder does not hold: no `FrameInput` expresses
+/// them, so `encode_into` cannot be asked to refuse them.
+const NOT_ENCODER_INPUT: &[&str] = &[
+    "bad-magic",
+    "bad-major",
+    "bad-minor",
+    "bad-flags",
+    "bad-header-size",
+    "bad-reserved",
+    "length-inequality",
+    "truncated",
+    "short-header",
+    "bad-session-pin",
+];
+
+/// Every frame-layer refusal that a caller could ask the encoder to produce
+/// is refused by `encode_into` with the code `decode` reports for the same
+/// bytes. Review 965 showed `encode_into` passing the `meta-not-utf8` record
+/// rebuilt as a `FrameInput`; this holds every such vector to the rule.
+#[test]
+fn encode_refuses_every_vector_decode_refuses() {
+    let mut out = vec![0u8; 128 * 1024];
+    let mut checked = Vec::new();
+    for vector in VECTORS {
+        let case = vector.case();
+        let Err(code) = &case.outcome else { continue };
+        if UPPER_LAYER_ONLY.contains(&case.name) || NOT_ENCODER_INPUT.contains(&case.name) {
+            continue;
+        }
+        let decoded = decode(case.bin, &case.options).expect_err("a refused vector");
+        assert_eq!(decoded.as_str(), code, "{}: decode code", case.name);
+        let encoded = encode_into(&common::raw_input(case.bin), &mut out, &case.options);
+        assert_eq!(
+            encoded,
+            Err(EncodeError::Frame(decoded)),
+            "{}: encode_into must refuse what decode refuses",
+            case.name
+        );
+        checked.push(case.name);
+    }
+    assert_eq!(
+        checked,
+        [
+            "bad-type",
+            "wire-too-large",
+            "meta-too-large",
+            "seq-zero",
+            "correlation-zero-request",
+            "codec-not-negotiated",
+            "codec0-with-data",
+            "meta-not-utf8",
+            "meta-utf8-cut-at-data",
+        ],
+        "every refusal the encoder can be asked for"
+    );
+}
+
+/// R5 §3.3 makes the metadata region strict UTF-8, a byte rule the frame
+/// layer owns. The committed `meta-not-utf8` record carries 0xff inside a
+/// string; `meta-utf8-cut-at-data` ends the region on a lead byte whose
+/// continuation is the first data byte, so the scan must stop at `metaBytes`.
+#[test]
+fn refuses_metadata_that_is_not_utf8_on_both_paths() {
+    let mut out = vec![0u8; 4096];
+    for name in ["meta-not-utf8", "meta-utf8-cut-at-data"] {
+        let case = VECTORS.iter().find(|v| v.name == name).expect(name).case();
+        assert_eq!(decode(case.bin, &case.options), Err(FrameError::BadMetadata), "{name}");
+        let input = common::raw_input(case.bin);
+        assert!(std::str::from_utf8(input.meta).is_err(), "{name}: the fixture is not UTF-8");
+        assert_eq!(
+            encode_into(&input, &mut out, &case.options),
+            Err(EncodeError::Frame(FrameError::BadMetadata)),
+            "{name}"
+        );
+    }
+    // The boundary vector is one well-formed sequence when read past the region.
+    let case = VECTORS.iter().find(|v| v.name == "meta-utf8-cut-at-data").unwrap().case();
+    let input = common::raw_input(case.bin);
+    let meta_end = HEADER_BYTES + input.meta.len();
+    assert!(std::str::from_utf8(&case.bin[HEADER_BYTES..meta_end + 1]).is_ok());
 }
 
 #[test]

@@ -51,11 +51,15 @@ pub enum FrameError {
     BadSeq,
     /// `correlation` is zero on REQUEST/RESPONSE/CANCEL, or nonzero elsewhere.
     BadCorrelation,
-    /// Metadata is not strict UTF-8 JSON. Never returned by this crate — the
-    /// session layer that parses metadata reports it.
+    /// Metadata is not strict UTF-8 JSON. This crate decides the byte half of
+    /// that rule: a metadata region that is not valid UTF-8 is refused by
+    /// [`decode`] and [`encode_into`]. The JSON half (root object, duplicate
+    /// keys, number grammar, escapes) is decided by the session layer that
+    /// parses metadata.
     BadMetadata,
     /// Metadata parses but breaks an envelope rule (`op`, `final`, `status`,
-    /// `targetStream`). Never returned by this crate; see [`FrameError::BadMetadata`].
+    /// `targetStream`). Never returned by this crate: the envelope is read
+    /// from parsed metadata, one layer up.
     BadEnvelope,
 }
 
@@ -314,19 +318,21 @@ impl Header {
 }
 
 /// A decoded record: the header plus borrowed views of the two payload
-/// regions. `meta` is unparsed strict-UTF-8 JSON; this crate does not read it.
+/// regions. `meta` is valid UTF-8, checked by [`decode`], and unparsed JSON;
+/// this crate reads no JSON.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame<'a> {
     /// The validated header.
     pub header: Header,
-    /// The metadata region, exactly `header.meta_bytes` long.
+    /// The metadata region, exactly `header.meta_bytes` long and valid UTF-8.
     pub meta: &'a [u8],
     /// The data region, exactly `header.data_bytes` long.
     pub data: &'a [u8],
 }
 
-/// One record to encode. `meta` must already be strict-UTF-8 JSON — the layer
-/// that serialises metadata owns that guarantee.
+/// One record to encode. `meta` must be valid UTF-8, which [`encode_into`]
+/// checks; that it is a JSON object is the guarantee of the layer that
+/// serialises metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameInput<'a> {
     /// Frame type, from [`crate::spec::type_`].
@@ -464,6 +470,12 @@ pub fn decode<'a>(record: &'a [u8], opts: &FrameOptions) -> Result<Frame<'a>, Fr
     let meta_start = HEADER_BYTES;
     let data_start = meta_start + meta_bytes as usize;
     let data_end = data_start + data_bytes as usize;
+    let meta = &record[meta_start..data_start];
+    // R5 §3.3: the metadata region is strict UTF-8. Exactly `metaBytes` bytes
+    // are scanned, so a sequence the data region would complete is still cut.
+    if core::str::from_utf8(meta).is_err() {
+        return Err(FrameError::BadMetadata);
+    }
     Ok(Frame {
         header: Header {
             kind,
@@ -475,7 +487,7 @@ pub fn decode<'a>(record: &'a [u8], opts: &FrameOptions) -> Result<Frame<'a>, Fr
             meta_bytes,
             data_bytes,
         },
-        meta: &record[meta_start..data_start],
+        meta,
         data: &record[data_start..data_end],
     })
 }
@@ -531,6 +543,9 @@ pub fn encode_into(
         }
     } else if input.correlation != 0 {
         return Err(FrameError::BadCorrelation.into());
+    }
+    if core::str::from_utf8(input.meta).is_err() {
+        return Err(FrameError::BadMetadata.into());
     }
 
     let wire_bytes = match encoded_len(input.meta.len(), input.data.len()) {
@@ -772,6 +787,46 @@ mod tests {
             Err(FrameError::BadCodec.into()),
             "an extension codec is refused until negotiated"
         );
+
+        // R5 §3.3: metadata is strict UTF-8. A stray byte is refused before
+        // anything is written, as the peer's decoder would refuse the record.
+        let not_utf8 =
+            FrameInput { meta: b"{\"op\":\"relay.p\xffng\"}", ..request(spec::codec::NONE, b"") };
+        let mut untouched = [0u8; 256];
+        assert_eq!(encode(&not_utf8, &mut untouched), Err(FrameError::BadMetadata.into()));
+        assert!(untouched.iter().all(|&b| b == 0), "a refused frame wrote nothing");
+    }
+
+    /// R5 §3.3: the metadata region is strict UTF-8. The check covers exactly
+    /// `metaBytes` bytes: a lead byte that ends the region is incomplete even
+    /// when the first data byte would complete the sequence.
+    #[test]
+    fn decode_refuses_metadata_that_is_not_utf8() {
+        let mut out = [0u8; 256];
+        let input = request(spec::codec::OPAQUE_BYTES, b"\xa9\x00");
+        let n = encode(&input, &mut out).unwrap();
+        assert!(decode(&out[..n], &FrameOptions::unbounded()).is_ok());
+
+        // One metadata byte is not UTF-8; the header is intact.
+        let mut stray = out;
+        stray[HEADER_BYTES + 2] = 0xff;
+        assert_eq!(decode(&stray[..n], &FrameOptions::unbounded()), Err(FrameError::BadMetadata));
+
+        // The last metadata byte becomes a two-byte lead; the data region
+        // already opens with the continuation byte 0xa9. Valid across the
+        // boundary, invalid within the region.
+        let mut cut = out;
+        cut[HEADER_BYTES + META.len() - 1] = 0xc3;
+        assert_eq!(decode(&cut[..n], &FrameOptions::unbounded()), Err(FrameError::BadMetadata));
+
+        // Multibyte UTF-8 passes: the rule is validity, not ASCII.
+        let unicode = FrameInput {
+            meta: "{\"op\":\"relay.ping\",\"note\":\"café 协议 🎮\"}".as_bytes(),
+            ..input
+        };
+        let n = encode(&unicode, &mut out).unwrap();
+        let frame = decode(&out[..n], &FrameOptions::unbounded()).unwrap();
+        assert_eq!(frame.meta, unicode.meta);
     }
 
     #[test]
@@ -951,6 +1006,13 @@ mod tests {
         for (i, b) in payload.iter_mut().enumerate() {
             *b = i as u8;
         }
+        // Metadata must be UTF-8: a text with 1-, 2-, 3- and 4-byte sequences,
+        // repeated to fill the buffer and cut on a character boundary below.
+        const TEXT: &[u8] = "{\"op\":\"relay.ping\",\"note\":\"café 协议 🎮 \"}".as_bytes();
+        let mut text = [0u8; 1024];
+        for (i, b) in text.iter_mut().enumerate() {
+            *b = TEXT[i % TEXT.len()];
+        }
         let mut out = [0u8; 8192];
         let kinds = [
             spec::type_::REQUEST,
@@ -971,7 +1033,10 @@ mod tests {
             let r = next();
             let kind = kinds[(r % 5) as usize];
             let codec = codecs[((r >> 8) % 4) as usize];
-            let meta_len = ((r >> 16) % 1024) as usize;
+            let mut meta_len = ((r >> 16) % 1024) as usize;
+            while meta_len > 0 && (text[meta_len] & 0xc0) == 0x80 {
+                meta_len -= 1; // never cut inside a multibyte sequence
+            }
             let data_len = if codec == spec::codec::NONE {
                 0
             } else {
@@ -988,7 +1053,7 @@ mod tests {
                 } else {
                     0
                 },
-                meta: &payload[..meta_len],
+                meta: &text[..meta_len],
                 data: &payload[..data_len],
             };
             let n = encode(&input, &mut out).expect("generated frame encodes");
