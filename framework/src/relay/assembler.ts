@@ -111,8 +111,10 @@ export interface RelayAssemblerStats {
 const hexU64 = (s: string): bigint | null =>
   /^[0-9a-f]{16}$/.test(s) ? BigInt("0x" + s) : null;
 
+/** Chunk identity, revision included. A JSON tuple, not a delimiter join,
+ * so unrestricted field contents cannot alias two identities (review 1070 M1). */
 const refId = (r: RelayResourceRef) =>
-  `${r.kind}|${r.ns}|${r.key}|${r.revision ?? ""}|${r.rendition}`;
+  JSON.stringify([r.kind, r.ns, r.key, r.revision ?? null, r.rendition]);
 
 /** One assembler table per session/receiver direction. Bounded; hostile input
  * produces a fixed error code, never a throw. */
