@@ -73,6 +73,7 @@ pub const VECTORS: &[Vector] = vectors![
     "bad-session-pin",
     "seq-zero",
     "correlation-zero-request",
+    "cancel-nonzero-stream",
     "codec-not-negotiated",
     "codec0-with-data",
     "meta-not-utf8",

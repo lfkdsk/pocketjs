@@ -8,13 +8,18 @@
 mod common;
 
 use common::{Case, UPPER_LAYER_ONLY, VECTORS};
+use pocket_relay::spec::header as h;
 use pocket_relay::{decode, encode_into, EncodeError, FrameError, FrameInput, FrameOptions,
     RecordReader, HEADER_BYTES};
 
 #[test]
 fn links_every_vector_in_the_index() {
     common::assert_covers_index();
-    assert_eq!(VECTORS.len(), 47, "P1 committed 46 vectors; P6f added meta-utf8-cut-at-data");
+    assert_eq!(
+        VECTORS.len(),
+        48,
+        "P1 committed 46 vectors; P6f added meta-utf8-cut-at-data and cancel-nonzero-stream"
+    );
 }
 
 #[test]
@@ -88,7 +93,7 @@ fn decodes_every_vector_to_its_pinned_outcome() {
             }
         }
     }
-    assert_eq!((legal, refused, deferred), (23, 19, 5), "vector census");
+    assert_eq!((legal, refused, deferred), (23, 20, 5), "vector census");
 }
 
 /// Vectors whose defect lives in bytes the encoder writes itself, or is a
@@ -140,6 +145,7 @@ fn encode_refuses_every_vector_decode_refuses() {
             "meta-too-large",
             "seq-zero",
             "correlation-zero-request",
+            "cancel-nonzero-stream",
             "codec-not-negotiated",
             "codec0-with-data",
             "meta-not-utf8",
@@ -147,6 +153,30 @@ fn encode_refuses_every_vector_decode_refuses() {
         ],
         "every refusal the encoder can be asked for"
     );
+}
+
+/// R5 §3.6: a CANCEL rides header stream 0. Review 965 wrote 1 over the
+/// stream field of the legal `cancel` vector and both paths accepted it; that
+/// record is now the committed `cancel-nonzero-stream` vector.
+#[test]
+fn refuses_a_cancel_off_the_control_stream_on_both_paths() {
+    let legal = VECTORS.iter().find(|v| v.name == "cancel").expect("cancel").case();
+    let mut forged = legal.bin.to_vec();
+    forged[h::STREAM_OFFSET..h::STREAM_OFFSET + 4].copy_from_slice(&1u32.to_le_bytes());
+    let case = VECTORS.iter().find(|v| v.name == "cancel-nonzero-stream").expect("vector").case();
+    assert_eq!(case.bin, &forged[..], "the vector is the legal cancel with stream 1");
+
+    assert_eq!(decode(case.bin, &case.options), Err(FrameError::BadCorrelation));
+    let mut out = vec![0u8; 4096];
+    let input = common::raw_input(case.bin);
+    assert_eq!(input.stream, 1);
+    assert_eq!(
+        encode_into(&input, &mut out, &case.options),
+        Err(EncodeError::Frame(FrameError::BadCorrelation))
+    );
+    // The stream field is the only difference between refusal and the legal record.
+    let n = encode_into(&FrameInput { stream: 0, ..input }, &mut out, &case.options).unwrap();
+    assert_eq!(&out[..n], legal.bin);
 }
 
 /// R5 §3.3 makes the metadata region strict UTF-8, a byte rule the frame

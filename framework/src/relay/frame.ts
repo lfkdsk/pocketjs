@@ -408,7 +408,7 @@ class Parser {
 
 // --- envelope rules shared by encode and decode ------------------------------
 
-function validateEnvelope(meta: Record<string, unknown>, type: number, stream: number): RelayFrameErrorCode | null {
+function validateEnvelope(meta: Record<string, unknown>, type: number): RelayFrameErrorCode | null {
   if (typeof meta.op !== "string" || !OP_PATTERN.test(meta.op)) return RELAY_FRAME_ERROR.BAD_ENVELOPE;
   if (type === RELAY_TYPE.RESPONSE) {
     if (typeof meta.final !== "boolean") return RELAY_FRAME_ERROR.BAD_ENVELOPE;
@@ -417,7 +417,7 @@ function validateEnvelope(meta: Record<string, unknown>, type: number, stream: n
     }
   }
   if (type === RELAY_TYPE.CANCEL) {
-    if (stream !== 0 || meta.op !== RELAY_OP.REQUEST_CANCEL) return RELAY_FRAME_ERROR.BAD_ENVELOPE;
+    if (meta.op !== RELAY_OP.REQUEST_CANCEL) return RELAY_FRAME_ERROR.BAD_ENVELOPE;
     if (!isU32(meta.targetStream)) return RELAY_FRAME_ERROR.BAD_ENVELOPE;
   }
   return null;
@@ -468,6 +468,10 @@ export function prepareFrameBody(
   if (!allowed.has(codec)) return { ok: false, code: RELAY_FRAME_ERROR.BAD_CODEC };
 
   if (!isU32(input.stream)) return { ok: false, code: RELAY_FRAME_ERROR.BAD_LENGTH };
+  // §3.6: a CANCEL rides the control stream. The stream is fixed at prepare
+  // time, so the prepared path refuses it here, before metadata is serialized,
+  // with the code the one-shot encoder, decodeFrame, C and Rust report.
+  if (type === RELAY_TYPE.CANCEL && input.stream !== 0) return { ok: false, code: RELAY_FRAME_ERROR.BAD_CORRELATION };
 
   return buildBody(type, codec, input.stream, input.metadata, input.data, options);
 }
@@ -512,6 +516,9 @@ export function encodeFrame(input: RelayFrameInput, options: RelayFrameOptions =
   if (correlationRequired ? input.correlation === 0 : input.correlation !== 0) {
     return { ok: false, code: RELAY_FRAME_ERROR.BAD_CORRELATION };
   }
+  // §3.6: a CANCEL rides the control stream. The header field decides this,
+  // so the C and Rust frame layers refuse it before any metadata is read.
+  if (type === RELAY_TYPE.CANCEL && input.stream !== 0) return { ok: false, code: RELAY_FRAME_ERROR.BAD_CORRELATION };
 
   const built = buildBody(type, codec, input.stream, input.metadata ?? {}, input.data, options);
   if (!built.ok) return built;
@@ -538,7 +545,7 @@ function buildBody(
   } catch (e) {
     return { ok: false, code: e instanceof JsonWriteError ? e.code : RELAY_FRAME_ERROR.BAD_METADATA };
   }
-  const envelope = validateEnvelope(metadata, type, stream);
+  const envelope = validateEnvelope(metadata, type);
   if (envelope) return { ok: false, code: envelope };
 
   if (!Number.isSafeInteger(meta.length) || meta.length > 0xffffffff || data.length > 0xffffffff) {
@@ -634,6 +641,7 @@ export function decodeFrame(record: Uint8Array, options: RelayFrameOptions = {})
   if (correlationRequired ? correlation === 0 : correlation !== 0) {
     return fail(RELAY_FRAME_ERROR.BAD_CORRELATION);
   }
+  if (type === RELAY_TYPE.CANCEL && stream !== 0) return fail(RELAY_FRAME_ERROR.BAD_CORRELATION);
 
   let metadata: Record<string, unknown>;
   try {
@@ -641,7 +649,7 @@ export function decodeFrame(record: Uint8Array, options: RelayFrameOptions = {})
   } catch (e) {
     return fail(typeof e === "string" ? e as RelayFrameErrorCode : RELAY_FRAME_ERROR.BAD_METADATA);
   }
-  const envelope = validateEnvelope(metadata, type, stream);
+  const envelope = validateEnvelope(metadata, type);
   if (envelope) return fail(envelope);
 
   return {
