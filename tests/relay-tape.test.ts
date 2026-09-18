@@ -6,6 +6,7 @@ import {
   RelayFrameRecorder,
   sha256Hex,
   stringifyFrameTape,
+  toHex,
   verifyFrameTape,
   wrapRelayTransport,
   type RelayFrameDirection,
@@ -461,6 +462,49 @@ test("a recv()d foreign-session frame is returned and the trace marked incomplet
   const t = recording(inner, { session: 0x0102030405060708n });
   expect(t.recv()).toBe(hello); // the caller gets the bytes regardless
   expect(t.relayRecorder.incomplete?.reason).toMatch(/does not match tape session/);
+});
+
+test("recv(): the inner result is recorded inside the call and returned; null/undefined return null and record nothing", async () => {
+  // Review 986 C2: the wrapper calls inner.recv(), hands a non-null frame
+  // to the recorder, then returns it; the allowed undefined comes back as
+  // null. The order is observable: the tape holds the frame by the time
+  // recv() has returned it.
+  const credit = await loadBin("credit"); // session 0102030405060708, seq 4
+  const results: (Uint8Array | null | undefined)[] = [undefined, null, credit];
+  const inner = { send: () => {}, recv: () => results.shift() };
+  const t = recording(inner, { session: 0x0102030405060708n });
+  expect(t.recv()).toBeNull(); // inner undefined -> null
+  expect(t.recv()).toBeNull(); // inner null -> null
+  expect(t.relayRecorder.framesRecorded).toBe(0);
+  expect(t.relayRecorder.incomplete).toBeNull(); // an empty poll is not a record loss
+  expect(t.recv()).toBe(credit); // the inner object itself, not a copy
+  expect(t.relayRecorder.framesRecorded).toBe(1);
+  expect(t.relayRecorder.toTape().frames[0]).toEqual(["in", 4, toHex(credit), sha256Hex(credit)]);
+  expect(t.recv()).toBeNull(); // exhausted inner (undefined) -> null, nothing appended
+  expect(t.relayRecorder.framesRecorded).toBe(1);
+});
+
+test("recv() returns a frame the recorder rejects under any rule: foreign session, seq 0, frame cap", async () => {
+  // The fact behind "off the live path": a capture rejection cannot
+  // withhold a frame inner.recv() has produced. seq 0 and the cap were
+  // pinned for send() only; each rule is exercised on the inbound side.
+  const hello = await loadBin("hello");       // session 0: foreign to the pin
+  const zeroSeq = await loadBin("seq-zero");  // pinned session, seq 0
+  const ping = await loadBin("ping");
+  const pin = { session: 0x0102030405060708n };
+  const cases: [string, Uint8Array[], Omit<RelayFrameWrapOptions, "enabled">, RegExp][] = [
+    ["foreign session", [hello], pin, /does not match tape session/],
+    ["seq 0", [zeroSeq], pin, /seq is 0/],
+    ["frame cap", [ping, ping], { ...pin, maxFrames: 1 }, /frame cap 1 reached/],
+  ];
+  for (const [name, inbox, options, reason] of cases) {
+    const queue = [...inbox];
+    const t = recording({ send: () => {}, recv: () => queue.shift() ?? null }, options);
+    const returned = inbox.map(() => t.recv());
+    expect(returned, name).toEqual(inbox); // every produced frame reached the caller
+    expect(t.relayRecorder.incomplete?.reason, name).toMatch(reason);
+    expect(t.relayRecorder.framesRecorded, name).toBe(inbox.length - 1);
+  }
 });
 
 test("when inner.send throws the error propagates and nothing is recorded", async () => {
