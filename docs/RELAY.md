@@ -328,7 +328,11 @@ namespace scope advance that one revision-free generation and mark the
 resident value stale; revision scope compares the concrete revision, removes
 only the matching resident entry, and records the invalidated revision on an
 in-flight get so a late response naming that revision is dropped with
-`RESYNC_REQUIRED` while a response for a newer revision may still land. The
+`RESYNC_REQUIRED` while a response for a newer revision may still land.
+**One invalidate advances the generation of a matching identity once,
+whatever the number of resident entries and in-flight gets it matches, and
+the counter never decreases**: the map of generations is the single counter,
+a get captures it at request time, and a resident entry mirrors it. The
 resident cache holds the current concrete revision under the revision-less
 key; publishing a newer revision replaces it at a frame boundary.
 
@@ -369,7 +373,15 @@ against the schemas in `contracts/spec/relay.ts`.
   delta applies; the object at the resync boundary is still delivered marked
   `resyncRequired`.** A latest-snapshot re-delivery of the held revision is
   idempotent. resource.unsubscribe terminates the subscription; pushes
-  already on the wire are consumed and dropped.
+  already on the wire are consumed and dropped. **The push channel is
+  admitted reserve-then-accept: a subscribe is refused `BUSY` before it is
+  sent when the assembly budget cannot hold `maxObjectBytes`, and a
+  reservation that fails when the terminal response arrives sends
+  `resource.unsubscribe` for the id the provider allocated**, completes the
+  subscribe with that error and calls `onEnd` once, so the provider does not
+  keep an active subscription that no local channel can assemble. A
+  withdrawal the request window refuses is retried on the next incoming
+  frame and dropped by a stream reset, which ends the provider side as well.
 - **resource.release** ends an explicit provider `lease:u32` on remote
   residence. Local cache disposal is a different operation.
 
@@ -419,7 +431,13 @@ Two distinct operations use the INVALIDATE frame type:
   records that revision on an in-flight get. A late get response stamped
   with an older generation, or naming a revision invalidated in flight, is
   dropped with `RESYNC_REQUIRED`; a response for a newer revision may still
-  land. A subscription in scope is marked for resync.
+  land. **The marker store is bounded: one in-flight get keeps at most 8
+  distinct invalidated revisions, and the ninth distinct revision replaces
+  them with a fence over the whole get**, so a marker is never dropped for
+  lack of room (draft §3.8) and a burst of invalidates costs one re-fetch,
+  never a stale publication; a repeated revision is one marker, and the
+  escalation touches neither the resident entry nor other in-flight gets. A
+  subscription in scope is marked for resync.
 - **cache.evict** is consumer-to-provider advisory only
   (`reason:"budget" | "view-close"`). It states that the consumer no longer
   holds a copy; **the provider may ignore it and there is no ACK.** Remote
