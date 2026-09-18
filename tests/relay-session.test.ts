@@ -469,6 +469,60 @@ test("B-2 handshake: a HELLO response claiming a kind the guest never offered te
   expect(solo.guest.phase).toBe("closed");
 });
 
+test("B-4 schema: the HELLO response requires kinds, so an omitted field fails at both ends", () => {
+  // The provider validates its own response against this schema before
+  // the send (controlResponse) and the guest validates what it receives:
+  // one required entry covers both ends.
+  const schema = RELAY_METADATA_SCHEMAS[`${RELAY_OP.HELLO}.response`] as Record<string, unknown>;
+  const response = {
+    op: RELAY_OP.HELLO, status: RELAY_STATUS.OK, final: true,
+    bootNonce: "00112233445566778899aabbccddeeff",
+    peerNonce: "ffeeddccbbaa99887766554433221100",
+    session: "0102030405060708", selected: [1, 0],
+    profiles: [{ name: "map.raster", version: 1 }],
+    codecs: [0], kinds: [1], grants: ["pocket-map"], rxLimits: RX_LIMITS,
+  };
+  expect(validateRelaySchema(schema, response)).toBeNull();
+  const { kinds: _omittedKinds, ...withoutKinds } = response;
+  expect(validateRelaySchema(schema, withoutKinds)).toContain("missing kinds");
+  // codecs stays optional: its fallback is the codec set [0], which never
+  // claims a codec the peer did not confirm.
+  const { codecs: _omittedCodecs, ...withoutCodecs } = response;
+  expect(validateRelaySchema(schema, withoutCodecs)).toBeNull();
+});
+
+test("B-4 handshake: a HELLO response without kinds is UNSUPPORTED and closes the guest", async () => {
+  // Review 988 replayed the pre-fix provider: it narrows the guest offer
+  // [1,6,7] to [1] but its response carries no kinds field, and the old
+  // guest fell back to its whole offer. The field is now required: the
+  // guest closes instead of claiming an intersection the peer never
+  // confirmed.
+  const donor = makePair({ guestCaps: { kinds: [1, 6, 7] }, providerCaps: { kinds: [1] } });
+  await handshake(donor);
+  expect(donor.provider.negotiation!.kinds).toEqual([1]);
+  const real = decode(donor.wire.find((f) => f.from === "provider"
+    && decode(f).metadata.op === RELAY_OP.HELLO)!);
+  const { kinds: _omitted, ...withoutKinds } = real.metadata;
+
+  const solo = makePair({ guestCaps: { kinds: [1, 6, 7] }, providerCaps: { kinds: [1] } });
+  const ready = solo.guest.whenReady();
+  solo.guest.hello(); // async transport: only the guest HELLO is on the wire
+  const ownHello = decode(solo.wire[0]);
+  solo.provider.close(); // never deliver the real response
+  expect(solo.guest.phase).toBe("hello-sent");
+
+  const stripped = encodeFrame({
+    type: RELAY_TYPE.RESPONSE, codec: 0, session: 0n, seq: 1, stream: 0, correlation: 1,
+    metadata: { ...withoutKinds, bootNonce: ownHello.metadata.bootNonce },
+  }, { maxWireBytes: 4096, codecs: [0] });
+  if (!stripped.ok) throw new Error(stripped.code);
+  solo.guest.handleRecord(stripped.bytes);
+  expect(solo.guest.phase).toBe("closed");
+  expect(solo.guest.negotiation).toBeUndefined();
+  expect(solo.guest.getStats().handshakeFailures).toBe(1);
+  await expect(ready).rejects.toThrow(/UNSUPPORTED/);
+});
+
 test("OPEN outside grants or with a non-negotiated profile/codec is refused", async () => {
   const pair = makePair();
   await handshake(pair);

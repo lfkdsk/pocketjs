@@ -737,6 +737,14 @@ export class RelaySession {
         this.teardown(`hello rejected: ${code}`);
         return;
       }
+      // A success response without `kinds` cannot confirm the §3.2
+      // intersection (the schema requires the field); the peer is
+      // unsupported. Decide here so the close reason carries the code.
+      if (!Object.prototype.hasOwnProperty.call(meta, "kinds")) {
+        this.statsValue.handshakeFailures++;
+        this.teardown(`hello rejected: ${RELAY_ERROR.UNSUPPORTED} (response without kinds)`);
+        return;
+      }
       if (!this.validateAgainst(frame, `${RELAY_OP.HELLO}.response`)) return;
       if (meta.bootNonce !== this.bootNonce) { this.teardown("bootNonce mismatch"); return; }
       const local = this.options.local;
@@ -755,11 +763,11 @@ export class RelaySession {
         this.teardown("selected codec set invalid"); return;
       }
       // §3.2 field table: kinds are chosen by mutual intersection. The
-      // provider echoes the picked set; every value must be one the guest
-      // offered and at least one kind must survive.
-      const kinds = meta.kinds as number[] | undefined;
-      if (kinds !== undefined
-          && (kinds.length === 0 || !kinds.every((k) => local.kinds.includes(k)))) {
+      // response must carry the picked set (the schema requires it, and a
+      // response without it closed the session above): every value must be
+      // one the guest offered and at least one kind must survive.
+      const kinds = meta.kinds as number[];
+      if (kinds.length === 0 || !kinds.every((k) => local.kinds.includes(k))) {
         this.teardown("selected kind set invalid"); return;
       }
       const grants = meta.grants as string[];
@@ -778,10 +786,7 @@ export class RelaySession {
         version: selected,
         profiles,
         codecs: codecs ?? [RELAY_CODEC.NONE],
-        // The provider echoes the intersected kinds (same erratum as
-        // codecs); a response that omits the field is a pre-fix peer, for
-        // which the local offer stands.
-        kinds: kinds ?? [...local.kinds],
+        kinds,
         grants,
         rxLimits: limits,
         peerNonce: meta.peerNonce as string,

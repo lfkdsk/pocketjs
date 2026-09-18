@@ -175,11 +175,13 @@ The machine has six phases: `idle`, `hello-sent`, `hello-received`,
    and `rxLimits` computed field by field as `min(local, peer)`. With no
    version/profile/kind intersection, or an app outside the adapter grants,
    it returns a final RESPONSE with `status:"error"` and an `error.code`
-   (`UNSUPPORTED` or `UNAUTHORIZED`) and closes. The echoed codec and kind
-   sets are optional metadata fields (the field table lists the
-   intersection rule but the step-3 response list omits both fields); a
-   guest that does not receive them keeps its own offer, and a set naming a
-   codec or kind the guest did not offer tears the session down.
+   (`UNSUPPORTED` or `UNAUTHORIZED`) and closes. The response carries the
+   kind intersection in a required `kinds` field and the codec intersection
+   in an optional `codecs` field (the field table lists the intersection
+   rule; the step-3 response list omits both fields). **A guest that
+   receives no `kinds` closes the session as `UNSUPPORTED`**; a guest that
+   receives no `codecs` records the codec set `[0]`; a set naming a codec or
+   kind the guest did not offer tears the session down.
 3. The guest sends REQUEST `relay.ready` on the new session confirming the
    selected version; the provider acks and both sides enter `ready`. Each
    direction's seq restarts at 1 on the new session.
