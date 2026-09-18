@@ -232,11 +232,11 @@ record over the advertised bound destroys the connection without allocating.
 
 **`RelayByteChannel.send` is an admission decision: it returns `false` only
 when the frame was not taken.** A node `socket.write()` that returns `false`
-has already queued the bytes and will still flush them, so
+has queued the bytes and flushes them later, so
 `relaySocketChannel` checks `writableLength + frameSize` against
 `writableHighWaterMark` before writing (`socketCanAdmit`) and returns
 `busy` without writing; a frame on an empty queue that alone reaches the
-mark is still written, after which sends are busy until the queue drains.
+mark is written, after which sends are busy until the queue drains.
 Reporting a queued frame as busy would make the session roll its seq back
 and reuse it on the retry, putting a duplicate seq on the wire.
 
@@ -294,8 +294,9 @@ leave the sender FIFO; a frame never reorders inside its stream.
   frames, returns their credit, and the stream id can never be reopened.
 - **CANCEL rides stream 0** with `op:"request.cancel"`, the original
   request correlation, and `targetStream`. The provider emits exactly one
-  terminal response on the original stream: if the result was already in
-  flight the success terminal stands; if the cancel finished first the
+  terminal response on the original stream: if the result was in flight
+  before the cancel arrived the success terminal stands; if the cancel
+  finished first the
   terminal is `error.code=CANCELLED` with `effect:"none"`. A repeated
   terminal is rejected (`ALREADY_TERMINAL`), a repeated CANCEL produces no
   second terminal. Cancelling, timing out, or unmounting a view does not
@@ -305,7 +306,7 @@ leave the sender FIFO; a frame never reorders inside its stream.
   credit accounting, return credit, and are dropped without delivery.
 - **`relay.reset`** fails every request and subscription on the target
   stream, queues and seq state clear, and later work requires a new stream
-  id. In-flight frames still settle through credit accounting.
+  id. In-flight frames settle through credit accounting.
 
 ## Resource identity
 
@@ -328,7 +329,7 @@ namespace scope advance that one revision-free generation and mark the
 resident value stale; revision scope compares the concrete revision, removes
 only the matching resident entry, and records the invalidated revision on an
 in-flight get so a late response naming that revision is dropped with
-`RESYNC_REQUIRED` while a response for a newer revision may still land.
+`RESYNC_REQUIRED` while a response for a newer revision is delivered.
 **One invalidate advances the generation of a matching identity once,
 whatever the number of resident entries and in-flight gets it matches, and
 the counter never decreases**: the map of generations is the single counter,
@@ -337,8 +338,8 @@ resident cache holds the current concrete revision under the revision-less
 key; publishing a newer revision replaces it at a frame boundary.
 
 **Draft errata (§3.5 cache key).** The draft lists `revision` inside the
-cache-key tuple while also permitting a revisionless get and requiring a
-key-scope invalidate to move every revision. The three statements do not
+cache-key tuple, permits a revisionless get, and requires a key-scope
+invalidate to move every revision. The three statements do not
 share one key: a literal per-revision key gives the revisionless get and its
 concrete response two unrelated counters. The implementation keeps
 `revision` in the *wire* identity tuple and on every entry/response, but
@@ -357,7 +358,7 @@ against the schemas in `contracts/spec/relay.ts`.
 - **resource.get** sends `args.accept` (negotiated codec ids) and
   `args.maxObjectBytes`. A conditional get adds `ifRevision`; a match comes
   back `status:"ok", final:true, value:{notModified:true}` with the concrete
-  revision still named on the resource. An object larger than
+  revision named on the resource. An object larger than
   `maxObjectBytes` is `TOO_LARGE`; a request that cannot enter the bounded
   window or the local assembly budget is `BUSY` and the caller retries on a
   later frame.
@@ -366,14 +367,14 @@ against the schemas in `contracts/spec/relay.ts`.
   `value.subscription`, a session-scoped u32 that is never reused after
   unsubscribe. A reliable delta carries a top-level `baseRevision` and
   applies only when the base equals the held revision; a mismatch sets
-  `resyncRequired` instead of guessing the base, and a delta alone never
+  `resyncRequired` and does not guess the base, and a delta alone never
   advances the held revision or clears the flag. **Recovery is a full
   snapshot — a push with no `baseRevision`: it re-establishes the held
   revision on any revision and clears `resyncRequired`, so the next matching
-  delta applies; the object at the resync boundary is still delivered marked
+  delta applies; the object at the resync boundary is delivered marked
   `resyncRequired`.** A latest-snapshot re-delivery of the held revision is
-  idempotent. resource.unsubscribe terminates the subscription; pushes
-  already on the wire are consumed and dropped. **The push channel is
+  idempotent. resource.unsubscribe terminates the subscription; pushes on
+  the wire before the unsubscribe are consumed and dropped. **The push channel is
   admitted reserve-then-accept: a subscribe is refused `BUSY` before it is
   sent when the assembly budget cannot hold `maxObjectBytes`, and a
   reservation that fails when the terminal response arrives sends
@@ -430,8 +431,8 @@ Two distinct operations use the INVALIDATE frame type:
   scope removes only the resident entry whose concrete revision matches and
   records that revision on an in-flight get. A late get response stamped
   with an older generation, or naming a revision invalidated in flight, is
-  dropped with `RESYNC_REQUIRED`; a response for a newer revision may still
-  land. **The marker store is bounded: one in-flight get keeps at most 8
+  dropped with `RESYNC_REQUIRED`; a response for a newer revision is
+  delivered. **The marker store is bounded: one in-flight get keeps at most 8
   distinct invalidated revisions, and the ninth distinct revision replaces
   them with a fence over the whole get**, so a marker is never dropped for
   lack of room (draft §3.8) and a burst of invalidates costs one re-fetch,
@@ -441,7 +442,7 @@ Two distinct operations use the INVALIDATE frame type:
 - **cache.evict** is consumer-to-provider advisory only
   (`reason:"budget" | "view-close"`). It states that the consumer no longer
   holds a copy; **the provider may ignore it and there is no ACK.** Remote
-  lease teardown uses resource.release instead.
+  lease teardown uses resource.release.
 
 ## C frame layer
 
@@ -470,7 +471,7 @@ busy; it never drops or overwrites a frame it holds. Slot occupancy and
 window bytes are two counters: `relay_frame_queue_pop` frees the slot, while
 the bytes stay charged until `relay_frame_queue_release` moves the frame into
 reserved storage. Admission counts the incoming frame (`queued + length <=
-window`), so a backlog that already fills the window cannot be extended.
+window`), so a backlog that fills the window cannot be extended.
 `relay_frame_admit` validates a record before it enqueues it.
 
 ## Frame tape (record and replay)
