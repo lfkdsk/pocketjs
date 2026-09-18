@@ -29,7 +29,7 @@ frameBytes + 4 == 48 + metaBytes + dataBytes
 | 0 | `frameBytes` | u32 | `44 + metaBytes + dataBytes`; validated before payload is trusted |
 | 4 | `magic` | 4B | ASCII `PRLY` |
 | 8 | `major` | u8 | `1` |
-| 9 | `minor` | u8 | `0` in v1; selected exactly during READY |
+| 9 | `minor` | u8 | `0` in v1; one value, selected by the HELLO response and confirmed by READY |
 | 10 | `type` | u8 | `1..5`, see below |
 | 11 | `flags` | u8 | must be `0`; a nonzero reserved bit rejects the frame |
 | 12 | `headerBytes` | u16 | must be `48` including the prefix |
@@ -86,7 +86,7 @@ wire encoding.
 | 1 | REQUEST | `>0` | one `op`; ids do not repeat within a session |
 | 2 | RESPONSE | echoes request | carries `status` (`ok`/`accepted`/`error`) and boolean `final`; exactly one terminal response has `final:true` |
 | 3 | PUSH | `0` | subscription or control delivery; carries `subscription` or a stream-0 control op |
-| 4 | CANCEL | original request id | sent on stream 0 with `op:"request.cancel"` and `targetStream`; provider still emits one terminal response on the original stream |
+| 4 | CANCEL | original request id | sent on stream 0 with `op:"request.cancel"` and `targetStream`; the provider emits one terminal response on the original stream |
 | 5 | INVALIDATE | `0` | authority content invalidation or consumer cache eviction |
 
 Control ops are metadata names, not new types: `relay.hello`, `relay.ready`,
@@ -493,7 +493,7 @@ record including the 4-byte length prefix; `sha256Hex` is the SHA-256 of
 those bytes, computed by a dependency-free implementation in `tape.ts` (the
 module runs inside QuickJS guests and does not use `node:crypto`). The tape
 stores no timestamps, labels, session/stream columns, or parsed metadata;
-those fields are already inside the record. `session` is the u64 header
+the wire record carries those fields. `session` is the u64 header
 value as 16 hex chars and every entry must carry it; `"0000…0"` is accepted
 only for a bootstrap HELLO exchange. This format is not the input tape
 (`framework/src/devtools.ts`, versions 1..3, `{v, app, masks, …}`); a frame
@@ -510,15 +510,15 @@ the entries, and `parseFrameTape` shape-validates the JSON back.
 transport first and hands the frame to the recorder after it returns;
 `recv()` returns the inner frame before recording it. A frame the recorder
 rejects (a session other than the pinned one, a zero seq, or the
-`maxFrames` cap) still crosses the wire, and an error thrown by the inner
+`maxFrames` cap) crosses the wire, and an error thrown by the inner
 transport propagates without recording the frame. The first rejected frame
-instead latches an `incomplete: {index, reason}` field onto the tape, and
+latches an `incomplete: {index, reason}` field onto the tape, and
 no later frame is appended: the stored tuples stay a clean single-session
 prefix ending at `index`. R5 §3.11 record mode requires partial record
 loss to mark the trace incomplete rather than break the live session.
 `verifyFrameTape` returns a `tape-incomplete` divergence for such a
 document, and `createRelayFrameReplay` refuses to build a replay from it;
-R5 §3.11 bars deterministic replay of a trace with gaps. The recorder also
+R5 §3.11 bars deterministic replay of a trace with gaps. The recorder
 exposes the strict `note()`/`noteOut()`/`noteIn()` entry points that throw
 on the same rules, and the non-throwing `observe()` entry point the
 transport wrapper uses.
