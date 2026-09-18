@@ -1149,3 +1149,38 @@ test("receive sideband (B-a): a slot is 256 bytes and the lane 512 — two 256-b
   expect(rx.sessionFatal).toBe(true);
   expect(rx.sidebandOccupancy()).toEqual({ frames: 0, bytes: 0 });
 });
+
+test("receive sideband (B-b): applyReset(0) discards staged lane records — nothing delivers afterwards, no credit is produced, the lane is closed", () => {
+  const creditTable = new RelayCreditTable();
+  const rx = new RelayReceiver(
+    SESSION, new Map([[0, controlSlice()], [1, { frames: 2, bytes: 2 * GET_WIRE }]]), creditTable,
+  );
+  const cancel = (seq: number) => {
+    const bytes = wireRecord(0, seq, 7, {
+      op: RELAY_OP.REQUEST_CANCEL, targetStream: 1, reason: "x",
+    }, RELAY_TYPE.CANCEL);
+    const dec = decodeFrame(bytes);
+    if (!dec.ok) throw new Error(dec.code);
+    return { bytes, frame: dec.frame };
+  };
+  const c1 = cancel(1);
+  expect(rx.ingestSideband(c1.frame, c1.bytes.length).ok).toBe(true);
+  expect(rx.sidebandOccupancy()).toEqual({ frames: 1, bytes: c1.bytes.length });
+
+  const reset = rx.applyReset(0, "peer reset");
+  expect(reset.ok).toBe(true);
+  // Occupancy is read before the pump so the pump cannot be what empties
+  // the lane; both must already show the discard.
+  const after = rx.sidebandOccupancy();
+  const delivered = rx.pumpSideband();
+  expect(after).toEqual({ frames: 0, bytes: 0 });
+  expect(delivered).toEqual([]);
+  // The undelivered control earned no stream-0 credit row.
+  expect(creditTable.counters(0)).toBeUndefined();
+  // Stream 0 is dead: the lane is closed to the transport and to ingest.
+  expect(rx.sessionFatal).toBe(true);
+  const c2 = cancel(2);
+  expect(rx.canIngestSideband(c2.bytes.length)).toBe(false);
+  expect(rx.ingestSideband(c2.frame, c2.bytes.length).code).toBe(RELAY_P3_ERROR.SESSION_FATAL);
+  expect(rx.sidebandOccupancy()).toEqual({ frames: 0, bytes: 0 });
+});
