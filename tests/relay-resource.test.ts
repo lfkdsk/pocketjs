@@ -4,6 +4,7 @@ import { sha256Hex, verifySha256Digest } from "../framework/src/relay/sha256.ts"
 import { RelayChunkAssembler } from "../framework/src/relay/assembler.ts";
 import { validateRelayMetadata } from "../framework/src/relay/metadata.ts";
 import {
+  RELAY_MAX_FENCED_REVISIONS,
   RelayIdAllocator,
   RelayResourceAuthority,
   RelayResourceClient,
@@ -1138,4 +1139,89 @@ test("G1: the identity generation is one monotonic counter moved once per invali
   answer(c4, "r2");
   expect(results.g4.ok).toBe(true);
   expect(client.localEntry(tileRef("r2"))).toMatchObject({ revision: "r2", generation: 2, stale: false });
+});
+
+test("G2: revision markers on an in-flight get are bounded; overflow fences the whole get", () => {
+  const { wire, client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  const results: { ok: boolean; error?: { code: string } }[] = [];
+  client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+    (r) => results.push(r as { ok: boolean; error?: { code: string } }));
+  const correlation = wire.lastRequest().correlation;
+  const N = 5000;
+  for (let i = 0; i < N; i++) {
+    feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef(`r${i}`) }));
+  }
+  // §3.8 bounded markers: review 989 G2 measured N entries and quadratic
+  // time on this path.
+  expect(client.stats().fencedRevisions).toBeLessThanOrEqual(RELAY_MAX_FENCED_REVISIONS);
+  // Past the bound the marker escalates to the whole get: a response naming
+  // a revision that was never invalidated is dropped too (a re-fetch, never a
+  // guess about which revision the burst reached).
+  for (const f of auth.chunkObject({
+    type: RELAY_TYPE.RESPONSE, stream: 1, correlation,
+    ref: tileRef("r-current"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(16),
+  })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  expect(results[0].ok).toBe(false);
+  expect(results[0].error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);
+  expect(client.localEntry(tileRef("r-current"))).toBeUndefined();
+  expect(client.stats()).toMatchObject({ pending: 0, fencedRevisions: 0 });
+  // The escalation belongs to that get alone: the re-fetch lands.
+  const again: { ok: boolean }[] = [];
+  client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+    (r) => again.push(r as { ok: boolean }));
+  for (const f of auth.chunkObject({
+    type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
+    ref: tileRef("r-current"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(16),
+  })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  expect(again[0].ok).toBe(true);
+  expect(client.localEntry(tileRef("r-current"))).toMatchObject({ revision: "r-current", stale: false });
+});
+
+test("G2: below the bound the fence stays exact and a repeated revision is one marker", () => {
+  const { client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  const results: { ok: boolean; error?: { code: string } }[] = [];
+  const start = () => {
+    const out = client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+      (r) => results.push(r as { ok: boolean; error?: { code: string } }));
+    if (!("correlation" in out)) throw new Error("budget");
+    return out.correlation;
+  };
+  const answer = (correlation: number, revision: string) => {
+    for (const f of auth.chunkObject({
+      type: RELAY_TYPE.RESPONSE, stream: 1, correlation,
+      ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE, data: zeros(16),
+    })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  };
+  const invalidate = (revision: string) =>
+    feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef(revision) }));
+
+  // The same revision invalidated many times is one marker, and a response
+  // for another revision lands.
+  const c1 = start();
+  for (let i = 0; i < 100; i++) invalidate("r1");
+  expect(client.stats().fencedRevisions).toBe(1);
+  answer(c1, "r2");
+  expect(results[0].ok).toBe(true);
+
+  // Exactly the bound: every named revision is fenced, an unnamed one lands.
+  const c2 = start();
+  for (let i = 0; i < RELAY_MAX_FENCED_REVISIONS; i++) invalidate(`s${i}`);
+  expect(client.stats().fencedRevisions).toBe(RELAY_MAX_FENCED_REVISIONS);
+  answer(c2, "s3");
+  expect(results[1].error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);
+  const c3 = start();
+  for (let i = 0; i < RELAY_MAX_FENCED_REVISIONS; i++) invalidate(`s${i}`);
+  answer(c3, "s-new");
+  expect(results[2].ok).toBe(true);
+
+  // One distinct revision past the bound: the get is fenced as a whole and
+  // its markers are released.
+  const c4 = start();
+  for (let i = 0; i <= RELAY_MAX_FENCED_REVISIONS; i++) invalidate(`t${i}`);
+  expect(client.stats().fencedRevisions).toBe(0);
+  answer(c4, "t-new");
+  expect(results[3].error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);
+  expect(client.localEntry(tileRef("t-new"))?.revision).toBe("s-new");
 });

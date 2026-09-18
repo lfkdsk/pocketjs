@@ -121,6 +121,12 @@ export type RelayGetOutcome =
 
 // --- consumer ----------------------------------------------------------------
 
+/** §3.8 bounded invalidation markers: distinct concrete revisions one
+ * in-flight get records before the marker escalates to a fence over the
+ * whole get. A receiver-local guarantee, not a negotiated wire limit; the
+ * store holds at most maxPending × this many revision strings. */
+export const RELAY_MAX_FENCED_REVISIONS = 8;
+
 interface PendingGet {
   kind: "get";
   stream: number;
@@ -128,11 +134,14 @@ interface PendingGet {
   /** Local identity generation captured at request time; a response stamped
    * with an older generation is dropped after a key/namespace invalidation. */
   generation: number;
-  /** Concrete revisions invalidated while this get was in flight. The late
-   * response is dropped when it names one of them; a response for a newer
-   * revision may still publish. The array dies with the request, so it is
-   * bounded by maxPending in-flight requests. */
-  fencedRevisions?: string[];
+  /** Concrete revisions a revision-scope invalidate named while this get was
+   * in flight. The late response is dropped when it names one of them; a
+   * response for a newer revision may still publish. At most
+   * maxFencedRevisions distinct revisions are kept; one more sets fenceAll
+   * instead, so a marker is never dropped for lack of room (§3.8). */
+  fencedRevisions?: Set<string>;
+  /** Marker overflow: every response to this get is dropped as RESYNC_REQUIRED. */
+  fenceAll: boolean;
   /** Assembler reservation exists for this correlation. */
   reserved: boolean;
   complete: (result: ResourceResult<RelayGetOutcome>) => void;
@@ -182,14 +191,20 @@ export class RelayResourceClient {
    * still observe the moved generation. */
   private readonly generations = new Map<string, number>();
   private readonly assembler: RelayChunkAssembler;
+  private readonly maxFencedRevisions: number;
   private protocolErrors = 0;
 
   constructor(private readonly opts: {
     wire: RelayResourceWire;
     negotiated: RelayResourceNegotiated;
     assembler: RelayChunkAssembler;
+    /** Revision markers kept per in-flight get; default RELAY_MAX_FENCED_REVISIONS. */
+    maxFencedRevisions?: number;
   }) {
     this.assembler = opts.assembler;
+    const markers = opts.maxFencedRevisions ?? RELAY_MAX_FENCED_REVISIONS;
+    if (!Number.isInteger(markers) || markers < 1) throw new Error("maxFencedRevisions must be a positive integer");
+    this.maxFencedRevisions = markers;
   }
 
   /** resource.get. A conditional fetch with ifRevision may return
@@ -229,7 +244,7 @@ export class RelayResourceClient {
       return { ok: false, code: reservation.code };
     }
     this.pending.set(correlation, {
-      kind: "get", stream, ref, generation: this.generationFor(ref), reserved: true, complete,
+      kind: "get", stream, ref, generation: this.generationFor(ref), fenceAll: false, reserved: true, complete,
     });
     return { correlation };
   }
@@ -383,9 +398,7 @@ export class RelayResourceClient {
       // get of this key identity, including a revisionless "current version"
       // get: the fence is checked against the response's concrete revision,
       // not the request name.
-      if (ref!.revision !== undefined && !pending.fencedRevisions?.includes(ref!.revision)) {
-        (pending.fencedRevisions ??= []).push(ref!.revision);
-      }
+      if (ref!.revision !== undefined) this.fenceRevision(pending, ref!.revision);
     }
     for (const idKey of moved) {
       const next = (this.generations.get(idKey) ?? 0) + 1;
@@ -520,12 +533,31 @@ export class RelayResourceClient {
     pending.complete({ ok: true, value: { ref, codec, data, digest, value } });
   }
 
+  /** Record one revision-scope marker on an in-flight get. The store is
+   * bounded (§3.8): past maxFencedRevisions distinct revisions the get is
+   * fenced as a whole and its markers are released, so an invalidate is never
+   * dropped for lack of room and a burst costs one re-fetch, not a stale
+   * publication. A repeated revision is one marker. */
+  private fenceRevision(pending: PendingGet, revision: string): void {
+    if (pending.fenceAll) return;
+    const fenced = (pending.fencedRevisions ??= new Set());
+    if (fenced.has(revision)) return;
+    if (fenced.size >= this.maxFencedRevisions) {
+      pending.fenceAll = true;
+      pending.fencedRevisions = undefined;
+      return;
+    }
+    fenced.add(revision);
+  }
+
   /** Whether a late response must be dropped: a key/namespace invalidate moved
-   * the revision-free identity generation after the request was captured, or a
-   * revision-scope invalidate named the concrete revision the response carries. */
+   * the revision-free identity generation after the request was captured, a
+   * revision-scope invalidate named the concrete revision the response
+   * carries, or the marker store overflowed and the whole get is fenced. */
   private isFenced(pending: PendingGet, responseRef: RelayResourceRef): boolean {
+    if (pending.fenceAll) return true;
     if (this.generationFor(responseRef) !== pending.generation) return true;
-    return responseRef.revision !== undefined && !!pending.fencedRevisions?.includes(responseRef.revision);
+    return responseRef.revision !== undefined && !!pending.fencedRevisions?.has(responseRef.revision);
   }
 
   private handlePush(frame: RelayResourceIncomingFrame): void {
@@ -651,11 +683,15 @@ export class RelayResourceClient {
     }
   }
   stats() {
+    let fencedRevisions = 0;
+    for (const p of this.pending.values()) if (p.kind === "get") fencedRevisions += p.fencedRevisions?.size ?? 0;
     return {
       pending: this.pending.size,
       subscriptions: this.subscriptions.size,
       entries: this.entries.size,
       protocolErrors: this.protocolErrors,
+      /** Revision markers held across in-flight gets: at most pending × maxFencedRevisions. */
+      fencedRevisions,
     };
   }
 }
