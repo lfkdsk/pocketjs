@@ -165,7 +165,7 @@ export interface RelayFrameTape {
 const DEFAULT_MAX_FRAMES = 1_000_000;
 const SESSION_HEX = /^[0-9a-f]{16}$/;
 
-function readRecordHeader(frame: Uint8Array): { session: bigint; seq: number } {
+function readRecordHeader(frame: Uint8Array): { session: bigint; seq: number; stream: number } {
   if (frame.length < RELAY_HEADER.reserved.offset + 4) {
     throw new Error(`relay-tape: short record (${frame.length} bytes, header needs 48)`);
   }
@@ -185,7 +185,40 @@ function readRecordHeader(frame: Uint8Array): { session: bigint; seq: number } {
   return {
     session: dv.getBigUint64(RELAY_HEADER.session.offset, true),
     seq: dv.getUint32(RELAY_HEADER.seq.offset, true),
+    stream: dv.getUint32(RELAY_HEADER.stream.offset, true),
   };
+}
+
+/** The identity and order rules one tuple must satisfy, shared by
+ * verifyFrameTape and the replay transport so both reach the same verdict
+ * (review 1070 N3): the header session is the document session, the tuple
+ * seq is the header seq, and within one (direction, stream) seq increases
+ * in capture order (a session never reuses or rolls back a seq on the
+ * wire; a tape wrapped after READY starts above 1, so contiguity is not
+ * required). `last` is the per-(direction, stream) cursor the caller keeps. */
+function checkTupleRules(
+  header: { session: bigint; seq: number; stream: number },
+  direction: RelayFrameDirection,
+  seq: number,
+  tapeSession: string,
+  last: Map<string, number>,
+): { code: "record" | "order"; detail: string } | null {
+  if (header.session !== BigInt("0x" + tapeSession)) {
+    return {
+      code: "record",
+      detail: `frame session ${header.session.toString(16)} does not match tape session ${tapeSession}`,
+    };
+  }
+  if (header.seq !== seq) {
+    return { code: "record", detail: `tuple seq ${seq} does not match header seq ${header.seq}` };
+  }
+  const lane = `${direction}:${header.stream}`;
+  const prev = last.get(lane);
+  if (prev !== undefined && seq <= prev) {
+    return { code: "order", detail: `${direction} stream ${header.stream} seq ${seq} after seq ${prev}` };
+  }
+  last.set(lane, seq);
+  return null;
 }
 
 // --- recorder -----------------------------------------------------------------
@@ -414,7 +447,9 @@ export function parseFrameTape(text: string): RelayFrameTape {
 export type RelayFrameDivergenceCode =
   | "digest" // stored sha256 does not match the frame bytes
   | "direction" // send/recv happened where the tape expected the opposite
-  | "record" // frame bytes are not one complete PRLY record
+  | "record" // frame bytes are not one complete PRLY record of this session with the tuple's seq
+  | "order" // seq went backwards or repeated within one (direction, stream)
+  | "empty" // the tape carries no frames
   | "unexpected" // a frame was sent after the tape ran out
   | "incomplete" // replay ended with tape entries left
   | "tape-incomplete"; // the trace itself carries a record-loss marker
@@ -437,10 +472,11 @@ export interface RelayFrameTapeVerdict {
   divergence?: RelayFrameDivergence;
 }
 
-/** Check every tuple's record shape and sha256 in capture order. Returns
- * the first divergence (index + seq) — the --assert semantics. A trace that
- * carries a record-loss marker is not OK regardless of its stored prefix
- * (R5 §3.11: partial loss bars a deterministic verdict). */
+/** Check every tuple's record shape, identity, order and sha256 in capture
+ * order. Returns the first divergence (index + seq) — the --assert
+ * semantics. A trace that carries a record-loss marker is not OK regardless
+ * of its stored prefix (R5 §3.11: partial loss bars a deterministic
+ * verdict), and a tape with no frames is not a verdict either. */
 export function verifyFrameTape(tape: RelayFrameTape): RelayFrameTapeVerdict {
   if (tape.incomplete) {
     return {
@@ -455,6 +491,8 @@ export function verifyFrameTape(tape: RelayFrameTape): RelayFrameTapeVerdict {
       },
     };
   }
+  if (tape.frames.length === 0) return divergence(0, "out", 0, "empty", "tape carries no frames");
+  const last = new Map<string, number>();
   for (let i = 0; i < tape.frames.length; i++) {
     const [direction, seq, frameHex, digest] = tape.frames[i];
     let bytes: Uint8Array;
@@ -469,12 +507,8 @@ export function verifyFrameTape(tape: RelayFrameTape): RelayFrameTapeVerdict {
     } catch (e) {
       return divergence(i, direction, seq, "record", (e as Error).message);
     }
-    if (header.session !== BigInt("0x" + tape.session)) {
-      return divergence(
-        i, direction, seq, "record",
-        `frame session ${header.session.toString(16)} does not match tape session ${tape.session}`,
-      );
-    }
+    const rule = checkTupleRules(header, direction, seq, tape.session, last);
+    if (rule) return divergence(i, direction, seq, rule.code, rule.detail);
     const actual = sha256Hex(bytes);
     if (actual !== digest) {
       return divergence(i, direction, seq, "digest", `expected ${digest}, computed ${actual}`);
@@ -507,9 +541,11 @@ export interface RelayFrameReplay {
 }
 
 /** Build the fake transport a replayed session stack drives. Entry bytes
- * are verified lazily at the send/recv step that consumes them. A trace
- * carrying a record-loss marker is refused: R5 §3.11 says partial loss must
- * not manufacture a deterministic replay. */
+ * are verified lazily at the send/recv step that consumes them, under the
+ * same identity and order rules as verifyFrameTape. A trace carrying a
+ * record-loss marker, or no frames at all, is refused: R5 §3.11 says
+ * partial loss must not manufacture a deterministic replay, and an empty
+ * script verifies nothing. */
 export function createRelayFrameReplay(tape: RelayFrameTape): RelayFrameReplay {
   if (tape.incomplete) {
     throw new Error(
@@ -517,8 +553,10 @@ export function createRelayFrameReplay(tape: RelayFrameTape): RelayFrameReplay {
         + `(${tape.incomplete.index} recorded frame(s); ${tape.incomplete.reason})`,
     );
   }
+  if (tape.frames.length === 0) throw new Error("relay-tape: refusing to replay a tape with no frames");
   let i = 0;
   let first: RelayFrameDivergence | null = null;
+  const last = new Map<string, number>();
 
   function fail(code: RelayFrameDivergenceCode, detail: string): void {
     if (first) return;
@@ -545,10 +583,16 @@ export function createRelayFrameReplay(tape: RelayFrameTape): RelayFrameReplay {
       fail("record", (e as Error).message);
       return null;
     }
+    let header: ReturnType<typeof readRecordHeader>;
     try {
-      readRecordHeader(bytes);
+      header = readRecordHeader(bytes);
     } catch (e) {
       fail("record", (e as Error).message);
+      return null;
+    }
+    const rule = checkTupleRules(header, direction, seq, tape.session, last);
+    if (rule) {
+      fail(rule.code, rule.detail);
       return null;
     }
     if (frame !== undefined) {
