@@ -1316,3 +1316,83 @@ test("sender (§3.9 control wire): a normal frame of exactly 4096 wire bytes adm
   expect(only.bytes.length).toBe(cap);
   expect(only.frame.seq).toBe(1);
 });
+
+// ---------------------------------------------------------------------------
+// Review 1070 M4/M5: the read gate classifies an over-slot control, and a
+// stream-0 fatal stops delivery on both lanes
+// ---------------------------------------------------------------------------
+
+test("M4: an over-slot whitelisted control passes the read gate as fatal, so the transport reaches SESSION_FATAL instead of waiting", () => {
+  // Review 1070's OVERSIZED_SIDEBAND_GATE probe: a 466-byte credit was false
+  // at canIngestSideband before and after pumping, and only a forced ingest
+  // produced the fatal classification.
+  const rx = new RelayReceiver(SESSION, new Map([[0, controlSlice()], [1, { frames: 4, bytes: 4096 }]]), new RelayCreditTable());
+  const oversized = wireRecord(0, 1, 0, {
+    op: RELAY_OP.CREDIT, targetStream: 1, framesReleased: "0000000000000000",
+    bytesReleased: "0000000000000000", pad: "p".repeat(300),
+  }, RELAY_TYPE.PUSH);
+  const dec = decodeFrame(oversized);
+  if (!dec.ok) throw new Error(dec.code);
+  expect(isSidebandFrame(dec.frame)).toBe(true);
+  expect(oversized.length).toBeGreaterThan(RELAY_LIMITS.sidebandSlotBytes);
+  expect(rx.sidebandAdmission(oversized.length)).toBe("fatal");
+  expect(rx.canIngestSideband(oversized.length)).toBe(true);
+  rx.pumpSideband();
+  expect(rx.canIngestSideband(oversized.length)).toBe(true);
+  expect(rx.ingest(dec.frame, oversized.length)).toEqual({ ok: false, code: RELAY_P3_ERROR.SIDEBAND_FORBIDDEN });
+  expect(rx.ingestSideband(dec.frame, oversized.length)).toEqual({ ok: false, code: RELAY_P3_ERROR.SESSION_FATAL });
+  expect(rx.sessionFatal).toBe(true);
+  // The lane is closed once the session is dead: false for every size.
+  expect(rx.sidebandAdmission(64)).toBe("fatal");
+  expect(rx.canIngestSideband(64)).toBe(false);
+
+  // A live lane distinguishes "wait" (both slots held) from "stage".
+  const live = new RelayReceiver(SESSION, new Map([[0, controlSlice()]]), new RelayCreditTable());
+  const cancel = (seq: number) => {
+    const bytes = wireRecord(0, seq, 7, { op: RELAY_OP.REQUEST_CANCEL, targetStream: 1, reason: "x" }, RELAY_TYPE.CANCEL);
+    const d = decodeFrame(bytes);
+    if (!d.ok) throw new Error(d.code);
+    return { bytes, frame: d.frame };
+  };
+  const c1 = cancel(1), c2 = cancel(2), c3 = cancel(3);
+  expect(live.sidebandAdmission(c1.bytes.length)).toBe("stage");
+  expect(live.ingestSideband(c1.frame, c1.bytes.length).ok).toBe(true);
+  expect(live.ingestSideband(c2.frame, c2.bytes.length).ok).toBe(true);
+  expect(live.sidebandAdmission(c3.bytes.length)).toBe("wait");
+  expect(live.canIngestSideband(c3.bytes.length)).toBe(false);
+  expect(live.pumpSideband(1).length).toBe(1);
+  expect(live.sidebandAdmission(c3.bytes.length)).toBe("stage");
+  expect(live.canIngestSideband(c3.bytes.length)).toBe(true);
+  expect(live.ingestSideband(c3.frame, c3.bytes.length).ok).toBe(true);
+  expect(live.sessionFatal).toBe(false);
+});
+
+test("M5: after a stream-0 fatal nothing delivers from either lane and nothing ingests", () => {
+  // Review 1070's SIDEBAND_DELIVERY_AFTER_FATAL probe: a staged CANCEL was
+  // delivered after a stream-0 seq hole had ended the attachment.
+  const rx = new RelayReceiver(SESSION, new Map([[0, controlSlice()], [1, { frames: 4, bytes: 4096 }]]), new RelayCreditTable());
+  const cancel = wireRecord(0, 1, 7, { op: RELAY_OP.REQUEST_CANCEL, targetStream: 1, reason: "x" }, RELAY_TYPE.CANCEL);
+  const cancelDec = decodeFrame(cancel);
+  if (!cancelDec.ok) throw new Error(cancelDec.code);
+  expect(rx.ingestSideband(cancelDec.frame, cancel.length).ok).toBe(true);
+  const biz = wireRecord(1, 1, 1, GET_META);
+  const bizDec = decodeFrame(biz);
+  if (!bizDec.ok) throw new Error(bizDec.code);
+  expect(rx.ingest(bizDec.frame, biz.length).ok).toBe(true);
+  // A stream-0 seq hole ends the attachment.
+  const gap = wireRecord(0, 99, 1, { op: RELAY_OP.OPEN, stream: 1 });
+  const gapDec = decodeFrame(gap);
+  if (!gapDec.ok) throw new Error(gapDec.code);
+  expect(rx.ingest(gapDec.frame, gap.length)).toEqual({ ok: false, code: RELAY_P3_ERROR.SESSION_FATAL });
+  expect(rx.sessionFatal).toBe(true);
+  expect(rx.pumpSideband()).toEqual([]);
+  expect(rx.pump()).toEqual([]);
+  // Staged occupancy is unchanged (nothing was delivered or released) and a
+  // later business record is refused with the session verdict.
+  expect(rx.sidebandOccupancy().frames).toBe(1);
+  expect(rx.occupancyStream(1).frames).toBe(1);
+  const later = wireRecord(1, 2, 2, GET_META);
+  const laterDec = decodeFrame(later);
+  if (!laterDec.ok) throw new Error(laterDec.code);
+  expect(rx.ingest(laterDec.frame, later.length)).toEqual({ ok: false, code: RELAY_P3_ERROR.SESSION_FATAL });
+});
