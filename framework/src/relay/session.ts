@@ -1050,11 +1050,20 @@ export class RelaySession {
     const token = this.pingToken === 0 ? 1 : this.pingToken;
     const metadata = { op: RELAY_OP.PING, token };
     const correlation = this.allocateCorrelation();
+    // Publish the token BEFORE the send: a synchronous adapter delivers the
+    // matching pong nested inside emit(), and handlePing must find the
+    // token outstanding at that moment (Review 988 B-5). A send that was
+    // never admitted (BUSY, encode failure) rolls the slot back, the same
+    // way emit() rolls the seq back.
+    this.outstandingPing = token;
     const sent = this.emit({ type: RELAY_TYPE.REQUEST, stream: 0, correlation, metadata });
     if (sent.ok) {
-      this.outstandingPing = token;
+      // A nested pong may already have cleared the slot; leave it as is.
       this.statsValue.pingsSent++;
-    } else if (sent.code === "BUSY") {
+      return;
+    }
+    this.outstandingPing = undefined;
+    if (sent.code === "BUSY") {
       // The L0 queue had no room; retry the ping after retryMs instead of
       // burning the 2 s interval.
       this.retryTimer = this.scheduler.setTimeout(() => {

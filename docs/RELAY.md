@@ -200,7 +200,10 @@ The machine has six phases: `idle`, `hello-sent`, `hello-received`,
 6. REQUEST/RESPONSE `relay.ping` carries a u32 token echoed without clock
    interpretation. A ping is sent every 2 seconds with at most one
    outstanding; 15 seconds without an inbound frame ends the session; a
-   `busy` send retries after 1.5 seconds.
+   `busy` send retries after 1.5 seconds. **The outstanding token is
+   recorded before the ping frame enters `trySend`**, so a pong that a
+   synchronous adapter delivers inside the send matches it; a refused send
+   clears the slot again.
 
 **A reconnect or a guest realm reset is a new session: the machine discards
 the session id, negotiation, every stream binding, every seq counter and
