@@ -1184,3 +1184,107 @@ test("receive sideband (B-b): applyReset(0) discards staged lane records — not
   expect(rx.ingestSideband(c2.frame, c2.bytes.length).code).toBe(RELAY_P3_ERROR.SESSION_FATAL);
   expect(rx.sidebandOccupancy()).toEqual({ frames: 0, bytes: 0 });
 });
+
+// ---------------------------------------------------------------------------
+// Step 9 — §3.9 row audit: rows whose rule had no assertion (probes P-a/P-b/
+// P-e/P-n survived single-point mutation before these tests existed)
+// ---------------------------------------------------------------------------
+
+test("sender (§3.9 frame pump): with no configured budget one pump moves at most two normal frames", () => {
+  const sender = new RelaySender(SESSION, new RelaySideband(), {
+    windowFrames: ATTACH.frames, windowBytes: ATTACH.bytes, controlSlice: controlSlice(),
+    maxWireBytes: RELAY_LIMITS.controlMaxWireBytes,
+  });
+  expect(sender.openStream(1, { frames: 4, bytes: 4 * GET_WIRE }).ok).toBe(true);
+  for (const corr of [1, 2, 3]) {
+    expect(sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: corr, metadata: GET_META }).ok).toBe(true);
+  }
+  // "每guest逻辑帧普通submit≤2": the default budget is two, not the window.
+  const first = sender.pump();
+  expect(first.ok).toBe(true);
+  expect(first.frames.length).toBe(2);
+  expect(sender.queuedFrames(1)).toBe(1);
+  const second = sender.pump();
+  expect(second.frames.length).toBe(1);
+  expect(sender.queuedFrames(1)).toBe(0);
+});
+
+test("sender (§3.9 selection order): the sideband drains before normal work within one pump; stream-0 seq follows selection order", () => {
+  const ep = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 2 * GET_WIRE } }]);
+  // Normal work is admitted first: a management OPEN on stream 0 (control
+  // band) and a business GET on stream 1 (visible band)...
+  expect(ep.sender.admit({
+    type: RELAY_TYPE.REQUEST, stream: 0, correlation: 1,
+    priority: RELAY_PRIORITY.CONTROL, metadata: OPEN_META,
+  }).ok).toBe(true);
+  expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 2, metadata: GET_META }).ok).toBe(true);
+  // ...then a CANCEL is queued on the lane after both.
+  expect(ep.sender.cancel(1, 2, "user left").ok).toBe(true);
+  const out = pumpDecoded(ep).map((o) => ({ type: o.frame.type, stream: o.frame.stream, seq: o.frame.seq }));
+  // "primary先选择sideband再选择普通待送work，并在选定后分配stream0的seq".
+  expect(out).toEqual([
+    { type: RELAY_TYPE.CANCEL, stream: 0, seq: 1 },
+    { type: RELAY_TYPE.REQUEST, stream: 0, seq: 2 },
+    { type: RELAY_TYPE.REQUEST, stream: 1, seq: 1 },
+  ]);
+});
+
+test("sender (§3.9 reason clip): cancel() and sendReset() clip a long reason to 64 UTF-8 bytes without splitting a character", () => {
+  const ep = new Endpoint(SESSION, [{ stream: 1, slice: { frames: 2, bytes: 2 * GET_WIRE } }]);
+  const long = "é".repeat(100); // 200 UTF-8 bytes
+  expect(ep.sender.cancel(1, 7, long).ok).toBe(true);
+  expect(ep.sender.sendReset(1, long).ok).toBe(true);
+  const [cancel, reset] = pumpDecoded(ep);
+  expect(cancel.frame.type).toBe(RELAY_TYPE.CANCEL);
+  expect(reset.frame.metadata.op).toBe(RELAY_OP.RESET);
+  for (const { frame } of [cancel, reset]) {
+    const reason = frame.metadata.reason as string;
+    expect(new TextEncoder().encode(reason).length).toBe(RELAY_LIMITS.cancelReasonMaxBytes);
+    expect(reason).toBe("é".repeat(32)); // 32 two-byte characters fill the 64-byte cap exactly
+  }
+});
+
+test("beginSession (§3.9 credit row, a session change voids everything): lane staging, staged frames, seq state and window counters restart", () => {
+  const slice = { frames: 2, bytes: 2 * GET_WIRE };
+  const a = new Endpoint(SESSION, [{ stream: 1, slice }]);
+  const b = new Endpoint(SESSION, [{ stream: 1, slice }]);
+  // Session 1: a CANCEL sits in B's lane and a business frame in B's staging.
+  expect(a.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 1, metadata: GET_META }).ok).toBe(true);
+  expect(a.sender.cancel(1, 1, "x").ok).toBe(true);
+  const [side, biz] = pumpDecoded(a);
+  expect(side.frame.type).toBe(RELAY_TYPE.CANCEL);
+  expect(b.receiver.ingestSideband(side.frame, side.bytes.length).ok).toBe(true);
+  expect(b.receiver.ingest(biz.frame, biz.bytes.length).ok).toBe(true);
+  expect(b.receiver.sidebandOccupancy().frames).toBe(1);
+  expect(b.receiver.occupancyStream(1).frames).toBe(1);
+  expect(a.sender.ledgerView().inFlight(1)).toEqual({ frames: 1, bytes: GET_WIRE });
+
+  // Session 2 on both ends.
+  const NEXT = SESSION + 1n;
+  b.receiver.beginSession(NEXT, b.slices);
+  a.sender.beginSession(NEXT, [{ stream: 1, slice }]);
+  // Receive side: lane and staging are empty (occupancy read before the
+  // pumps, so a pump cannot be what empties them), nothing delivers, and
+  // the session is live again.
+  const lane = b.receiver.sidebandOccupancy();
+  const staged = b.receiver.occupancyStream(1);
+  expect(b.receiver.pumpSideband()).toEqual([]);
+  expect(b.receiver.pump()).toEqual([]);
+  expect(lane).toEqual({ frames: 0, bytes: 0 });
+  expect(staged).toEqual({ frames: 0, bytes: 0 });
+  expect(b.receiver.sessionFatal).toBe(false);
+  // Send side: the window is empty and session-1 credit is out of range.
+  expect(a.sender.ledgerView().inFlight(1)).toEqual({ frames: 0, bytes: 0 });
+  expect(a.sender.applyCredit({
+    targetStream: 1, framesReleased: "0000000000000001",
+    bytesReleased: GET_WIRE.toString(16).padStart(16, "0"),
+  }).code).toBe(RELAY_P3_ERROR.CREDIT_RANGE);
+  // A session-1 record is refused by the session-2 receiver; the first
+  // session-2 frame restarts stream-1 seq at 1 and ingests.
+  expect(b.receiver.ingest(biz.frame, biz.bytes.length).code).toBe(RELAY_P3_ERROR.SESSION_FATAL);
+  expect(a.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 1, metadata: GET_META }).ok).toBe(true);
+  const [fresh] = pumpDecoded(a);
+  expect(fresh.frame.session).toBe(NEXT);
+  expect(fresh.frame.seq).toBe(1);
+  expect(b.receiver.ingest(fresh.frame, fresh.bytes.length).ok).toBe(true);
+});
