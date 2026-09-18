@@ -1083,3 +1083,59 @@ test("M12 teeth: notModified must be final and name a concrete revision", () => 
   expect(results2.length).toBe(0);
   expect(client.stats().protocolErrors).toBe(2);
 });
+
+// ---------------------------------------------------------------------------
+// P4f: review 989 follow-ups (G1 single generation counter, G2 bounded
+// revision markers, G3 subscribe withdrawal) and its mutation killers
+// ---------------------------------------------------------------------------
+
+test("G1: the identity generation is one monotonic counter moved once per invalidate", () => {
+  const { client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  const results: Record<string, { ok: boolean; error?: { code: string } }> = {};
+  const answer = (correlation: number, revision: string) => {
+    for (const f of auth.chunkObject({
+      type: RELAY_TYPE.RESPONSE, stream: 1, correlation,
+      ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
+    })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  };
+  const getFor = (name: string) => {
+    const out = client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+      (r) => { results[name] = r as { ok: boolean; error?: { code: string } }; });
+    if (!("correlation" in out)) throw new Error("budget");
+    return out.correlation;
+  };
+  const invalidateKey = () =>
+    feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
+
+  answer(getFor("g0"), "r1");
+  const gens: number[] = [client.localEntry(tileRef("r1"))!.generation];
+  // Two concurrent gets for the identity, then one key-scope invalidate: the
+  // counter moves once, not once per matching in-flight get.
+  const c1 = getFor("g1");
+  const c2 = getFor("g2");
+  invalidateKey();
+  gens.push(client.localEntry(tileRef("r1"))!.generation);
+  answer(c1, "r1");
+  answer(c2, "r1");
+  expect(results.g1.error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);
+  expect(results.g2.error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);
+  // A get captured after the first invalidate, then a second invalidate.
+  const c3 = getFor("g3");
+  invalidateKey();
+  gens.push(client.localEntry(tileRef("r1"))!.generation);
+  answer(c3, "r1");
+  expect(gens).toEqual([0, 1, 2]);
+  // The late r1 response is fenced and the invalidated entry stays stale;
+  // review 989 G1 published it as fresh because the entries loop wrote
+  // entry.generation + 1 over a counter the pending loop had pushed higher.
+  expect(results.g3.ok).toBe(false);
+  expect(results.g3.error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);
+  expect(client.localEntry(tileRef("r1"))!.stale).toBe(true);
+  // A get captured after the last invalidate lands, and the entry it stores
+  // carries the same counter the fence compared: one counter, no drift.
+  const c4 = getFor("g4");
+  answer(c4, "r2");
+  expect(results.g4.ok).toBe(true);
+  expect(client.localEntry(tileRef("r2"))).toMatchObject({ revision: "r2", generation: 2, stale: false });
+});
