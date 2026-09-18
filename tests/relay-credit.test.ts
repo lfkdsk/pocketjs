@@ -1092,3 +1092,60 @@ test("mutation probe: removing the +1 frame check in charge() lets a third frame
     rmSync(mutatedPath, { force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Step 8 — review 985 blockers: killing tests for lane mutants S9 and S7
+// ---------------------------------------------------------------------------
+
+/** A relay.reset record padded so the whole wire record (4-byte length
+ * prefix + 44-byte header + metadata) is exactly `wireBytes` long. Every
+ * reason character is one ASCII byte, so the pad is exact; the frame layer
+ * does not enforce the 64-byte reason limit, so this models a peer that
+ * skipped the clip. */
+function resetRecordOf(seq: number, wireBytes: number): { bytes: Uint8Array; frame: RelayDecodedFrame } {
+  const probe = wireRecord(0, seq, 0, { op: RELAY_OP.RESET, targetStream: 1, reason: "x" }, RELAY_TYPE.PUSH);
+  const bytes = wireRecord(0, seq, 0, {
+    op: RELAY_OP.RESET, targetStream: 1, reason: "x".repeat(1 + wireBytes - probe.length),
+  }, RELAY_TYPE.PUSH);
+  expect(bytes.length).toBe(wireBytes);
+  const dec = decodeFrame(bytes, { maxWireBytes: RELAY_LIMITS.controlMaxWireBytes });
+  if (!dec.ok) throw new Error(dec.code);
+  expect(isSidebandFrame(dec.frame)).toBe(true);
+  return { bytes, frame: dec.frame };
+}
+
+test("receive sideband (B-a): a slot is 256 bytes and the lane 512 — two 256-byte records fill it, one byte over a slot is a stream-0 protocol error", () => {
+  const slotBytes = RELAY_LIMITS.sidebandSlotBytes;
+  const laneBytes = RELAY_LIMITS.sidebandSlots * slotBytes;
+  expect(slotBytes).toBe(256);
+  expect(laneBytes).toBe(512);
+  const creditTable = new RelayCreditTable();
+  const rx = new RelayReceiver(
+    SESSION, new Map([[0, controlSlice()], [1, { frames: 2, bytes: 2 * GET_WIRE }]]), creditTable,
+  );
+
+  // Two records of exactly one slot each fill the lane to the byte.
+  const r1 = resetRecordOf(1, slotBytes);
+  const r2 = resetRecordOf(2, slotBytes);
+  expect(rx.canIngestSideband(r1.bytes.length)).toBe(true);
+  expect(rx.ingestSideband(r1.frame, r1.bytes.length).ok).toBe(true);
+  expect(rx.canIngestSideband(r2.bytes.length)).toBe(true);
+  expect(rx.ingestSideband(r2.frame, r2.bytes.length).ok).toBe(true);
+  expect(rx.sidebandOccupancy()).toEqual({ frames: 2, bytes: laneBytes });
+  expect(rx.sessionFatal).toBe(false);
+  // Taking both frees all 512 bytes with no credit row (§3.9: the lane
+  // earns no credit).
+  expect(rx.pumpSideband().map((r) => r.wireBytes)).toEqual([slotBytes, slotBytes]);
+  expect(rx.sidebandOccupancy()).toEqual({ frames: 0, bytes: 0 });
+  expect(creditTable.counters(0)).toBeUndefined();
+
+  // One byte over a slot never fits, even with the lane empty: the peer
+  // broke the reservation, so the receiver ends the session (§3.9: excess
+  // is a protocol error). This is the receive-side twin of SIDEBAND_LARGE.
+  const big = resetRecordOf(3, slotBytes + 1);
+  const refused = rx.ingestSideband(big.frame, big.bytes.length);
+  expect(refused.ok).toBe(false);
+  expect(refused.code).toBe(RELAY_P3_ERROR.SESSION_FATAL);
+  expect(rx.sessionFatal).toBe(true);
+  expect(rx.sidebandOccupancy()).toEqual({ frames: 0, bytes: 0 });
+});
