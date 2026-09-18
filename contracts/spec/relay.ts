@@ -979,6 +979,11 @@ export interface RelayConstantsSnapshot {
   ops: typeof RELAY_OP;
   codecs: typeof RELAY_CODEC;
   kinds: typeof RELAY_KIND;
+  /** L2 string enums: subscribe delivery modes, invalidate scopes and
+   * cache.evict reasons (review 1070 N2). */
+  delivery: typeof RELAY_DELIVERY;
+  invalidateScope: typeof RELAY_INVALIDATE_SCOPE;
+  evictReason: typeof RELAY_EVICT_REASON;
   resource: typeof RELAY_RESOURCE;
   handshake: typeof RELAY_HANDSHAKE;
   limits: typeof RELAY_LIMITS;
@@ -1002,6 +1007,9 @@ export function relayConstantsSnapshot(): RelayConstantsSnapshot {
     ops: RELAY_OP,
     codecs: RELAY_CODEC,
     kinds: RELAY_KIND,
+    delivery: RELAY_DELIVERY,
+    invalidateScope: RELAY_INVALIDATE_SCOPE,
+    evictReason: RELAY_EVICT_REASON,
     resource: RELAY_RESOURCE,
     handshake: RELAY_HANDSHAKE,
     limits: RELAY_LIMITS,

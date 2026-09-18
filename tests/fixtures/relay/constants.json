@@ -166,6 +166,19 @@
     "FILE": 7,
     "EVENT": 8
   },
+  "delivery": {
+    "RELIABLE_DELTA": "reliable-delta",
+    "LATEST_SNAPSHOT": "latest-snapshot"
+  },
+  "invalidateScope": {
+    "REVISION": "revision",
+    "KEY": "key",
+    "NAMESPACE": "namespace"
+  },
+  "evictReason": {
+    "BUDGET": "budget",
+    "VIEW_CLOSE": "view-close"
+  },
   "resource": {
     "nsMaxBytes": 128,
     "keyMaxBytes": 256,

@@ -1,6 +1,14 @@
 import { expect, test } from "bun:test";
 import { decodeFrame, encodeFrame, encodePreparedFrame, prepareFrameBody, RelayRecordDecoder } from "../framework/src/relay/frame.ts";
-import { RELAY_FRAME, RELAY_FRAME_ERROR, RELAY_HEADER } from "../contracts/spec/relay.ts";
+import {
+  RELAY_DELIVERY,
+  RELAY_EVICT_REASON,
+  RELAY_FRAME,
+  RELAY_FRAME_ERROR,
+  RELAY_HEADER,
+  RELAY_INVALIDATE_SCOPE,
+  relayConstantsSnapshot,
+} from "../contracts/spec/relay.ts";
 
 const FIX = new URL("./fixtures/relay/", import.meta.url);
 const indexJson = await Bun.file(new URL("index.json", FIX)).json() as { vectors: string[] };
@@ -259,4 +267,17 @@ test("benchmark: encode + decode 10,000 small frames", () => {
   const ms = performance.now() - start;
   console.log(`relay encode+decode 10000 frames: ${ms.toFixed(1)} ms (${(ms / 10_000 * 1000).toFixed(2)} µs/frame)`);
   expect(ms).toBeLessThan(5000);
+});
+
+// Review 1070 N2: the L2 string enums are part of the cross-language
+// snapshot, so tests/contract.ts detects drift in them like any other family.
+test("the constants snapshot carries the L2 delivery, invalidate-scope and evict-reason enums", async () => {
+  const snapshot = relayConstantsSnapshot();
+  expect(snapshot.delivery).toEqual(RELAY_DELIVERY);
+  expect(snapshot.invalidateScope).toEqual(RELAY_INVALIDATE_SCOPE);
+  expect(snapshot.evictReason).toEqual(RELAY_EVICT_REASON);
+  const committed = await Bun.file(new URL("constants.json", FIX)).json() as Record<string, unknown>;
+  expect(committed.delivery).toEqual(RELAY_DELIVERY);
+  expect(committed.invalidateScope).toEqual(RELAY_INVALIDATE_SCOPE);
+  expect(committed.evictReason).toEqual(RELAY_EVICT_REASON);
 });
