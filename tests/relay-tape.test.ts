@@ -442,6 +442,49 @@ test("HELLO->assigned-session boundary: every frame delivered, trace marked inco
   expect(rec.framesRecorded).toBe(2);
 });
 
+test("the bootstrap boundary is the session-pin rule, not the frame cap; wrapping after READY records a complete tape", async () => {
+  // Review 986: docs/RELAY.md called this boundary the "cap rule";
+  // maxFrames plays no part in it. Three recorders over the same script.
+  const hello = await loadBin("hello");              // session 0, seq 1
+  const helloResp = await loadBin("hello-response"); // session 0
+  const ping = await loadBin("ping");                // assigned session 0102030405060708
+  const credit = await loadBin("credit");
+  const assigned = 0x0102030405060708n;
+  const scripted = (inbox: Uint8Array[]) => {
+    const queue = [...inbox];
+    return { send: () => {}, recv: () => queue.shift() ?? null };
+  };
+
+  // Unpinned, wrapped from HELLO, cap far above the frame count: the first
+  // recorded frame (HELLO) pins session 0 and the marker names the pin rule.
+  const t1 = recording(scripted([helloResp, credit]), { maxFrames: 1000 });
+  t1.send(hello); t1.recv(); t1.send(ping); t1.recv();
+  expect(t1.relayRecorder.toTape().session).toBe("0000000000000000");
+  expect(t1.relayRecorder.incomplete?.index).toBe(2);
+  expect(t1.relayRecorder.incomplete?.reason).toMatch(/does not match tape session/);
+  expect(t1.relayRecorder.incomplete?.reason).not.toMatch(/frame cap/);
+
+  // Pinned to the assigned session but wrapped from HELLO: HELLO is the
+  // loss at index 0 and the trace has no serializable tape.
+  const t2 = recording(scripted([helloResp, credit]), { session: assigned });
+  t2.send(hello); t2.recv(); t2.send(ping); t2.recv();
+  expect(t2.relayRecorder.framesRecorded).toBe(0);
+  expect(t2.relayRecorder.incomplete?.index).toBe(0);
+  expect(t2.relayRecorder.incomplete?.reason).toMatch(/does not match tape session/);
+  expect(() => t2.relayRecorder.toTape()).toThrow(/before any valid record/);
+
+  // Wrapped after READY (the bootstrap frames do not pass the wrapper) and
+  // pinned to the assigned session: a complete post-bootstrap tape.
+  const t3 = recording(scripted([credit]), { session: assigned });
+  t3.send(ping); t3.recv();
+  const tape = t3.relayRecorder.toTape();
+  expect(tape.session).toBe("0102030405060708");
+  expect(tape.incomplete).toBeUndefined();
+  expect(tape.frames.map((e) => e[0])).toEqual(["out", "in"]);
+  expect(verifyFrameTape(tape).ok).toBe(true);
+  expect(() => createRelayFrameReplay(tape)).not.toThrow();
+});
+
 test("a seq-0 frame is delivered on the wire and latches incomplete instead of throwing", async () => {
   const zeroSeq = await loadBin("seq-zero"); // complete PRLY record, same session, seq 0
   const sent: Uint8Array[] = [];
