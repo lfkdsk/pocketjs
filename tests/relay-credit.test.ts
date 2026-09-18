@@ -1310,7 +1310,7 @@ test("sender (§3.9 control wire): a normal frame of exactly 4096 wire bytes adm
   expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 1, metadata: getOf(cap) }).ok).toBe(true);
   const over = ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 2, metadata: getOf(cap + 1) });
   expect(over.ok).toBe(false);
-  expect(over.code).toBe(RELAY_FRAME_ERROR.WIRE_TOO_LARGE);
+  expect(over.code as string).toBe(RELAY_FRAME_ERROR.WIRE_TOO_LARGE); // admit() forwards the frame-layer code
   expect(ep.sender.queuedFrames(1)).toBe(1);
   const [only] = pumpDecoded(ep);
   expect(only.bytes.length).toBe(cap);
