@@ -159,6 +159,9 @@ RelayFrameStatus relay_frame_decode(const unsigned char *record, size_t length,
   bool correlation_required = type == RELAY_TYPE_REQUEST || type == RELAY_TYPE_RESPONSE
                               || type == RELAY_TYPE_CANCEL;
   if (correlation_required ? correlation == 0 : correlation != 0) return RELAY_FRAME_BAD_CORRELATION;
+  /* §3.6: a CANCEL rides the control stream; the request it aborts is named
+   * by metadata.targetStream, so the header field decides this here. */
+  if (type == RELAY_TYPE_CANCEL && stream != 0) return RELAY_FRAME_BAD_CORRELATION;
 
   const unsigned char *metadata = record + RELAY_FRAME_HEADER_BYTES;
   if (!relay_utf8_ok(metadata, (uint32_t)meta_bytes)) return RELAY_FRAME_BAD_METADATA;

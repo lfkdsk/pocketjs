@@ -446,14 +446,15 @@ Two distinct operations use the INVALIDATE frame type:
 ## C frame layer
 
 `hosts/shared/relay_frame.h` and `relay_frame.c` decode the fixed header on a
-C host. **The C layer checks the header fields, the length identity, the
-negotiated `maxWireBytes`/`maxMetaBytes`/codec set, and UTF-8 over the
-metadata region; it does not parse JSON.** Metadata reaches the caller as a
+C host. **The C layer checks the header fields, the §3.6 CANCEL stream rule
+(header stream 0), the length identity, the negotiated
+`maxWireBytes`/`maxMetaBytes`/codec set, and UTF-8 over the metadata region;
+it does not parse JSON.** Metadata reaches the caller as a
 pointer into the caller's record, so JSON structure and semantics (root
 object, duplicate keys, number grammar, surrogate escapes) and the envelope
-rules (`BAD_ENVELOPE`) are decided by the layer above. Of the 46 shared vectors the C layer decides 41 with the
-same code as the TypeScript codec and hands the other 5 through as well
-formed frames.
+rules (`BAD_ENVELOPE`) are decided by the layer above. Of the 48 shared
+vectors the C layer decides 43 with the same code as the TypeScript codec and
+hands the other 5 through as well formed frames.
 
 Declared lengths widen to `uint64_t` before they are summed or compared, so a
 `frameBytes` near the top of u32 cannot wrap past a check, and the limit test

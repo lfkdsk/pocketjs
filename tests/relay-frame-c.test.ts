@@ -167,7 +167,7 @@ test("the C frame layer rejects every illegal vector with its fixed code", () =>
     expect((result as { code: string }).code, name).toBe(spec.errorCode!);
     rejected++;
   }
-  expect(rejected).toBe(18);
+  expect(rejected).toBe(20);
   expect(deferred).toBe(UPPER_LAYER_ONLY.size);
 }, 120_000);
 
@@ -288,6 +288,13 @@ const MUTATIONS: { check: string; vector: string; find: string; replace: string 
   { check: "metadata UTF-8", vector: "meta-not-utf8",
     find: "if (!relay_utf8_ok(metadata, (uint32_t)meta_bytes))",
     replace: "if (!relay_utf8_ok(metadata, 0))" },
+  // Scanning past the region makes the cut lead byte and the first data byte
+  // one well-formed sequence; the check must stop at metaBytes.
+  { check: "metadata UTF-8 span", vector: "meta-utf8-cut-at-data",
+    find: "if (!relay_utf8_ok(metadata, (uint32_t)meta_bytes))",
+    replace: "if (!relay_utf8_ok(metadata, (uint32_t)(length - RELAY_FRAME_HEADER_BYTES)))" },
+  { check: "CANCEL stream", vector: "cancel-nonzero-stream", replace: "",
+    find: "  if (type == RELAY_TYPE_CANCEL && stream != 0) return RELAY_FRAME_BAD_CORRELATION;\n" },
 ];
 
 test("removing any one check turns its vector red", () => {
