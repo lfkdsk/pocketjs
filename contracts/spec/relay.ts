@@ -513,7 +513,11 @@ export const RELAY_METADATA_SCHEMAS: Readonly<Record<string, JsonSchema>> = Obje
   [`${RELAY_OP.HELLO}.response`]: {
     type: "object",
     additionalProperties: false,
-    required: ["op", "status", "final", "bootNonce", "peerNonce", "session", "selected", "profiles", "grants", "rxLimits"],
+    // `kinds` is required: the §3.2 field table selects it by mutual
+    // intersection, so a response without it cannot confirm any set and the
+    // guest would fall back to its own offer (Review 988 B-4). `codecs` stays
+    // optional because its fallback is codec 0 alone, which never over-claims.
+    required: ["op", "status", "final", "bootNonce", "peerNonce", "session", "selected", "profiles", "kinds", "grants", "rxLimits"],
     properties: {
       op: { const: RELAY_OP.HELLO },
       status: { const: RELAY_STATUS.OK },
