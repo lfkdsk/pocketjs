@@ -639,6 +639,9 @@ export function relayModuleLines(): string[] {
   enumModule("op", relay.ops as Record<string, unknown>, "&str");
   enumModule("codec", relay.codecs as Record<string, unknown>, "u16");
   enumModule("kind", relay.kinds as Record<string, unknown>, "u8");
+  enumModule("delivery", relay.delivery as Record<string, unknown>, "&str");
+  enumModule("invalidate_scope", relay.invalidateScope as Record<string, unknown>, "&str");
+  enumModule("evict_reason", relay.evictReason as Record<string, unknown>, "&str");
   boundsModule("resource", relay.resource as Record<string, unknown>);
   boundsModule("handshake", relay.handshake as Record<string, unknown>);
   boundsModule("limits", relay.limits as Record<string, unknown>);

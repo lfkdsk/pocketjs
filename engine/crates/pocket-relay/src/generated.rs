@@ -151,6 +151,19 @@ pub mod relay {
         pub const FILE: u8 = 7;
         pub const EVENT: u8 = 8;
     }
+    pub mod delivery {
+        pub const RELIABLE_DELTA: &str = "reliable-delta";
+        pub const LATEST_SNAPSHOT: &str = "latest-snapshot";
+    }
+    pub mod invalidate_scope {
+        pub const REVISION: &str = "revision";
+        pub const KEY: &str = "key";
+        pub const NAMESPACE: &str = "namespace";
+    }
+    pub mod evict_reason {
+        pub const BUDGET: &str = "budget";
+        pub const VIEW_CLOSE: &str = "view-close";
+    }
     pub mod resource {
         pub const NS_MAX_BYTES: u32 = 128;
         pub const KEY_MAX_BYTES: u32 = 256;
