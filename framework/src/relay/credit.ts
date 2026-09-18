@@ -908,14 +908,30 @@ export class RelayReceiver {
     return { frames: this.sideHeld.length, bytes: this.sideBytes };
   }
 
-  /** True while one more whitelisted record of wireBytes fits the reserved
-   * lane (two 256-byte slots). Independent of the normal stream-0 slice:
-   * the lane stays readable while both normal control slots are held. */
+  /** Classifies the next whitelisted record of wireBytes for the transport
+   * (review 1070 M4). "stage": it fits the lane now. "wait": both reserved
+   * slots are held; stop reading until pumpSideband() frees one. "fatal":
+   * no wait can help, because the record is over the 256-byte slot or
+   * stream 0 is dead; ingestSideband() answers SESSION_FATAL for it, which
+   * is how the transport reaches the teardown decision. */
+  sidebandAdmission(wireBytes: number): "stage" | "wait" | "fatal" {
+    if (this.sessionFatal || wireBytes > this.sideSlotBytes) return "fatal";
+    if (this.sideHeld.length >= this.sideSlots
+      || this.sideBytes + wireBytes > this.sideSlots * this.sideSlotBytes) {
+      return "wait";
+    }
+    return "stage";
+  }
+
+  /** True when the transport reads the next whitelisted record now: it fits
+   * the reserved lane (two 256-byte slots), or it can never fit and
+   * ingestSideband() ends the session with it. False only while both slots
+   * are held (backpressure) or after a stream-0 fatal closed the lane.
+   * Independent of the normal stream-0 slice: the lane stays readable while
+   * both normal control slots are held. */
   canIngestSideband(wireBytes: number): boolean {
     if (this.sessionFatal) return false;
-    return this.sideHeld.length < this.sideSlots
-      && wireBytes <= this.sideSlotBytes
-      && this.sideBytes + wireBytes <= this.sideSlots * this.sideSlotBytes;
+    return this.sidebandAdmission(wireBytes) !== "wait";
   }
 
   /** Ingests one decoded record classified by isSidebandFrame(). The
@@ -957,7 +973,8 @@ export class RelayReceiver {
     recordLength: number,
     association?: { kind: "correlation" | "subscription"; id: number },
   ): P3Result<{ late: boolean }> {
-    if (frame.session !== this.session) return { ok: false, code: RELAY_P3_ERROR.SESSION_FATAL };
+    // A stream-0 violation ends the attachment: nothing ingests afterwards.
+    if (frame.session !== this.session || this.sessionFatal) return { ok: false, code: RELAY_P3_ERROR.SESSION_FATAL };
     const { stream, seq } = frame;
     if (stream > this.maxStreams || !this.allocations.has(stream)) {
       return { ok: false, code: RELAY_P3_ERROR.STREAM_LIMIT };
@@ -1021,6 +1038,9 @@ export class RelayReceiver {
    * stream's whole backlog in one turn. */
   pump(): RelayReceived[] {
     const out: RelayReceived[] = [];
+    // After a stream-0 fatal the attachment cannot continue: staged frames
+    // are not delivered (review 1070 M5).
+    if (this.sessionFatal) return out;
     const streams = [...this.held.entries()]
       .filter(([, q]) => q.length > 0)
       .map(([stream]) => stream)
@@ -1049,8 +1069,9 @@ export class RelayReceiver {
    * dispatch CANCEL). The caller processes every returned frame; the lane
    * budget is the worker-turn bound (§3.9: at most two per turn). */
   pumpSideband(maxFrames = this.sideSlots): RelayReceived[] {
-    const n = Math.min(maxFrames, this.sideHeld.length);
     const out: RelayReceived[] = [];
+    if (this.sessionFatal) return out;
+    const n = Math.min(maxFrames, this.sideHeld.length);
     for (let i = 0; i < n; i++) {
       const held = this.sideHeld.shift()!;
       this.sideBytes -= held.wireBytes;
