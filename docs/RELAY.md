@@ -217,18 +217,25 @@ where it was. On receive, seq must be exactly previous+1 per
 `(session, stream)`; a gap or duplicate on stream 0 ends the session, and on
 a business stream invokes the `onStreamError` resync hook.
 
-Resource delivery is not in this layer. `sendBusiness` is the single
-admission point P3/P4 extend with queue and credit checks; inbound
-non-control frames go to `onBusinessFrame`, `relay.credit` and `relay.reset`
-PUSH frames go to `onCredit`/`onReset` hooks, and OPEN authorization is an
-`authorizeOpen` hook returning an error code or null.
+Resource delivery is not in this layer. The composed endpoint
+(`RelayEndpoint`, below) takes every post-bootstrap control frame through
+the `admitControl` hook, business frames with their wire length through
+`onBusinessFrame`, consumed stream-0 records through `onControlFrame`,
+`relay.credit`, `relay.reset` and CANCEL through `onCredit`/`onReset`/
+`onCancel`, stream bindings through `onStreamOpened`, and OPEN
+authorization through `authorizeOpen`. `sendBusiness` is the bare P2 path;
+a machine with `admitControl` set refuses it with `COMPOSED`.
 
-`tools/relay-wire.ts` binds the machine to a byte channel:
-`attachRelayProvider` (one connection), `attachRelayChannel` (guest side),
-`relaySocketChannel` (node `net`), and `serveRelayTcp`, which takes an
-`authenticate(socket)` callback returning the peer grants. Records are
-reassembled by `RelayRecordDecoder` before they reach the machine, and a
-record over the advertised bound destroys the connection without allocating.
+`tools/relay-wire.ts` binds a composed endpoint to a byte channel:
+`attachRelayProvider` (one connection; constructs the provider endpoint and
+exposes it as `connection.endpoint`), `attachRelayChannel` (guest side;
+takes an endpoint or a bare session), `relaySocketChannel` (node `net`,
+with `onDrain` so a busy channel resumes the outbox), and `serveRelayTcp`,
+which takes an `authenticate(socket)` callback returning the peer grants
+and per-connection hooks. Records are reassembled by `RelayRecordDecoder`
+before they reach the endpoint, a record over the advertised bound
+destroys the connection without allocating, and a protocol teardown
+destroys the socket.
 
 **`RelayByteChannel.send` is an admission decision: it returns `false` only
 when the frame was not taken.** A node `socket.write()` that returns `false`
@@ -270,7 +277,11 @@ leave the sender FIFO; a frame never reorders inside its stream.
   CANCEL only. The send side admits and drains them through `RelaySideband`;
   the receive side classifies a decoded record with `isSidebandFrame()`,
   gates reads on `canIngestSideband()`, stages it in its own two-slot lane,
-  and delivers it through `pumpSideband()`. Sideband frames take stream-0
+  and delivers it through `pumpSideband()`. `sidebandAdmission()` answers
+  `stage`, `wait` (both slots held: stop reading) or `fatal` (over the
+  256-byte slot, or stream 0 dead); the boolean gate is false for `wait`
+  and for a dead session only, so an over-slot record is read and
+  `ingestSideband()` ends the session with it. Sideband frames take stream-0
   seq from the same per-stream counter as ordinary stream-0 management
   frames, so dropping or filtering one opens a fatal seq hole; they consume
   no normal window and earn no credit, so taking one from the sideband pump
@@ -279,9 +290,14 @@ leave the sender FIFO; a frame never reorders inside its stream.
   routed through the normal receive path returns `SIDEBAND_FORBIDDEN`; a
   record the receiver cannot fit in the two reserved slots, or one over
   256 bytes, is a stream-0 protocol error, since the adapter must hold
-  every granted sideband record. Sideband frames are selected before normal
-  work on send. Outbound releases merge into at most nine credit rows
-  (stream 0 plus eight nonzero streams).
+  every granted sideband record, and after a stream-0 fatal neither lane
+  delivers and nothing ingests. The two lanes deliver independently: a
+  staged control leaves the sideband pump while an older normal stream-0
+  frame is staged (the lane exists to pass a stalled normal lane); the
+  composed endpoint dispatches stream 0 in arrival order without the
+  receiver's lanes. Sideband frames are selected before normal work on
+  send. Outbound releases merge into at most nine credit rows (stream 0
+  plus eight nonzero streams).
 - **Credit returns at one point:** after the receiver consumes a staged
   frame or moves it into a reserved assembler/result mailbox. Reading a
   frame or parsing its header returns no credit. `relay.credit` carries
@@ -291,7 +307,8 @@ leave the sender FIFO; a frame never reorders inside its stream.
 - **Receive seq is contiguous per stream starting at 1.** A hole or repeat
   stops that stream (`SEQ_GAP`) until resync; a seq error on stream 0 ends
   the session. A receiver reset discards staging and delivered-unreleased
-  frames, returns their credit, and the stream id can never be reopened.
+  frames and returns their credit; the stream id can never be reopened, and
+  the stream's window slice returns to the attachment for a later OPEN.
 - **CANCEL rides stream 0** with `op:"request.cancel"`, the original
   request correlation, and `targetStream`. The provider emits exactly one
   terminal response on the original stream: if the result was in flight
@@ -307,6 +324,80 @@ leave the sender FIFO; a frame never reorders inside its stream.
 - **`relay.reset`** fails every request and subscription on the target
   stream, queues and seq state clear, and later work requires a new stream
   id. In-flight frames settle through credit accounting.
+
+## Composed endpoint
+
+`framework/src/relay/endpoint.ts` (`RelayEndpoint`) runs the three layers as
+one object over one transport, for both roles. `tools/relay-wire.ts`
+constructs a provider endpoint per connection; a device host constructs a
+guest endpoint over its byte channel. **The session, the P3 sender and
+receiver, the request table and the L2 client or authority are built when
+the session is pinned and dropped when it ends; a reconnect starts a fresh
+set with seq, credit and correlation at their initial values.**
+
+Send path: the L2 client's request, advisory and cancel calls, the
+authority's terminals, chunks, pushes and invalidations, and the session's
+own control frames after the bootstrap (READY, OPEN, PING and pong) enter
+`RelaySender.admit` (READY and OPEN as ordinary stream-0 work in the control
+band, ping and pong on the sideband). `flush()` pumps the sender until the
+window or the queues are empty; frames stamped with a seq that a busy
+transport did not take wait in one ordered outbox, whose size is one pump
+batch plus the bootstrap frame, and leave in order when the channel drains.
+HELLO and its response ride session 0 from the session to the outbox
+without a sender queue and consume no window.
+
+Receive path: `RelaySession.handleRecord` decodes, pins the session and
+checks the per-stream seq; a business frame on an opened stream goes to
+`RelayReceiver.ingest` (window occupancy, the association for late drops),
+`pumpReceive()` delivers staged frames one receiver pump at a time to the
+client or authority, and the delivered frame is released, which is where
+its wire credit returns; the sender's next pump carries the cumulative
+`relay.credit` on the sideband. A stream-0 record the session consumed
+itself (READY, OPEN and their responses) returns its control-slice credit
+the same way; sideband records earn none. A frame past the granted window
+(`WINDOW_OVERFLOW`), a `relay.credit` out of range or a dead send pump
+closes the session; a seq hole on a business stream resets that stream on
+both ends.
+
+**Window slices are computed by the same rule on both ends.** Stream 0
+takes a quarter of the negotiated attachment window, capped by the §3.9
+control proposal. A newly opened stream takes the OPEN response's
+`windowFrames`/`windowBytes`, capped by what the attachment has left after
+stream 0 and the live streams opened before it; both ends see the same
+OPEN responses and resets in the same order. A reset stream returns its
+slice: its id never reopens, the receiver holds none of its frames, and a
+later OPEN takes the capacity.
+
+**Demand is bounded by admitted work.** A guest request the window cannot
+admit is refused `BUSY` before any frame leaves and the request slot
+returns; the caller keeps the demand. The provider's prepared envelopes
+wait in a per-stream FIFO until credit admits them; every entry belongs to
+one accepted request or one active subscription. The request table is the
+negotiated `maxPending` on both ends: the guest holds a slot until the one
+terminal is consumed, the provider until the terminal enters the send
+queue. The guest draws request ids from the session's one correlation
+space, so OPEN, PING and resource requests never share an id.
+
+The guest surface is `hello()`, `open()`, `get()`, `subscribe()`,
+`unsubscribe()`, `release()`, `reportEvict()` and `cancel()`; the current
+session's `RelayResourceClient` is `endpoint.client`. The provider answers
+`resource.get` through the `onGet` hook with `replyObject()` (admission
+against `accept`/`maxObjectBytes`, chunking under the negotiated limits),
+`replyNotModified()` or `replyError()`; subscribe, unsubscribe and release
+are answered by the authority; `pushObject()` and `invalidate()` publish;
+`onCancel` reports an inbound CANCEL with the request's `cancelRequested`
+flag, and `onEvict` an advisory. A `cache.evict` advisory rides the stream
+bound to the resource's namespace, as an authority INVALIDATE does; stream
+0 carries control ops only.
+
+`tests/relay-endpoint.test.ts` drives two endpoints over an in-memory
+transport (microtask-queued and synchronous delivery): get, conditional
+get, subscribe, push, invalidate, unsubscribe, evict, ping, a two-frame
+window with a six-chunk object, `maxPending` admission, a malformed
+terminal, CANCEL, a busy transport, a seq-hole reset and a credit fault,
+with the ledgers, request tables, assembler and cache asserted on both
+ends. `tests/relay-wire.test.ts` runs a guest endpoint against
+`serveRelayTcp` over a loopback socket.
 
 ## Resource identity
 
@@ -361,11 +452,23 @@ against the schemas in `contracts/spec/relay.ts`.
   revision named on the resource. An object larger than
   `maxObjectBytes` is `TOO_LARGE`; a request that cannot enter the bounded
   window or the local assembly budget is `BUSY` and the caller retries on a
-  later frame.
+  later frame. **A response that fails its op schema, names another op
+  than the request, or is an error without a valid body ends the request
+  as `INVALID` on the consumer and releases its pending entry and assembler
+  reservation, whatever its `final` flag**; a later well-formed frame for
+  that correlation is consumed and dropped as late, so two malformed
+  terminals cannot hold the bounded assembly budget. Error responses have
+  their own schemas (`resource.get.error` and the subscribe, unsubscribe
+  and release twins): `op`, `status:"error"`, `final:true`, the error body,
+  an optional `resource` (a get error names the requested resource when the
+  request was valid) and `effect` on a CANCELLED terminal. A chunked
+  object's `value` is published with its bytes from the final chunk.
 - **resource.subscribe** selects `delivery:"reliable-delta"` or
   `"latest-snapshot"`. The terminal response carries
   `value.subscription`, a session-scoped u32 that is never reused after
-  unsubscribe. A reliable delta carries a top-level `baseRevision` and
+  unsubscribe, and the revision named on its `resource` is the base the
+  subscription holds; the request's revision is a starting hint (§3.6). A
+  reliable delta carries a top-level `baseRevision` and
   applies only when the base equals the held revision; a mismatch sets
   `resyncRequired` and does not guess the base, and a delta alone never
   advances the held revision or clears the flag. **Recovery is a full
@@ -396,7 +499,19 @@ repeat `resource`/`codec`/`transfer.id`/`total`/`digest`; offsets run
 contiguously from 0, and the final chunk carries `final:true` with
 `offset + dataBytes == total`. A gap, overlap, identity change, transfer-id
 reuse or over-range offset rejects the assembly as `INVALID` and drops its
-scratch. **An assembly key is `(stream, id-space, id)`: RESPONSE deliveries
+scratch. **Transfer ids increase along a channel: the authority allocates
+them from one monotonic session counter and a channel's frames arrive in
+send order, so an id at or below the previous completed object's id is a
+reuse and rejects as `INVALID`** with O(1) state. Identity comparisons and
+the local cache key are JSON encodings of the field tuple, so a `|` or any
+other character inside `ns`/`key`/`rendition` cannot alias two identities.
+**The authority's chunker sizes every chunk against both negotiated
+receiver limits: metadata within `maxMetaBytes`, header plus metadata plus
+data within `maxWireBytes`.** Metadata does not depend on the chunk
+(fixed-width hex offsets; `final` differs by one byte), so an object whose
+metadata exceeds either ceiling is refused as `TOO_LARGE` before any frame
+is built and the request is answered with that error. **An assembly key is
+`(stream, id-space, id)`: RESPONSE deliveries
 use the get correlation space and PUSH deliveries the subscription id space.
 The two allocators start at 1 independently, so a get correlation 1 and
 subscription id 1 coexist on one stream and never collide.** The SHA-256
@@ -438,7 +553,12 @@ Two distinct operations use the INVALIDATE frame type:
   lack of room (draft §3.8) and a burst of invalidates costs one re-fetch,
   never a stale publication; a repeated revision is one marker, and the
   escalation touches neither the resident entry nor other in-flight gets. A
-  subscription in scope is marked for resync.
+  subscription in scope is marked for resync. **A generation marker exists
+  while a resident entry mirrors it or an in-flight get captured it and is
+  dropped with the last of them**, so the marker map is bounded by entries
+  plus pending gets; the fence compares a captured value with the current
+  one, and with neither an entry nor a pending get the absolute value
+  carries no information.
 - **cache.evict** is consumer-to-provider advisory only
   (`reason:"budget" | "view-close"`). It states that the consumer no longer
   holds a copy; **the provider may ignore it and there is no ACK.** Remote
@@ -551,7 +671,12 @@ later frames do not clear it** — the `--assert` semantics of
 `tools/tape.ts`, which names the first divergent frame. A run is OK only
 when every tuple is consumed. Missing and extra frames report
 `incomplete` and `unexpected`. `verifyFrameTape(tape)` checks a stored tape
-without a session stack.
+without a session stack. **Verification and replay apply one rule set per
+tuple: the header session is the document session, the tuple seq is the
+header seq, and within one (direction, stream) seq increases in capture
+order** (`order` divergence; contiguity is not required, since a tape
+wrapped after READY starts above 1). A tape with no frames verifies as
+`empty` and cannot be replayed.
 
 The sim hook mounts through `bootWorld`'s `extraGlobals` at the
 `relayTape` slot, alongside `db`/`fs`/`audio`:
@@ -574,6 +699,7 @@ bun test tests/relay-session.test.ts   # handshake/negotiation/session/ping
 bun test tests/relay-wire.test.ts      # provider over a TCP loopback
 bun test tests/relay-credit.test.ts    # queues/credit/priority/CANCEL
 bun test tests/relay-resource.test.ts  # L2 get/subscribe/chunks/budget/invalidate
+bun test tests/relay-endpoint.test.ts  # composed endpoint, guest <-> provider
 bun test tests/relay-frame-c.test.ts  # compiles the C layer, feeds it the vectors
 bun test tests/relay-tape.test.ts tests/relay-sim-tape.test.ts
 bun tests/contract.ts

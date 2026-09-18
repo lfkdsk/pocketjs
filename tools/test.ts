@@ -111,6 +111,7 @@ const SUITE: readonly Stage[] = [
       "tests/relay-wire.test.ts",
       "tests/relay-credit.test.ts",
       "tests/relay-resource.test.ts",
+      "tests/relay-endpoint.test.ts",
       "tests/relay-frame-c.test.ts",
       "tests/relay-tape.test.ts",
       "tests/relay-sim-tape.test.ts",

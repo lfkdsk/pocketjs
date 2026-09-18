@@ -362,7 +362,7 @@ function chunks(auth: RelayResourceAuthority, input: Parameters<RelayResourceAut
 // resource.get / notModified
 // ---------------------------------------------------------------------------
 
-test("get delivers a chunked object once, at the final frame", () => {
+test("get delivers a chunked object once, at the final frame, with the value every chunk repeated", () => {
   const { wire, client } = makeClient();
   const results: unknown[] = [];
   const r = client.get(1, tileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
@@ -384,11 +384,12 @@ test("get delivers a chunked object once, at the final frame", () => {
   }
   feed(client, frames[2], RELAY_CODEC.R5G6B5LE);
   expect(results.length).toBe(1);
-  const out = results[0] as { ok: true; value: { data: Uint8Array; ref: RelayResourceRef } };
+  const out = results[0] as { ok: true; value: { data: Uint8Array; ref: RelayResourceRef; value?: unknown } };
   expect(out.ok).toBe(true);
   expect(out.value.data.length).toBe(131072);
   expect(out.value.data[123456]).toBe(123456 & 0xff);
   expect(out.value.ref.revision).toBe("tile-v1");
+  expect(out.value.value).toEqual({ width: 256, height: 256, logicalSize: 256 });
 });
 
 test("get with ifRevision returns notModified and still names the revision", () => {
@@ -613,7 +614,7 @@ test("invalidate scope=revision removes the local entry and fences an in-flight 
   client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, (r) => results.push(r));
   // The get would have published r1; invalidate first.
   const auth = new RelayResourceAuthority();
-  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }), RELAY_CODEC.NONE);
+  feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }), RELAY_CODEC.NONE);
   // The late response now fences on generation.
   const frames = chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.sent[0].correlation,
@@ -637,7 +638,7 @@ test("invalidate scope=key advances local generation but keeps the stale value",
   })) seeded.client.handleFrame(toFrame(f, RELAY_CODEC.R5G6B5LE));
   expect(results.length).toBe(1);
   expect(seeded.client.localEntry(tileRef("r1"))?.generation).toBe(0);
-  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") })));
+  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") })));
   const entry = seeded.client.localEntry(tileRef("r1"));
   expect(entry?.generation).toBe(1); // generation moved forward
   expect(entry?.stale).toBe(true); // value retained but stale
@@ -657,7 +658,7 @@ test("invalidate scope=namespace moves every matching namespace generation forwa
       ref, codec: RELAY_CODEC.R5G6B5LE, data: zeros(10),
     })) seeded.client.handleFrame(toFrame(f, RELAY_CODEC.R5G6B5LE));
   }
-  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.NAMESPACE, ns: "map/demo" })));
+  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.NAMESPACE, ns: "map/demo" })));
   expect(seeded.client.localEntry(a)?.generation).toBe(1);
   expect(seeded.client.localEntry(b)?.generation).toBe(1);
   expect(seeded.client.localEntry(other)?.generation).toBe(0);
@@ -678,7 +679,7 @@ test("F1: a key-scope invalidate fences an in-flight revisionless get", () => {
   // §3.5: a get without revision requests the current revision.
   client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
     (r) => results.push(r as { ok: boolean; error?: { code: string } }));
-  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
+  feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
   // The late response names the concrete revision (§3.5).
   for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
@@ -698,7 +699,7 @@ test("F1: a revision-scope invalidate fences only the invalidated concrete revis
   client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
     (r) => results.push(r as typeof results[number]));
   // r1 is invalidated while the get is in flight.
-  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
+  feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
   // Authority answers with the current revision, r2: a different concrete
   // revision that the fence must not reject.
   for (const f of chunks(auth, {
@@ -713,7 +714,7 @@ test("F1: a revision-scope invalidate fences only the invalidated concrete revis
   const named: { ok: boolean; error?: { code: string } }[] = [];
   client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
     (r) => named.push(r as { ok: boolean; error?: { code: string } }));
-  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
+  feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
   for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
     ref: tileRef("r1"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
@@ -740,16 +741,16 @@ test("F1: revision scope removes only the current concrete revision; an invalida
   const current = seeded.client.localEntry(tileRef("r2"));
   expect(current?.ref.revision).toBe("r2");
   // A revision invalidate for the stale r1 must not remove the resident r2.
-  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") })));
+  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") })));
   expect(seeded.client.localEntry(tileRef("r2"))?.ref.revision).toBe("r2");
   expect(seeded.client.localEntry(tileRef("r2"))?.stale).toBe(false);
   // An invalidate for the concrete current revision removes it.
-  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r2") })));
+  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r2") })));
   expect(seeded.client.localEntry(tileRef("r2"))).toBeUndefined();
 
   // Key scope marks the current revision stale without deleting it.
   serve("r3");
-  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r3") })));
+  seeded.client.handleFrame(toFrame(auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r3") })));
   expect(seeded.client.localEntry(tileRef("r3"))?.stale).toBe(true);
 });
 
@@ -1149,7 +1150,7 @@ test("M2: a marker survives an eviction while a get that captured the older gene
   const results: Array<ResourceResult<unknown>> = [];
   client.get(1, tileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 8 }, (r) => results.push(r));
   const inFlight = wire.lastRequest().correlation;
-  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
+  feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
   client.reportEvict(tileRef("r1"), RELAY_EVICT_REASON.BUDGET);
   expect(client.stats()).toMatchObject({ entries: 0, pending: 1, generationMarkers: 1 });
   // The late response is fenced; the marker goes with the get.
@@ -1163,11 +1164,11 @@ test("M2: a marker survives an eviction while a get that captured the older gene
   expect(results[1]?.ok).toBe(true);
   expect(client.localEntry(tileRef())?.revision).toBe("r3");
   // A resident entry keeps its marker after an invalidate until it is evicted.
-  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r3") }));
+  feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r3") }));
   expect(client.stats()).toMatchObject({ entries: 1, generationMarkers: 1 });
   expect(client.localEntry(tileRef())?.stale).toBe(true);
   // A revision-scope invalidate of the resident revision releases both.
-  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r3") }));
+  feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r3") }));
   expect(client.stats()).toMatchObject({ entries: 0, generationMarkers: 0 });
 });
 
@@ -1556,7 +1557,7 @@ test("G1: the identity generation is one monotonic counter moved once per invali
     return out.correlation;
   };
   const invalidateKey = () =>
-    feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
+    feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
 
   answer(getFor("g0"), "r1");
   const gens: number[] = [client.localEntry(tileRef("r1"))!.generation];
@@ -1599,7 +1600,7 @@ test("G2: revision markers on an in-flight get are bounded; overflow fences the 
   const correlation = wire.lastRequest().correlation;
   const N = 5000;
   for (let i = 0; i < N; i++) {
-    feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef(`r${i}`) }));
+    feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef(`r${i}`) }));
   }
   // §3.8 bounded markers: review 989 G2 measured N entries and quadratic
   // time on this path.
@@ -1644,7 +1645,7 @@ test("G2: below the bound the fence stays exact and a repeated revision is one m
     })) feed(client, f, RELAY_CODEC.R5G6B5LE);
   };
   const invalidate = (revision: string) =>
-    feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef(revision) }));
+    feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef(revision) }));
 
   // The same revision invalidated many times is one marker, and a response
   // for another revision lands.
@@ -1741,7 +1742,7 @@ test("G3: a withdrawal the request window refuses is retried on the next incomin
   expect(wire.lastRequest()).toBe(getReq);
   expect(client.stats().orphanedSubscriptions).toBe(1);
   // Still full: an unrelated frame changes nothing.
-  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
+  feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
   expect(client.stats().orphanedSubscriptions).toBe(1);
   expect(wire.lastRequest()).toBe(getReq);
   // The get's terminal response frees the window; the withdrawal goes out then.
@@ -1770,7 +1771,7 @@ test("G3: a stream reset drops a pending withdrawal with the stream's subscripti
   client.resetStream(1);
   wire.refuseRequest = false;
   const sentBefore = wire.sent.length;
-  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
+  feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
   expect(wire.sent.length).toBe(sentBefore);
   expect(client.stats()).toMatchObject({ pending: 0, subscriptions: 0, orphanedSubscriptions: 0 });
 });
@@ -1785,7 +1786,7 @@ test("TEETH A5: a notModified naming an invalidated revision is fenced", () => {
   const results: { ok: boolean; error?: { code: string } }[] = [];
   client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072, ifRevision: "r1" },
     (r) => results.push(r as { ok: boolean; error?: { code: string } }));
-  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
+  feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
   feed(client, auth.answerNotModified({ stream: 1, correlation: wire.lastRequest().correlation }, tileRef("r1")));
   expect(results[0].ok).toBe(false);
   expect(results[0].error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);

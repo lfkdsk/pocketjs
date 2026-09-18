@@ -1,20 +1,21 @@
 /** Provider-side relay wiring over an authenticated byte channel.
  *
- * The session state machine is shared with the guest
- * (`framework/src/relay/session.ts`); this file only binds a provider
- * machine to a duplex byte transport:
+ * The composed endpoint (`framework/src/relay/endpoint.ts`) is shared with
+ * the guest: one object runs the L1 session, the P3 credit/queue machines
+ * and the L2 authority. This file binds a provider endpoint to a duplex
+ * byte transport:
  *
  *   bytes in  -> RelayRecordDecoder (split/coalesced records, bounded)
- *             -> RelaySession.handleRecord
- *   bytes out -> session transport.trySend -> channel.send
+ *             -> RelayEndpoint.handleRecord (session, window, L2, credit)
+ *   bytes out -> endpoint transport.trySend -> channel.send
  *
  * Authentication and encryption belong to the L0 transport profile
  * (draft §3.2 step 1); `serveRelayTcp` therefore takes an `authenticate`
  * callback that returns the peer identity and grants. The wire layer never
  * trusts identity claims inside HELLO metadata.
  *
- * Each physical connection gets a fresh session machine: reconnect and
- * guest realm reset establish a new session with no carried-over
+ * Each physical connection gets a fresh endpoint: reconnect and guest
+ * realm reset establish a new session with no carried-over
  * seq/credit/stream state. */
 
 import type { Server, Socket } from "node:net";
@@ -22,14 +23,18 @@ import { createServer } from "node:net";
 import { RELAY_LIMITS } from "../contracts/spec/relay.ts";
 import { RelayRecordDecoder, type RelayDecodedFrame } from "../framework/src/relay/frame.ts";
 import {
-  createRelaySession,
-  type RelayLocalCapabilities,
-  type RelayNegotiation,
-  type RelayOpenRequest,
-  type RelayPeerContext,
-  type RelayPhase,
-  type RelaySendStatus,
-  type RelaySession,
+  RelayEndpoint,
+  type RelayEndpointHooks,
+  type RelayEndpointOptions,
+} from "../framework/src/relay/endpoint.ts";
+import type {
+  RelayLocalCapabilities,
+  RelayNegotiation,
+  RelayOpenRequest,
+  RelayPeerContext,
+  RelayPhase,
+  RelaySendStatus,
+  RelaySession,
 } from "../framework/src/relay/session.ts";
 
 export type {
@@ -42,13 +47,21 @@ export type {
   RelaySession,
 } from "../framework/src/relay/session.ts";
 export type { RelayDecodedFrame } from "../framework/src/relay/frame.ts";
+export {
+  RelayEndpoint,
+  type RelayEndpointHooks,
+  type RelayEndpointOptions,
+  type RelayIncomingRequest,
+} from "../framework/src/relay/endpoint.ts";
 
 /** An authenticated ordered byte channel. `send` is an admission decision:
- * it returns false only when the frame was not taken, so the session may
- * keep its seq and retry later. Returning false after the bytes already
- * entered an underlying queue is wrong — the frame would be delivered and a
- * retry would reuse the seq. A dead channel returns false (or throws). The
- * adapter keeps the underlying socket. */
+ * it returns false only when the frame was not taken, so the endpoint
+ * keeps the frame at the head of its ordered outbox and retries later.
+ * Returning false after the bytes already entered an underlying queue is
+ * wrong — the frame would be delivered and a retry would put it on the wire
+ * twice. A dead channel returns false (or throws). The adapter keeps the
+ * underlying socket. `onDrain` fires when a busy channel can take frames
+ * again; the endpoint flushes its outbox then. */
 export interface RelayByteChannel {
   /** Write one whole reassembled record. Returns false when the transport
    * has no queue room right now ("busy") and the frame was not written. */
@@ -56,42 +69,55 @@ export interface RelayByteChannel {
   readonly peer: RelayPeerContext;
   onData(callback: (chunk: Uint8Array) => void): void;
   onClose(callback: (reason: string) => void): void;
+  onDrain?(callback: () => void): void;
   destroy(): void;
   readonly closed: boolean;
 }
 
-export interface RelayProviderHooks {
-  /** Return a RELAY_ERROR code to refuse an OPEN, or null to allow it. */
-  authorizeOpen?: (req: RelayOpenRequest, peer: RelayPeerContext) => string | null;
-  onPhase?: (phase: RelayPhase, detail?: { reason?: string }) => void;
-  onBusinessFrame?: (frame: RelayDecodedFrame) => void;
-  onCredit?: (metadata: Record<string, unknown>) => void;
-  onReset?: (metadata: Record<string, unknown>) => void;
-  onStreamError?: (stream: number, code: string) => void;
-  /** A record failed frame-level validation; the connection is dropped. */
-  onProtocolError?: (code: string) => void;
+/** The endpoint hooks (OPEN authorization, phases, resource requests,
+ * cancel, evict, protocol errors) plus the record-level failure of the
+ * channel itself. */
+export interface RelayProviderHooks extends RelayEndpointHooks {
+  /** A record failed frame-level validation or a peer fault was seen; on
+   * a record failure the connection is dropped. */
+  onProtocolError?: (code: string, detail?: string) => void;
 }
 
 export interface RelayProviderConnection {
+  endpoint: RelayEndpoint;
+  /** The endpoint's session machine. */
   session: RelaySession;
   peer: RelayPeerContext;
   close(): void;
 }
 
-/** Bind one provider session to one authenticated channel. The caller
- * owns accepting the physical connection and authenticating the peer. */
+/** What a byte channel drives: the composed endpoint, or a bare session
+ * machine in tests. */
+export interface RelayRecordSink {
+  handleRecord(bytes: Uint8Array): void;
+  handleDisconnect(reason: string): void;
+  close(): void;
+  /** Retry the ordered outbox once a busy channel drained. */
+  flush?(): void;
+}
+
+/** Bind one provider endpoint to one authenticated channel. The caller
+ * owns accepting the physical connection and authenticating the peer. The
+ * endpoint runs the session, the P3 windows and the L2 authority; the
+ * application answers resource.get through `hooks.onGet` and the
+ * endpoint's reply methods. */
 export function attachRelayProvider(options: {
   channel: RelayByteChannel;
   local: RelayLocalCapabilities;
   hooks?: RelayProviderHooks;
+  /** Endpoint tuning: pump budgets, request reserve, timers, randomness. */
+  endpoint?: Pick<RelayEndpointOptions,
+    "framesPerPump" | "bytesPerPump" | "requestReserve" | "outboxFrames"
+    | "scheduler" | "randomBytes" | "pingIntervalMs" | "stallMs" | "retryMs">;
 }): RelayProviderConnection {
   const { channel, local, hooks } = options;
-  // Inbound frames never exceed our own advertised guarantee; min() during
-  // negotiation can only shrink it. Size for at least the bootstrap bound.
-  const maxWireBytes = Math.max(local.rxLimits.maxWireBytes, RELAY_LIMITS.bootstrapMaxWireBytes);
-  const decoder = new RelayRecordDecoder(maxWireBytes);
-
-  const session = createRelaySession({
+  const endpoint = new RelayEndpoint({
+    ...options.endpoint,
     role: "provider",
     local,
     transport: {
@@ -101,66 +127,71 @@ export function attachRelayProvider(options: {
         return channel.send(bytes) ? "accepted" : "busy";
       },
     },
-    authorizeOpen: hooks?.authorizeOpen,
-    onPhase: hooks?.onPhase,
-    onBusinessFrame: hooks?.onBusinessFrame,
-    onCredit: hooks?.onCredit,
-    onReset: hooks?.onReset,
-    onStreamError: hooks?.onStreamError,
+    hooks: {
+      ...hooks,
+      onPhase: (phase, detail) => {
+        hooks?.onPhase?.(phase, detail);
+        // Protocol teardown ends the physical connection: a new one starts
+        // a new session.
+        if (phase === "closed") channel.destroy();
+      },
+    },
   });
-
-  channel.onData((chunk) => {
-    const pushed = decoder.push(chunk);
-    if (!pushed.ok) {
-      hooks?.onProtocolError?.(pushed.code ?? "RECORD");
-      session.handleDisconnect(`record: ${pushed.code ?? "RECORD"}`);
-      channel.destroy();
-      return;
-    }
-    for (const record of pushed.frames) session.handleRecord(record);
-  });
-  channel.onClose((reason) => session.handleDisconnect(reason));
-
+  bindChannel(endpoint, channel, local.rxLimits.maxWireBytes, (code) => hooks?.onProtocolError?.(code, "record"));
   return {
-    session,
+    endpoint,
+    session: endpoint.session,
     peer: channel.peer,
     close() {
-      session.close();
+      endpoint.close();
       channel.destroy();
     },
   };
 }
 
+/** Records in, records out: one fixed reassembly buffer of the advertised
+ * receiver bound (a forged length prefix cannot drive an allocation), every
+ * complete record to the sink, a record failure drops the connection, and
+ * a drained channel retries the sink's outbox. */
+function bindChannel(
+  sink: RelayRecordSink,
+  channel: RelayByteChannel,
+  maxWireBytes: number,
+  onRecordError?: (code: string) => void,
+): void {
+  // Inbound frames never exceed our own advertised guarantee; min() during
+  // negotiation can only shrink it. Size for at least the bootstrap bound.
+  const decoder = new RelayRecordDecoder(Math.max(maxWireBytes, RELAY_LIMITS.bootstrapMaxWireBytes));
+  channel.onData((chunk) => {
+    const pushed = decoder.push(chunk);
+    if (!pushed.ok) {
+      onRecordError?.(pushed.code ?? "RECORD");
+      sink.handleDisconnect(`record: ${pushed.code ?? "RECORD"}`);
+      channel.destroy();
+      return;
+    }
+    for (const record of pushed.frames) sink.handleRecord(record);
+  });
+  channel.onClose((reason) => sink.handleDisconnect(reason));
+  channel.onDrain?.(() => sink.flush?.());
+}
+
 // --- guest-side channel binding (the companion is the listener) -------------
 
-/** Bind an existing guest session to a byte channel; used by device-side
- * hosts that dial the companion. `maxWireBytes` is the receiver guarantee
- * the guest advertised in HELLO — the reassembly buffer is one fixed
- * buffer of that size, so a forged length prefix can never drive an
- * allocation. */
-export function attachRelayChannel(session: RelaySession, channel: RelayByteChannel, options: {
+/** Bind an existing guest endpoint (or bare session) to a byte channel;
+ * used by device-side hosts that dial the companion. `maxWireBytes` is the
+ * receiver guarantee the guest advertised in HELLO — the reassembly buffer
+ * is one fixed buffer of that size, so a forged length prefix can never
+ * drive an allocation. */
+export function attachRelayChannel(sink: RelayRecordSink, channel: RelayByteChannel, options: {
   maxWireBytes?: number;
 } = {}): {
   close(): void;
 } {
-  const maxWireBytes = Math.max(
-    options.maxWireBytes ?? RELAY_LIMITS.controlMaxWireBytes,
-    RELAY_LIMITS.bootstrapMaxWireBytes,
-  );
-  const decoder = new RelayRecordDecoder(maxWireBytes);
-  channel.onData((chunk) => {
-    const pushed = decoder.push(chunk);
-    if (!pushed.ok) {
-      session.handleDisconnect(`record: ${pushed.code ?? "RECORD"}`);
-      channel.destroy();
-      return;
-    }
-    for (const record of pushed.frames) session.handleRecord(record);
-  });
-  channel.onClose((reason) => session.handleDisconnect(reason));
+  bindChannel(sink, channel, options.maxWireBytes ?? RELAY_LIMITS.controlMaxWireBytes);
   return {
     close() {
-      session.close();
+      sink.close();
       channel.destroy();
     },
   };
@@ -211,6 +242,9 @@ export function relaySocketChannel(socket: Socket, peer: RelayPeerContext): Rela
         closed = true;
         callback((error as NodeJS.ErrnoException).code ?? "socket error");
       });
+    },
+    onDrain(callback) {
+      socket.on("drain", callback);
     },
     destroy() {
       closed = true;

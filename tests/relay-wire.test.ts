@@ -1,10 +1,13 @@
 import { expect, test } from "bun:test";
 import { connect, createServer, type Socket } from "node:net";
 import {
+  RelayEndpoint,
+  attachRelayChannel,
   attachRelayProvider,
   relaySocketChannel,
   serveRelayTcp,
   socketCanAdmit,
+  type RelayProviderConnection,
 } from "../tools/relay-wire.ts";
 import {
   createRelaySession,
@@ -255,4 +258,70 @@ test("B-3 loopback: the frame whose send() returns busy is never delivered to th
   channel.destroy(); client.destroy(); await new Promise<void>((r) => server.close(() => r()));
   console.log(`first busy at frame #${busyAt}; bytes delivered = ${total}; admitted cap = ${busyAt * CHUNK}`);
   expect(total).toBeLessThanOrEqual(busyAt * CHUNK);
+});
+
+// --- review 1070 B3: the adapter composes session, credit and resource layers --
+
+test("B3 over TCP: a guest endpoint completes a resource.get and a subscribe through the composed provider adapter", async () => {
+  const object = new Uint8Array(10000);
+  for (let i = 0; i < object.length; i++) object[i] = (i * 7) & 0xff;
+  const ref = { kind: 1, ns: "map/demo", key: "z/1", revision: "v1", rendition: "r5g6b5le-256-v1" };
+  const gets: string[] = [];
+  const server = await serveRelayTcp({
+    local: { ...local },
+    authenticate: () => ({ id: "device-1", grants: ["pocket-map"] }),
+    onConnection: (connection) => { serverConnection = connection; },
+    hooks: () => ({
+      onGet: (request) => {
+        gets.push((request.metadata.resource as { key: string }).key);
+        serverConnection!.endpoint.replyObject(request, { ref, codec: 257, data: object, value: { width: 100 } });
+      },
+    }),
+  });
+  let serverConnection: RelayProviderConnection | undefined;
+
+  const socket = connect(server.port, "127.0.0.1");
+  await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+  const guestChannel = relaySocketChannel(socket, { id: "companion", grants: ["pocket-map"] });
+  const guest = new RelayEndpoint({
+    role: "guest",
+    transport: { peer: guestChannel.peer, trySend: (bytes) => (guestChannel.send(bytes) ? "accepted" : "busy") },
+    local: { app: "pocket-map", ...local },
+    pingIntervalMs: 10 ** 9,
+    stallMs: 10 ** 9,
+  });
+  attachRelayChannel(guest, guestChannel, { maxWireBytes: RX.maxWireBytes });
+
+  const ready = guest.whenReady();
+  expect(guest.hello().ok).toBe(true);
+  await ready;
+  const opened = await guest.open({ app: "pocket-map", namespace: "map/demo", profile: { name: "map.raster", version: 1 } });
+  expect(opened.stream).toBe(1);
+
+  const result = await new Promise<{ ok: boolean; value?: { data: Uint8Array; value?: unknown } }>((resolve) => {
+    const started = guest.get(1, { kind: 1, ns: "map/demo", key: "z/1", rendition: "r5g6b5le-256-v1" },
+      { accept: [257], maxObjectBytes: 131072 }, (r) => resolve(r as never));
+    if (!("correlation" in started)) resolve({ ok: false });
+  });
+  expect(result.ok).toBe(true);
+  expect(Buffer.compare(Buffer.from(result.value!.data), Buffer.from(object))).toBe(0);
+  expect(result.value!.value).toEqual({ width: 100 });
+  expect(gets).toEqual(["z/1"]);
+
+  const subscribed = await new Promise<{ ok: boolean; value?: { subscription?: number } }>((resolve) => {
+    guest.subscribe(1, { ns: "map/demo" }, "latest-snapshot", { onObject() {} }, (r) => resolve(r as never));
+  });
+  expect(subscribed).toEqual({ ok: true, value: { subscription: 1 } });
+  // Credit came back over the socket: nothing in flight on either end once
+  // the exchange settled.
+  await new Promise((r) => setTimeout(r, 50));
+  expect(guest.inspect()!.sender.ledgerView().inFlight(1)).toEqual({ frames: 0, bytes: 0 });
+  const providerLedger = serverConnection!.endpoint.inspect()!.sender.ledgerView();
+  expect(providerLedger.inFlight(1)).toEqual({ frames: 0, bytes: 0 });
+  expect(providerLedger.releasedTotals(1)).toEqual(providerLedger.sentTotals(1));
+  expect(providerLedger.sentTotals(1).frames).toBeGreaterThanOrEqual(3);
+
+  guest.close();
+  socket.destroy();
+  await server.close();
 });

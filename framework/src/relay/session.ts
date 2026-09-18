@@ -13,8 +13,11 @@
  * Scope: session/stream/seq, version/profile/codec/limits negotiation,
  * liveness and stale-session fencing. Resource delivery (L2) and credit
  * accounting (§3.9) are not implemented here: business frames leave the
- * machine through `onBusinessFrame`, credit/reset through hooks, and
- * `sendBusiness` is the single P3/P4 admission point.
+ * machine through `onBusinessFrame`, credit/reset/CANCEL through hooks, and
+ * the composed endpoint (`endpoint.ts`) takes every post-bootstrap control
+ * frame through `admitControl` so the P3 sender assigns seq at selection.
+ * `sendBusiness` is the bare P2 path for a machine that runs without the
+ * endpoint.
  *
  * The machine holds no socket: the injected transport adapter owns the
  * authenticated peer and bounded delivery (draft §3.1 L0). It never reads
@@ -146,6 +149,14 @@ export interface RelayOpenResult {
   rxLimits: RelayRxLimits;
 }
 
+/** A control frame the machine wants to send on the pinned session; the
+ * composition layer prepares, queues and stamps it (P3 admission). */
+export interface RelayControlAdmission {
+  type: number;
+  correlation: number;
+  metadata: Record<string, unknown>;
+}
+
 export interface RelayLocalCapabilities {
   /** Guest only: the app name presented in HELLO/OPEN (<= 64 bytes). */
   app?: string;
@@ -170,8 +181,9 @@ export interface RelaySessionOptions {
   /** Provider hook: return a stable RELAY_ERROR code string to refuse OPEN. */
   authorizeOpen?: (req: RelayOpenRequest, peer: RelayPeerContext) => string | null;
   onPhase?: (phase: RelayPhase, detail?: { reason?: string }) => void;
-  /** L2 (P3+) hook: every non-control frame on a known stream. */
-  onBusinessFrame?: (frame: RelayDecodedFrame) => void;
+  /** L2 (P3+) hook: every non-control frame on a known stream, with the
+   * wire length of its record (the window slot it occupies). */
+  onBusinessFrame?: (frame: RelayDecodedFrame, wireBytes: number) => void;
   /** §3.9 credit PUSH on stream 0 — recorded, never delivered as business. */
   onCredit?: (metadata: Record<string, unknown>) => void;
   /** relay.reset PUSH: the stream's old requests/subscriptions are dead. */
@@ -179,6 +191,26 @@ export interface RelaySessionOptions {
   /** Reliable-stream gap/decode error that requires a resync (stream 0
    * errors end the session instead). */
   onStreamError?: (stream: number, code: string) => void;
+  /** Composition (P3): once the session is pinned, every control frame the
+   * machine emits on it (READY, OPEN, PING and pong) goes here for queue
+   * and credit admission; the sender assigns seq at selection and the
+   * frame leaves through the endpoint's ordered send path. The bootstrap
+   * HELLO exchange on session 0 always goes straight to the transport.
+   * Return {ok:false, code:"BUSY"} for a refused frame; the machine treats
+   * it like a busy transport (OPEN rejects BUSY, a ping retries). */
+  admitControl?: (input: RelayControlAdmission) => { ok: true } | { ok: false; code: string };
+  /** Composition (P3): an inbound stream-0 record on the pinned session
+   * was consumed by the machine, with its wire length. Runs after dispatch
+   * whatever the outcome (a dropped frame held its window slot too), so the
+   * endpoint can return the peer's control-slice credit. */
+  onControlFrame?: (frame: RelayDecodedFrame, wireBytes: number) => void;
+  /** Inbound CANCEL (stream 0, op request.cancel) in READY; the endpoint
+   * withdraws the targeted request. Without the hook the frame is dropped. */
+  onCancel?: (frame: RelayDecodedFrame) => void;
+  /** A stream binding was installed: the guest received an OPEN success,
+   * or the provider allocated and answered one. Runs before the guest's
+   * open() promise resolves. */
+  onStreamOpened?: (result: RelayOpenResult) => void;
 }
 
 // --- small helpers -----------------------------------------------------------
@@ -391,6 +423,17 @@ export class RelaySession {
     frameSeq?: number;
   }): { ok: true } | { ok: false; code: string } {
     const bootstrap = input.bootstrap ?? this.session === 0n;
+    if (!bootstrap && input.frameSeq === undefined && this.options.admitControl) {
+      // Composed path: no seq is assigned here. The P3 sender stamps it when
+      // the frame is selected after its credit is charged (§3.3/§3.9); a
+      // refused admission leaves no trace, like a busy transport.
+      const admitted = this.options.admitControl({
+        type: input.type, correlation: input.correlation, metadata: input.metadata,
+      });
+      if (!admitted.ok) return admitted;
+      this.statsValue.framesSent++;
+      return { ok: true };
+    }
     const negotiated = this.negotiationValue;
     const codecs = bootstrap ? [RELAY_CODEC.NONE] : negotiated!.codecs;
     const maxWireBytes = bootstrap
@@ -562,12 +605,16 @@ export class RelaySession {
   // --- L2 admission point (P3/P4 fill this in) -------------------------------
 
   /** Encode one business frame with the pinned session and a fresh seq for
-   * its (stream, direction). P3/P4 add credit/queue checks here; P2 only
-   * enforces READY plus a known/open stream. */
+   * its (stream, direction): the bare P2 path, which enforces READY plus a
+   * known/open stream and nothing else. A machine composed with the P3
+   * sender (`admitControl` set) refuses it with COMPOSED: business frames
+   * then enter through the endpoint, where credit admission and the
+   * sender's seq space apply. */
   sendBusiness(input: {
     type: number; stream: number; correlation?: number;
     metadata: Record<string, unknown>; data?: Uint8Array; codec?: number;
   }): { ok: true } | { ok: false; code: string } {
+    if (this.options.admitControl) return { ok: false, code: "COMPOSED" };
     if (this.phase !== "ready" || !this.negotiationValue) return { ok: false, code: "NOT_READY" };
     if (input.stream === 0 || !this.streams.has(input.stream)) return { ok: false, code: "BAD_STREAM" };
     const prevSeq = this.txSeq.get(input.stream) ?? 0;
@@ -629,7 +676,10 @@ export class RelaySession {
     if (!this.checkInboundSeq(frame)) return;
     this.statsValue.framesReceived++;
     this.noteActivity();
-    this.dispatch(frame);
+    this.dispatch(frame, bytes.length);
+    // A stream-0 record on the pinned session held a control-slice slot on
+    // the peer (unless it rode the sideband); the endpoint returns it.
+    if (frame.stream === 0 && frame.session !== 0n) this.options.onControlFrame?.(frame, bytes.length);
   }
 
   /** seq is per (session, stream, direction) and starts at 1. On a
@@ -664,7 +714,7 @@ export class RelaySession {
 
   // --- control dispatch -------------------------------------------------------
 
-  private dispatch(frame: RelayDecodedFrame) {
+  private dispatch(frame: RelayDecodedFrame, wireBytes: number) {
     const op = frame.metadata.op;
     if (typeof op !== "string") {
       this.teardown("frame without op");
@@ -677,7 +727,8 @@ export class RelaySession {
       case RELAY_OP.PING: this.handlePing(frame); return;
       case RELAY_OP.CREDIT: this.handleCredit(frame); return;
       case RELAY_OP.RESET: this.handleReset(frame); return;
-      default: this.handleBusiness(frame);
+      case RELAY_OP.REQUEST_CANCEL: this.handleCancel(frame); return;
+      default: this.handleBusiness(frame, wireBytes);
     }
   }
 
@@ -976,9 +1027,13 @@ export class RelaySession {
       // The binding starts a fresh per-stream seq at 1 in each direction.
       this.clearStreamSeq(stream);
       this.streams.set(stream, binding);
-      pending.resolve({
+      const opened: RelayOpenResult = {
         stream, namespace: binding.namespace, profile: binding.profile, rxLimits: binding.rxLimits,
-      });
+      };
+      // The composition layer allocates the stream's window slice before
+      // the caller can send on it.
+      this.options.onStreamOpened?.(opened);
+      pending.resolve(opened);
       return;
     }
 
@@ -1030,7 +1085,8 @@ export class RelaySession {
       op: RELAY_OP.OPEN, status: RELAY_STATUS.OK, final: true,
       stream, namespace: request.namespace, profile: request.profile, rxLimits,
     }, `${RELAY_OP.OPEN}.response`);
-    if (!sent.ok) { this.streams.delete(stream); this.teardown(`open response: ${sent.code}`); }
+    if (!sent.ok) { this.streams.delete(stream); this.teardown(`open response: ${sent.code}`); return; }
+    this.options.onStreamOpened?.({ stream, namespace: request.namespace, profile: request.profile, rxLimits });
   }
 
   // --- PING -------------------------------------------------------------------
@@ -1131,7 +1187,19 @@ export class RelaySession {
     this.options.onReset?.(frame.metadata);
   }
 
-  private handleBusiness(frame: RelayDecodedFrame) {
+  /** Inbound CANCEL: §3.6 rides stream 0 with op request.cancel and the
+   * original request's correlation; the frame codec checked the envelope
+   * (type CANCEL, stream 0, u32 targetStream). The composition layer
+   * withdraws the request and answers with its one terminal. */
+  private handleCancel(frame: RelayDecodedFrame) {
+    if (this.phase !== "ready" || frame.session !== this.session
+        || frame.type !== RELAY_TYPE.CANCEL || frame.stream !== 0) {
+      this.statsValue.droppedNotReady++; return;
+    }
+    this.options.onCancel?.(frame);
+  }
+
+  private handleBusiness(frame: RelayDecodedFrame, wireBytes: number) {
     if (this.phase !== "ready" || frame.session !== this.session) {
       this.statsValue.droppedNotReady++; return;
     }
@@ -1146,12 +1214,17 @@ export class RelaySession {
       this.options.onStreamError?.(frame.stream, "BAD_STREAM");
       return;
     }
-    this.options.onBusinessFrame?.(frame);
+    this.options.onBusinessFrame?.(frame, wireBytes);
   }
 
   // --- misc -------------------------------------------------------------------
 
-  private allocateCorrelation(): number {
+  /** The session-scoped request id space (§3.6: one space per direction,
+   * never reused within a session; restarts at 1 on a new session). The
+   * machine draws OPEN and PING ids here, and the composition layer draws
+   * business request ids from the same space. Returns 0 when the space is
+   * exhausted, which ends the session. */
+  allocateCorrelation(): number {
     const id = this.nextCorrelation;
     if (id === 0xffffffff) {
       this.teardown("correlation exhausted");
@@ -1164,6 +1237,20 @@ export class RelaySession {
   /** Provider-visible bindings (tests and tools/relay-wire.ts). */
   streamInfo(stream: number): StreamBinding | undefined {
     return this.streams.get(stream);
+  }
+
+  /** Open stream ids of the pinned session, ascending. */
+  streamIds(): number[] {
+    return [...this.streams.keys()].sort((a, b) => a - b);
+  }
+
+  /** Drop a stream binding and its seq counters after a locally originated
+   * relay.reset; the id is never reused (§3.6). An inbound reset does this
+   * in handleReset. */
+  forgetStream(stream: number): boolean {
+    this.txSeq.delete(stream);
+    this.rxSeq.delete(stream);
+    return this.streams.delete(stream);
   }
 
   /** Drop all session state without a physical disconnect (guest realm

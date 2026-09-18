@@ -562,8 +562,9 @@ function controlErrorSchema(op: string): JsonSchema {
 
 /** Final error RESPONSE for a resource op: op + error body, plus the
  * resource when the authority could identify it (a malformed request
- * carries none). The success shape is the op's `.response` schema; an error
- * never repeats `value`. [R5-P06] */
+ * carries none) and `effect` on a CANCELLED terminal (§3.4: a cancel
+ * terminal states none/committed/unknown). The success shape is the op's
+ * `.response` schema; an error never repeats `value`. [R5-P06] */
 function resourceErrorSchema(op: string): JsonSchema {
   return {
     type: "object",
@@ -575,6 +576,7 @@ function resourceErrorSchema(op: string): JsonSchema {
       status: { const: RELAY_STATUS.ERROR },
       final: { const: true },
       error: errorBodySchema,
+      effect: { type: "string", enum: [RELAY_EFFECT.NONE, RELAY_EFFECT.COMMITTED, RELAY_EFFECT.UNKNOWN] },
     },
   };
 }
