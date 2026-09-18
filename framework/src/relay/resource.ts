@@ -482,15 +482,28 @@ export class RelayResourceClient {
     if (frame.metadata.status === RELAY_STATUS.ERROR) {
       // An error envelope is terminal and need not repeat resource/value; the
       // frame layer already validated op/status/final. Only the error body
-      // shape is checked here.
+      // shape is checked here; a malformed body ends the request as INVALID.
       const error = frame.metadata.error as RelayErrorBody | undefined;
-      if (!error || typeof error.code !== "string" || !error.code) this.protocolErrors++;
+      if (!error || typeof error.code !== "string" || !error.code) {
+        this.failMalformed(frame.correlation, pending);
+        return;
+      }
       this.terminatePending(frame.correlation, pending);
-      pending.complete({ ok: false, error: { code: error?.code ?? RELAY_ERROR.UNSUPPORTED, message: error?.message } });
+      pending.complete({ ok: false, error: { code: error.code, message: error.message } });
       return;
     }
 
-    if (validateRelayMetadata(`${op}.response`, frame.metadata)) { this.protocolErrors++; return; }
+    // A response that fails its op schema is a peer fault. §3.6 gives every
+    // request exactly one terminal, so the request ends here as INVALID,
+    // whether or not the malformed frame carried final: the pending entry and
+    // the assembler reservation are released, and a later well-formed frame
+    // for this correlation is consumed and dropped as late. Keeping the
+    // request open would let two malformed terminals hold the bounded
+    // assembly budget until the stream is reset (review 1070 B1).
+    if (validateRelayMetadata(`${op}.response`, frame.metadata)) {
+      this.failMalformed(frame.correlation, pending);
+      return;
+    }
 
     if (pending.kind === "get") {
       this.deliverGet(frame, pending);
@@ -502,6 +515,14 @@ export class RelayResourceClient {
       ok: true,
       value: { subscription: (frame.metadata.value as { subscription?: number } | undefined)?.subscription },
     });
+  }
+
+  /** End a request whose response was malformed: count the protocol error,
+   * release the pending slot and reservation, and complete it as INVALID. */
+  private failMalformed(correlation: number, pending: Pending): void {
+    this.protocolErrors++;
+    this.terminatePending(correlation, pending);
+    pending.complete({ ok: false, error: { code: RELAY_ERROR.INVALID } });
   }
 
   private terminatePending(correlation: number, pending: Pending): void {
@@ -518,7 +539,9 @@ export class RelayResourceClient {
     const value = meta.value as { notModified?: boolean } | undefined;
 
     if (value?.notModified) {
-      if (!meta.final || !ref.revision) { this.protocolErrors++; return; }
+      // §3.6: notModified is terminal and names the concrete revision; a
+      // response that breaks either rule ends the get as INVALID.
+      if (!meta.final || !ref.revision) { this.failMalformed(frame.correlation, pending); return; }
       const fenced = this.isFenced(pending, ref);
       this.terminatePending(frame.correlation, pending);
       if (fenced) {
@@ -530,7 +553,8 @@ export class RelayResourceClient {
     }
 
     if (frame.data.length) {
-      if (!meta.transfer || !meta.resource) { this.protocolErrors++; return; }
+      // A data region without a transfer descriptor cannot be assembled.
+      if (!meta.transfer || !meta.resource) { this.failMalformed(frame.correlation, pending); return; }
       const result = this.assembler.push({
         stream: frame.stream,
         channel: frame.correlation,
