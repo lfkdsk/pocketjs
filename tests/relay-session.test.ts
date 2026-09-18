@@ -1089,34 +1089,66 @@ test("T-2 a HELLO response echoing the wrong bootNonce tears the guest down", as
 });
 
 test("T-3 a pong carrying a token we never sent does not satisfy the outstanding ping", async () => {
-  // Sync transport: the real pong is delivered nested inside the ping's
-  // emit, before outstandingPing is assigned, so it is dropped stale and
-  // the ping remains outstanding. A forged seq-3 pong with a wrong token
-  // must then also fail the token match instead of clearing the ping.
-  const pair = makePair({ sync: true, pingIntervalMs: 2000, retryMs: 1500 });
-  pair.guest.hello();
-  expect(pair.guest.phase).toBe("ready");
-  pair.clocks.guest.advance(2000); // guest ping goes out; real pong nests and is dropped
+  // Delivery is withheld after READY so the ping leaves and stays
+  // outstanding without any help from the send ordering: the provider
+  // never sees it. A forged pong with a wrong token must not clear the
+  // slot; the matching token must.
+  const pair = makePair({ pingIntervalMs: 2000, retryMs: 1500 });
+  await handshake(pair);
+  pair.deliver = false;
+  pair.clocks.guest.advance(2000); // guest ping goes out; nobody answers
   const ping = decode(lastFrames(pair, "guest", 1)[0]);
   expect(ping.metadata.op).toBe(RELAY_OP.PING);
-  const pingsBefore = pair.guest.getStats().pingsSent;
-  expect(pingsBefore).toBe(1);
+  expect(pair.guest.getStats().pingsSent).toBe(1);
 
-  // Provider stream 0 sent READY ack (seq 1) then the nested real pong
-  // (seq 2); the forged pong is seq 3 so it passes the inbound-seq check.
-  const wrong = encodeFrame({
-    type: RELAY_TYPE.RESPONSE, codec: 0, session: pair.guest.sessionId,
-    seq: 3, stream: 0, correlation: ping.correlation,
-    metadata: {
-      op: RELAY_OP.PING, status: RELAY_STATUS.OK, final: true,
-      token: (((ping.metadata.token as number) ^ 0x5a5a) >>> 0),
-    },
-  }, { maxWireBytes: 4096, codecs: [0] });
-  if (!wrong.ok) throw new Error(wrong.code);
-  pair.guest.handleRecord(wrong.bytes);
+  // Provider stream 0 has sent only the READY ack (seq 1); forged pongs
+  // continue its seq space so they pass the inbound-seq check.
+  const pong = (seq: number, token: number) => {
+    const r = encodeFrame({
+      type: RELAY_TYPE.RESPONSE, codec: 0, session: pair.guest.sessionId,
+      seq, stream: 0, correlation: ping.correlation,
+      metadata: { op: RELAY_OP.PING, status: RELAY_STATUS.OK, final: true, token },
+    }, { maxWireBytes: 4096, codecs: [0] });
+    if (!r.ok) throw new Error(r.code);
+    return r.bytes;
+  };
+  const token = ping.metadata.token as number;
+  pair.guest.handleRecord(pong(2, (token ^ 0x5a5a) >>> 0));
   expect(pair.guest.phase).toBe("ready");
+  expect(pair.guest.getStats().droppedStaleSeq).toBe(1);
 
   // Still outstanding: the next interval must not start a second ping.
   pair.clocks.guest.advance(2000);
-  expect(pair.guest.getStats().pingsSent).toBe(pingsBefore);
+  expect(pair.guest.getStats().pingsSent).toBe(1);
+
+  // The matching token clears the slot, and the next interval pings again.
+  pair.guest.handleRecord(pong(3, token));
+  expect(pair.guest.getStats().droppedStaleSeq).toBe(1);
+  pair.clocks.guest.advance(2000);
+  expect(pair.guest.getStats().pingsSent).toBe(2);
+});
+
+test("B-5 a synchronous adapter answers the ping inside emit(); the pong is accepted and heartbeats continue", () => {
+  // Review 988: the token was recorded after emit() returned, so the pong
+  // a synchronous adapter delivered inside the send found no outstanding
+  // token, was dropped as stale, blocked every later ping and the guest
+  // hit the stall deadline. The token is now published before the send.
+  const pair = makePair({ sync: true, pingIntervalMs: 2000, stallMs: 15000, retryMs: 1500 });
+  pair.guest.hello();
+  expect(pair.guest.phase).toBe("ready");
+  pair.clocks.guest.advance(2000);
+  expect(pair.provider.getStats().pingsReceived).toBe(1);
+  expect(pair.guest.getStats().pingsSent).toBe(1);
+  expect(pair.guest.getStats().droppedStaleSeq).toBe(0);
+
+  // Past the stall deadline the guest is alive and has pinged every
+  // interval: 8 pings over 17 s, each answered inside its own send.
+  pair.clocks.guest.advance(15001);
+  expect({
+    phase: pair.guest.phase,
+    sent: pair.guest.getStats().pingsSent,
+    received: pair.provider.getStats().pingsReceived,
+    stale: pair.guest.getStats().droppedStaleSeq,
+    timeouts: pair.guest.getStats().pingTimeouts,
+  }).toEqual({ phase: "ready", sent: 8, received: 8, stale: 0, timeouts: 0 });
 });
