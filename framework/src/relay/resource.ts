@@ -157,10 +157,35 @@ interface PendingGet {
 interface PendingControl {
   kind: "subscribe" | "unsubscribe" | "release";
   stream: number;
-  complete: (result: ResourceResult<{ subscription?: number }>) => void;
+  /** `response` is the terminal's metadata on success; the subscribe path
+   * reads the concrete revision the authority named from it. */
+  complete: (result: ResourceResult<{ subscription?: number }>, response?: Record<string, unknown>) => void;
 }
 
 type Pending = PendingGet | PendingControl;
+
+/** The op a pending request's RESPONSE must carry. */
+const PENDING_OP: Record<Pending["kind"], string> = {
+  get: RELAY_OP.RESOURCE_GET,
+  subscribe: RELAY_OP.RESOURCE_SUBSCRIBE,
+  unsubscribe: RELAY_OP.RESOURCE_UNSUBSCRIBE,
+  release: RELAY_OP.RESOURCE_RELEASE,
+};
+
+/** Clip diagnostics to the §3.4 160-byte error.message bound without
+ * splitting a character. */
+function clipErrorMessage(s: string): string {
+  let bytes = 0;
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0)!;
+    const n = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    if (bytes + n > RELAY_LIMITS.errorMessageMaxBytes) break;
+    bytes += n;
+    out += ch;
+  }
+  return out;
+}
 
 export interface RelaySubscriptionHandler {
   /** One complete, in-order object. Reliable deltas arrive chained by
@@ -299,7 +324,7 @@ export class RelayResourceClient {
     if (correlation === 0) return { ok: false, code: RELAY_ERROR.BUSY };
     this.pending.set(correlation, {
       kind: "subscribe", stream,
-      complete: (result) => {
+      complete: (result, response) => {
         if (result.ok && "value" in result && typeof result.value.subscription === "number") {
           const id = result.value.subscription;
           // Reserve the push channel in the subscription id space, distinct
@@ -318,10 +343,14 @@ export class RelayResourceClient {
           }
           if (isRef) {
             const ref = target as RelayResourceRef;
+            // §3.6: the request's revision is a starting-base hint; the
+            // terminal names the concrete revision the authority holds, and
+            // that is the base the first delta must match (review 1070 N1).
+            const named = (response?.resource as RelayResourceRef | undefined)?.revision;
             this.subscriptions.set(id, {
               id, stream, delivery,
               filter: { ns: ref.ns, kind: ref.kind, key: ref.key, rendition: ref.rendition },
-              revision: ref.revision, resyncRequired: false, handler,
+              revision: named ?? ref.revision, resyncRequired: false, handler,
             });
           } else {
             this.subscriptions.set(id, {
@@ -518,17 +547,23 @@ export class RelayResourceClient {
   }
 
   private handlePendingResponse(frame: RelayResourceIncomingFrame, pending: Pending): void {
-    const op = typeof frame.metadata.op === "string" ? frame.metadata.op : "";
+    // The response answers the op of the pending request; any other op is a
+    // peer fault and ends the request as INVALID.
+    const op = PENDING_OP[pending.kind];
+    if (frame.metadata.op !== op) {
+      this.failMalformed(frame.correlation, pending);
+      return;
+    }
 
     if (frame.metadata.status === RELAY_STATUS.ERROR) {
-      // An error envelope is terminal and need not repeat resource/value; the
-      // frame layer already validated op/status/final. Only the error body
-      // shape is checked here; a malformed body ends the request as INVALID.
-      const error = frame.metadata.error as RelayErrorBody | undefined;
-      if (!error || typeof error.code !== "string" || !error.code) {
+      // An error envelope is terminal; its shape is the op's `.error` schema
+      // (op, optional resource, error body), never the success `.response`
+      // schema. A malformed error ends the request as INVALID.
+      if (validateRelayMetadata(`${op}.error`, frame.metadata)) {
         this.failMalformed(frame.correlation, pending);
         return;
       }
+      const error = frame.metadata.error as RelayErrorBody;
       this.terminatePending(frame.correlation, pending);
       pending.complete({ ok: false, error: { code: error.code, message: error.message } });
       return;
@@ -555,7 +590,7 @@ export class RelayResourceClient {
     pending.complete({
       ok: true,
       value: { subscription: (frame.metadata.value as { subscription?: number } | undefined)?.subscription },
-    });
+    }, frame.metadata);
   }
 
   /** End a request whose response was malformed: count the protocol error,
@@ -872,7 +907,7 @@ export class RelayResourceAuthority {
     const args = frame.metadata.args as { delivery: string; namespace?: string };
     const ref = frame.metadata.resource as RelayResourceRef | undefined;
     const ns = ref?.ns ?? args.namespace;
-    if (!ns) return this.error(frame, RELAY_OP.RESOURCE_SUBSCRIBE, RELAY_ERROR.INVALID, "namespace required");
+    if (!ns) return this.error(frame, RELAY_OP.RESOURCE_SUBSCRIBE, RELAY_ERROR.INVALID, "namespace required", ref);
     const id = this.subscriptionIds.allocate();
     this.subscriptions.set(id, { id, stream: frame.stream, delivery: args.delivery, ns, ref, active: true });
     return {
@@ -929,8 +964,19 @@ export class RelayResourceAuthority {
     return null;
   }
 
-  answerGetError(frame: { stream: number; correlation: number }, code: string, message = code): RelayResourceEnvelope {
-    return this.error(frame, RELAY_OP.RESOURCE_GET, code, message);
+  /** Terminal error for a get. The error names the requested resource when
+   * `frame.metadata` is a valid resource.get request; a malformed request
+   * has no trustworthy ref to echo. */
+  answerGetError(
+    frame: { stream: number; correlation: number; metadata?: Record<string, unknown> },
+    code: string,
+    message = code,
+  ): RelayResourceEnvelope {
+    const ref = frame.metadata !== undefined
+      && validateRelayMetadata(`${RELAY_OP.RESOURCE_GET}.request`, frame.metadata) === null
+      ? frame.metadata.resource as RelayResourceRef
+      : undefined;
+    return this.error(frame, RELAY_OP.RESOURCE_GET, code, message, ref);
   }
 
   answerNotModified(frame: { stream: number; correlation: number }, ref: RelayResourceRef): RelayResourceEnvelope {
@@ -1055,12 +1101,18 @@ export class RelayResourceAuthority {
     };
   }
 
-  private error(frame: { stream: number; correlation: number }, op: string, code: string, message: string): RelayResourceEnvelope {
+  /** One error envelope shape for every resource op: the op's `.error`
+   * schema (review 1070 N1). The message is clipped to 160 UTF-8 bytes and
+   * never empty, so the envelope validates on the consumer. */
+  private error(frame: { stream: number; correlation: number }, op: string, code: string, message: string,
+    ref?: RelayResourceRef): RelayResourceEnvelope {
     return {
       type: RELAY_TYPE.RESPONSE, stream: frame.stream, correlation: frame.correlation,
       metadata: {
-        op, status: RELAY_STATUS.ERROR, final: true,
-        error: { code, message: message.slice(0, 160) },
+        op,
+        ...(ref ? { resource: ref } : {}),
+        status: RELAY_STATUS.ERROR, final: true,
+        error: { code, message: clipErrorMessage(message) || code },
       },
     };
   }

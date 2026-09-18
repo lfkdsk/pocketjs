@@ -560,6 +560,25 @@ function controlErrorSchema(op: string): JsonSchema {
   };
 }
 
+/** Final error RESPONSE for a resource op: op + error body, plus the
+ * resource when the authority could identify it (a malformed request
+ * carries none). The success shape is the op's `.response` schema; an error
+ * never repeats `value`. [R5-P06] */
+function resourceErrorSchema(op: string): JsonSchema {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["op", "status", "final", "error"],
+    properties: {
+      op: { const: op },
+      resource: resourceRefSchema,
+      status: { const: RELAY_STATUS.ERROR },
+      final: { const: true },
+      error: errorBodySchema,
+    },
+  };
+}
+
 /** Schemas for the §3.2/§3.6 control messages. All are strict: unknown
  * properties reject. Session-layer code applies the schema matching
  * metadata.op before acting on the message. */
@@ -836,6 +855,10 @@ export const RELAY_METADATA_SCHEMAS: Readonly<Record<string, JsonSchema>> = Obje
       error: { type: "object" },
     },
   },
+  [`${RELAY_OP.RESOURCE_GET}.error`]: resourceErrorSchema(RELAY_OP.RESOURCE_GET),
+  [`${RELAY_OP.RESOURCE_SUBSCRIBE}.error`]: resourceErrorSchema(RELAY_OP.RESOURCE_SUBSCRIBE),
+  [`${RELAY_OP.RESOURCE_UNSUBSCRIBE}.error`]: resourceErrorSchema(RELAY_OP.RESOURCE_UNSUBSCRIBE),
+  [`${RELAY_OP.RESOURCE_RELEASE}.error`]: resourceErrorSchema(RELAY_OP.RESOURCE_RELEASE),
   /** PUSH content for an established subscription. Chunked pushes repeat
    * transfer/digest exactly like get responses. `final` is required on PUSH. */
   "resource.push": {

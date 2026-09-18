@@ -963,6 +963,112 @@ test("M1: two refs whose fields contain the old delimiter are two identities in 
 });
 
 // ---------------------------------------------------------------------------
+// Review 1070 N1: error envelopes have their own schemas; subscribe holds the
+// revision the authority named
+// ---------------------------------------------------------------------------
+
+test("N1: authority error envelopes validate against the op's .error schema, carry the resource when known, and clip the message by bytes", () => {
+  // Review 1070's L2_SCHEMA_AND_SUBSCRIBE_REVISION probe: the get error
+  // failed `$.resource: required` and the subscribe error `$.value: required`
+  // against the success schemas. Errors now have a shape of their own.
+  const auth = new RelayResourceAuthority();
+  const getRequest = {
+    op: RELAY_OP.RESOURCE_GET, resource: tileRef("r1"), args: { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 16 },
+  };
+  const getError = auth.answerGetError({ stream: 1, correlation: 1, metadata: getRequest }, RELAY_ERROR.TOO_LARGE);
+  expect(validateRelayMetadata(`${RELAY_OP.RESOURCE_GET}.error`, getError.metadata)).toBeNull();
+  expect(getError.metadata.resource).toEqual(tileRef("r1"));
+  expect(getError.metadata.value).toBeUndefined();
+  // Without a valid request there is no ref to echo; the envelope stays valid.
+  const bare = auth.answerGetError({ stream: 1, correlation: 1 }, RELAY_ERROR.NOT_FOUND);
+  expect(validateRelayMetadata(`${RELAY_OP.RESOURCE_GET}.error`, bare.metadata)).toBeNull();
+  expect(bare.metadata.resource).toBeUndefined();
+  const malformedRequest = auth.answerGetError({ stream: 1, correlation: 1, metadata: { op: RELAY_OP.RESOURCE_GET, resource: { kind: 1 } } }, RELAY_ERROR.INVALID);
+  expect(malformedRequest.metadata.resource).toBeUndefined();
+
+  const subError = auth.answerSubscribe({
+    stream: 1, correlation: 2, metadata: { op: RELAY_OP.RESOURCE_SUBSCRIBE, args: { delivery: "invalid" } },
+  });
+  expect(validateRelayMetadata(`${RELAY_OP.RESOURCE_SUBSCRIBE}.error`, subError.metadata)).toBeNull();
+  const unsubError = auth.answerUnsubscribe({ stream: 1, correlation: 3, metadata: { op: RELAY_OP.RESOURCE_UNSUBSCRIBE, args: { subscription: 99 } } });
+  expect(validateRelayMetadata(`${RELAY_OP.RESOURCE_UNSUBSCRIBE}.error`, unsubError.metadata)).toBeNull();
+  const releaseError = auth.answerRelease({ stream: 1, correlation: 4, metadata: { op: RELAY_OP.RESOURCE_RELEASE, resource: tileRef(), args: { lease: 5 } } });
+  expect(validateRelayMetadata(`${RELAY_OP.RESOURCE_RELEASE}.error`, releaseError.metadata)).toBeNull();
+
+  // A 200-character two-byte message clips to at most 160 UTF-8 bytes, on a
+  // character boundary, and an empty message falls back to the code.
+  const wide = auth.answerGetError({ stream: 1, correlation: 1 }, RELAY_ERROR.BUSY, "é".repeat(200));
+  const message = (wide.metadata.error as { message: string }).message;
+  expect(stringToUtf8(message).length).toBe(160);
+  expect(message).toBe("é".repeat(80));
+  expect(validateRelayMetadata(`${RELAY_OP.RESOURCE_GET}.error`, wide.metadata)).toBeNull();
+  const empty = auth.answerGetError({ stream: 1, correlation: 1 }, RELAY_ERROR.BUSY, "");
+  expect((empty.metadata.error as { message: string }).message).toBe(RELAY_ERROR.BUSY);
+});
+
+test("N1: a successful subscribe response names the revision the subscription holds; a namespace subscription holds none", () => {
+  const { wire, client } = makeClient();
+  const hinted: RelayResourceRef = { kind: RELAY_KIND.TILE, ns: "n", key: "k", revision: "hint", rendition: "x" };
+  const outcomes: unknown[] = [];
+  const started = client.subscribe(1, hinted, RELAY_DELIVERY.RELIABLE_DELTA, { onObject() {} }, (r) => outcomes.push(r));
+  expect("correlation" in started).toBe(true);
+  client.handleFrame({
+    type: RELAY_TYPE.RESPONSE, codec: RELAY_CODEC.NONE, stream: 1, correlation: wire.lastRequest().correlation,
+    metadata: {
+      op: RELAY_OP.RESOURCE_SUBSCRIBE, resource: { ...hinted, revision: "authority-current" },
+      status: RELAY_STATUS.OK, final: true, value: { subscription: 77 },
+    },
+    data: new Uint8Array(0),
+  });
+  expect(client.subscription(77)?.revision).toBe("authority-current");
+  // The app callback keeps its {subscription} shape.
+  expect(outcomes).toEqual([{ ok: true, value: { subscription: 77 } }]);
+  // The first delta must base on the named revision, not the hint.
+  const auth = new RelayResourceAuthority();
+  const delivered: Array<{ revision?: string; resync: boolean }> = [];
+  client.subscription(77)!.handler.onObject = (o, ctx) => delivered.push({ revision: o.ref.revision, resync: ctx.resyncRequired });
+  for (const f of chunks(auth, {
+    type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: 77,
+    ref: { ...hinted, revision: "next" }, codec: RELAY_CODEC.OPAQUE_BYTES, data: zeros(4), baseRevision: "authority-current",
+  })) feed(client, f, RELAY_CODEC.OPAQUE_BYTES);
+  expect(delivered).toEqual([{ revision: "next", resync: false }]);
+  expect(client.subscription(77)?.revision).toBe("next");
+
+  // A response without a resource (namespace subscription) leaves the
+  // revision undefined; the response echoing the hint unchanged keeps it.
+  client.subscribe(1, { ns: "n" }, RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject() {} }, () => {});
+  feed(client, auth.answerSubscribe({ stream: 1, correlation: wire.lastRequest().correlation, metadata: wire.lastRequest().metadata }));
+  const nsId = auth.idsAllocated().subscription;
+  expect(client.subscription(nsId)?.revision).toBeUndefined();
+  client.subscribe(1, hinted, RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject() {} }, () => {});
+  feed(client, auth.answerSubscribe({ stream: 1, correlation: wire.lastRequest().correlation, metadata: wire.lastRequest().metadata }));
+  expect(client.subscription(auth.idsAllocated().subscription)?.revision).toBe("hint");
+});
+
+test("N1: a response carrying another op than the pending request ends it as INVALID", () => {
+  const { wire, client, assembler } = makeClient();
+  const outcomes: unknown[] = [];
+  client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 8 }, (r) => outcomes.push(r));
+  client.handleFrame({
+    type: RELAY_TYPE.RESPONSE, codec: RELAY_CODEC.NONE, stream: 1, correlation: wire.lastRequest().correlation,
+    metadata: { op: RELAY_OP.RESOURCE_SUBSCRIBE, status: RELAY_STATUS.OK, final: true, value: { subscription: 1 } },
+    data: new Uint8Array(0),
+  });
+  expect(outcomes).toEqual([{ ok: false, error: { code: RELAY_ERROR.INVALID } }]);
+  expect(client.stats()).toMatchObject({ pending: 0, subscriptions: 0, protocolErrors: 1 });
+  expect(assembler.stats().assemblies).toBe(0);
+  // A schema-invalid error envelope (a value on an error) ends a get the same way.
+  client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 8 }, (r) => outcomes.push(r));
+  client.handleFrame({
+    type: RELAY_TYPE.RESPONSE, codec: RELAY_CODEC.NONE, stream: 1, correlation: wire.lastRequest().correlation,
+    metadata: { op: RELAY_OP.RESOURCE_GET, status: RELAY_STATUS.ERROR, final: true, error: { code: "BUSY", message: "x" }, value: {} },
+    data: new Uint8Array(0),
+  });
+  expect(outcomes[1]).toEqual({ ok: false, error: { code: RELAY_ERROR.INVALID } });
+  expect(client.stats()).toMatchObject({ pending: 0, protocolErrors: 2 });
+});
+
+// ---------------------------------------------------------------------------
 // Review 1070 M3: transfer ids increase on a channel; a non-adjacent reuse rejects
 // ---------------------------------------------------------------------------
 
