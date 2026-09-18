@@ -1,6 +1,6 @@
 //! The P1 byte vectors, linked into the test binary.
 //!
-//! `tests/fixtures/relay/vectors/` is the shared acceptance set: the same 46
+//! `tests/fixtures/relay/vectors/` is the shared acceptance set: the same
 //! records the TypeScript codec and the C frame layer are held to. Each is a
 //! complete wire record (`.bin`) plus the expected decode or the exact frame
 //! error code (`.json`). `include_bytes!` pins them at compile time, so a
@@ -12,7 +12,7 @@
 pub mod json;
 
 use json::Json;
-use pocket_relay::{CodecSet, FrameOptions};
+use pocket_relay::{spec::header as h, CodecSet, FrameInput, FrameOptions, HEADER_BYTES};
 
 pub struct Vector {
     pub name: &'static str,
@@ -76,6 +76,7 @@ pub const VECTORS: &[Vector] = vectors![
     "codec-not-negotiated",
     "codec0-with-data",
     "meta-not-utf8",
+    "meta-utf8-cut-at-data",
     "meta-duplicate-key",
     "meta-float-number",
     "meta-nan",
@@ -99,11 +100,40 @@ pub fn assert_covers_index() {
     assert_eq!(listed, linked, "tests/common/mod.rs must link every vector in index.json");
 }
 
-/// Errors this crate defers to the layer above: metadata is JSON, and the
-/// envelope rules read parsed metadata. A vector expecting one of these is
-/// asserted to pass the header checks instead.
-pub const DEFERRED_TO_METADATA_LAYER: &[&str] =
-    &[pocket_relay::spec::frame_error::BAD_METADATA, pocket_relay::spec::frame_error::BAD_ENVELOPE];
+/// Vectors this crate accepts and the layer above refuses: JSON semantics
+/// (a duplicate key, fractional and NaN numbers, a lone surrogate escape) and
+/// one envelope rule (a RESPONSE without `final`). Their metadata is valid
+/// UTF-8, so the byte-level check here passes them on. The C frame layer's
+/// test keeps the same five names; every other invalid vector is a frame-layer
+/// refusal in all three languages.
+pub const UPPER_LAYER_ONLY: &[&str] = &[
+    "meta-duplicate-key",
+    "meta-float-number",
+    "meta-nan",
+    "meta-lone-surrogate",
+    "envelope-response-no-final",
+];
+
+/// Rebuilds the encoder's input from a record's raw bytes without going
+/// through `decode`, so a record `decode` refuses can still be offered to
+/// `encode_into`. The record must hold a full header whose `metaBytes` fits
+/// inside it; the data region is whatever follows the metadata.
+pub fn raw_input(record: &[u8]) -> FrameInput<'_> {
+    let u32_at = |off: usize| u32::from_le_bytes(record[off..off + 4].try_into().unwrap());
+    let meta_end = HEADER_BYTES + u32_at(h::META_BYTES_OFFSET) as usize;
+    FrameInput {
+        kind: record[h::TYPE_OFFSET],
+        codec: u16::from_le_bytes(record[h::CODEC_OFFSET..h::CODEC_OFFSET + 2].try_into().unwrap()),
+        session: u64::from_le_bytes(
+            record[h::SESSION_OFFSET..h::SESSION_OFFSET + 8].try_into().unwrap(),
+        ),
+        seq: u32_at(h::SEQ_OFFSET),
+        stream: u32_at(h::STREAM_OFFSET),
+        correlation: u32_at(h::CORRELATION_OFFSET),
+        meta: &record[HEADER_BYTES..meta_end],
+        data: &record[meta_end..],
+    }
+}
 
 pub struct Expect {
     pub kind: u8,

@@ -41,6 +41,7 @@
     "codec-not-negotiated",
     "codec0-with-data",
     "meta-not-utf8",
+    "meta-utf8-cut-at-data",
     "meta-duplicate-key",
     "meta-float-number",
     "meta-nan",

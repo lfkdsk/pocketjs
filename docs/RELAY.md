@@ -507,10 +507,13 @@ builds `--no-default-features`, and the crate compiles for
 `thumbv7em-none-eabi` and `wasm32-unknown-unknown` as well as the desktop
 target.
 
-**The crate reads no JSON.** `BAD_METADATA` and `BAD_ENVELOPE` are in its error
-enum because they are part of the shared vocabulary, but `decode` never returns
-them — the layer that parses metadata does. The six vectors expecting those two
-codes are asserted to pass the header checks, which is where the handoff sits.
+**The crate reads no JSON.** `decode` and `encode_into` check that the metadata
+region is valid UTF-8 and return `BAD_METADATA` when it is not, the same byte
+rule the C layer applies. The JSON half of that rule and every `BAD_ENVELOPE`
+rule are decided by the layer that parses metadata. The five vectors that pass
+the frame layer and fail above it (a duplicate key, fractional and NaN numbers,
+a lone surrogate escape, a RESPONSE without `final`) are asserted to decode
+here, which is where the handoff sits.
 
 ```sh
 cargo test -p pocket-relay                       # 41 tests, 46 vectors

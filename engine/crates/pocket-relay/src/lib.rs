@@ -7,10 +7,12 @@
 //! layout and every limit come from `contracts/spec/relay.ts` through
 //! `gen-rust.ts`, re-exported here as [`spec`].
 //!
-//! **There is no JSON in this crate.** [`Frame::meta`] is unparsed bytes.
-//! [`FrameError::BadMetadata`] and [`FrameError::BadEnvelope`] exist in the
-//! error vocabulary because they are part of the shared wire contract, but
-//! [`decode`] never returns them — the session layer that reads metadata does.
+//! **There is no JSON in this crate.** [`Frame::meta`] is unparsed bytes that
+//! [`decode`] has checked to be valid UTF-8: a region that is not is
+//! [`FrameError::BadMetadata`], and [`encode_into`] refuses one the same way.
+//! The JSON half of that rule and every [`FrameError::BadEnvelope`] rule are
+//! decided by the session layer that reads metadata; this crate never returns
+//! `BadEnvelope`.
 //! `framework/src/relay/frame.ts` is the TypeScript peer, and
 //! `tests/fixtures/relay/vectors/` is the byte-level acceptance set both pass.
 //!
