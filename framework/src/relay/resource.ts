@@ -175,9 +175,11 @@ export class RelayResourceClient {
   private readonly pending = new Map<number, Pending>();
   private readonly subscriptions = new Map<number, RelaySubscriptionEntry>();
   private readonly entries = new Map<string, RelayLocalEntry>();
-  /** Monotonic per-identity invalidation generations. Outlives the entry
-   * itself: a revision-scope invalidation deletes the entry but a late
-   * response must still observe the moved generation. */
+  /** Monotonic per-identity invalidation generations: the single counter a
+   * get captures and a late response is compared against; a resident entry
+   * mirrors it and never feeds it. Outlives the entry itself: a
+   * revision-scope invalidation deletes the entry but a late response must
+   * still observe the moved generation. */
   private readonly generations = new Map<string, number>();
   private readonly assembler: RelayChunkAssembler;
   private protocolErrors = 0;
@@ -349,52 +351,47 @@ export class RelayResourceClient {
     const ref = meta.resource as RelayResourceRef | undefined;
     const ns = ref?.ns ?? args.namespace!;
 
+    const revisionScope = args.scope === RELAY_INVALIDATE_SCOPE.REVISION;
+    const inScope = (target: RelayResourceRef): boolean => args.scope === RELAY_INVALIDATE_SCOPE.NAMESPACE
+      ? target.ns === ns
+      : ref !== undefined && refMatchesKeyScope(target, ref);
+    // Identity keys whose revision-free generation moves. Key/namespace scope
+    // move it once per invalidate per identity, whatever the number of
+    // resident entries and in-flight gets that match: `generations` is the
+    // single counter and an entry only mirrors it (review 989 G1).
+    const moved = new Set<string>();
+
     for (const [key, entry] of this.entries) {
-      if (args.scope === RELAY_INVALIDATE_SCOPE.NAMESPACE) {
-        if (entry.ref.ns !== ns) continue;
-      } else if (ref) {
-        if (!refMatchesKeyScope(entry.ref, ref)) continue;
+      if (!inScope(entry.ref)) continue;
+      if (revisionScope) {
         // Revision scope removes only the concrete revision; a newer resident
         // revision of the same identity stays.
-        if (args.scope === RELAY_INVALIDATE_SCOPE.REVISION && entry.ref.revision !== ref.revision) continue;
-      } else continue;
+        if (entry.ref.revision === ref!.revision) { entry.stale = true; this.entries.delete(key); }
+        continue;
+      }
+      // The stale value is retained under the moved generation.
       entry.stale = true;
-      if (args.scope === RELAY_INVALIDATE_SCOPE.REVISION) {
-        this.entries.delete(key);
-        continue;
-      }
-      // Key/namespace scope move the revision-free identity generation of
-      // every revision of the identity; the stale value is retained.
-      const next = entry.generation + 1;
-      this.generations.set(relayResourceKey(entry.ref), next);
-      entry.generation = next;
+      moved.add(key);
     }
-    // Identities with no resident entry but an in-flight get: key/namespace
-    // scope move the identity fence; revision scope records the concrete
-    // revision that must not land (a response for a newer revision may still
-    // publish).
+    // In-flight gets: key/namespace scope move the identity fence; revision
+    // scope records the concrete revision that must not land (a response for
+    // a newer revision may still publish).
     for (const pending of this.pending.values()) {
-      if (pending.kind !== "get") continue;
-      if (args.scope === RELAY_INVALIDATE_SCOPE.NAMESPACE) {
-        if (pending.ref.ns !== ns) continue;
-        const idKey = relayResourceKey(pending.ref);
-        this.generations.set(idKey, (this.generations.get(idKey) ?? 0) + 1);
-        continue;
+      if (pending.kind !== "get" || !inScope(pending.ref)) continue;
+      if (!revisionScope) { moved.add(relayResourceKey(pending.ref)); continue; }
+      // Revision scope records the invalidated concrete revision on every
+      // get of this key identity, including a revisionless "current version"
+      // get: the fence is checked against the response's concrete revision,
+      // not the request name.
+      if (ref!.revision !== undefined && !pending.fencedRevisions?.includes(ref!.revision)) {
+        (pending.fencedRevisions ??= []).push(ref!.revision);
       }
-      if (!ref || !refMatchesKeyScope(pending.ref, ref)) continue;
-      if (args.scope === RELAY_INVALIDATE_SCOPE.KEY) {
-        const idKey = relayResourceKey(pending.ref);
-        this.generations.set(idKey, (this.generations.get(idKey) ?? 0) + 1);
-      } else {
-        // Revision scope records the invalidated concrete revision on every
-        // get of this key identity, including a revisionless "current version"
-        // get: the fence is checked against the response's concrete revision,
-        // not the request name. A response for a different (including newer)
-        // revision may still publish.
-        if (!pending.fencedRevisions?.includes(ref.revision!)) {
-          (pending.fencedRevisions ??= []).push(ref.revision!);
-        }
-      }
+    }
+    for (const idKey of moved) {
+      const next = (this.generations.get(idKey) ?? 0) + 1;
+      this.generations.set(idKey, next);
+      const entry = this.entries.get(idKey);
+      if (entry) entry.generation = next;
     }
 
     // In-flight gets keep their assembler reservation until the (now stale)
@@ -626,8 +623,7 @@ export class RelayResourceClient {
   }
 
   private generationFor(ref: RelayResourceRef): number {
-    const idKey = relayResourceKey(ref);
-    return this.generations.get(idKey) ?? this.entries.get(idKey)?.generation ?? 0;
+    return this.generations.get(relayResourceKey(ref)) ?? 0;
   }
 
   localEntry(ref: RelayResourceRef): RelayLocalEntry | undefined {
