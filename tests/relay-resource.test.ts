@@ -432,7 +432,8 @@ test("local assembler BUSY: once the assembly budget is full, a new get is refus
   const { client } = makeClient({ maxAssemblies: 1, maxScratchBytes: 4 * 1024 * 1024 });
   const first = client.get(1, tileRef("a"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, () => {});
   expect("correlation" in first).toBe(true);
-  // Second get cannot reserve the only assembler slot: request is cancelled, BUSY.
+  // Second get cannot reserve the only assembler slot: refused BUSY before
+  // any request is sent, so there is nothing to cancel.
   const second = client.get(1, tileRef("b"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, () => {});
   expect(second).toEqual({ ok: false, code: RELAY_ERROR.BUSY });
 });
@@ -1324,4 +1325,53 @@ test("G3: a stream reset drops a pending withdrawal with the stream's subscripti
   feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
   expect(wire.sent.length).toBe(sentBefore);
   expect(client.stats()).toMatchObject({ pending: 0, subscriptions: 0, orphanedSubscriptions: 0 });
+});
+
+/** Review 989's three mutation killers (artifact 9565), taken in as written
+ * up to the shared helpers: each is the sole test that turns one mutation
+ * of the P4r delta red (A5, B5, C5 in the review's mutation round). */
+
+test("TEETH A5: a notModified naming an invalidated revision is fenced", () => {
+  const { wire, client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  const results: { ok: boolean; error?: { code: string } }[] = [];
+  client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072, ifRevision: "r1" },
+    (r) => results.push(r as { ok: boolean; error?: { code: string } }));
+  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
+  feed(client, auth.answerNotModified({ stream: 1, correlation: wire.lastRequest().correlation }, tileRef("r1")));
+  expect(results[0].ok).toBe(false);
+  expect(results[0].error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);
+});
+
+test("TEETH B5: a wrong-base delta latches resync for the next object", () => {
+  const { wire, client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  const marks: boolean[] = [];
+  client.subscribe(1, tileRef("r1"), RELAY_DELIVERY.RELIABLE_DELTA,
+    { onObject: (_o, ctx) => marks.push(ctx.resyncRequired) }, () => {});
+  feed(client, auth.answerSubscribe({
+    stream: 1, correlation: wire.lastRequest().correlation, metadata: wire.lastRequest().metadata,
+  }));
+  const id = client.subscription(1)!.id;
+  const push = (revision: string, baseRevision?: string) => {
+    for (const f of auth.chunkObject({
+      type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: id,
+      ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64), baseRevision,
+    })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  };
+  push("r2", "wrong");
+  expect(client.subscription(id)!.resyncRequired).toBe(true);
+  // The held base is still r1, so a delta on r1 must stay marked until a
+  // full snapshot recovers the subscription.
+  push("r3", "r1");
+  expect(marks).toEqual([true, true]);
+});
+
+test("TEETH C5: a post-send reservation failure withdraws the request", () => {
+  const { wire, client } = makeClient({ maxAssemblies: 4 });
+  client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 1024 }, () => {});
+  wire.correlation = 0; // the wire hands out an already-reserved correlation
+  const second = client.get(1, tileRef("r2"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 1024 }, () => {});
+  expect(second).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+  expect(wire.cancels).toEqual([{ stream: 1, correlation: 1, reason: "busy" }]);
 });
