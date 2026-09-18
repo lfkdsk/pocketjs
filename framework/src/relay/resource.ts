@@ -53,9 +53,14 @@ const hex16 = (n: number): string => {
  * key/namespace invalidate moves the generation of every revision of the
  * identity. The concrete revision is compared separately on the entry, the
  * response and revision-scope invalidation. See the §3.5 cache-key errata in
- * docs/RELAY.md. */
+ * docs/RELAY.md.
+ *
+ * The key is the JSON encoding of the tuple, not a delimiter join: the
+ * schema bounds the byte length of ns/key/rendition but reserves no
+ * character, so `{ns:"a", key:"b|c"}` and `{ns:"a|b", key:"c"}` must map to
+ * two keys (review 1070 M1). */
 export function relayResourceKey(ref: RelayResourceRef): string {
-  return `${ref.kind}|${ref.ns}|${ref.key}|${ref.rendition}`;
+  return JSON.stringify([ref.kind, ref.ns, ref.key, ref.rendition]);
 }
 
 function refMatchesKeyScope(a: RelayResourceRef, b: RelayResourceRef): boolean {

@@ -926,6 +926,43 @@ test("authority chunks respect the wire ceiling with contiguous offsets and one 
 });
 
 // ---------------------------------------------------------------------------
+// Review 1070 M1: resource keys must not alias across field boundaries
+// ---------------------------------------------------------------------------
+
+test("M1: two refs whose fields contain the old delimiter are two identities in the cache and in the assembler", () => {
+  // Review 1070's RESOURCE_KEY_COLLISION probe: with a `|` join both refs
+  // mapped to one key, the second publication overwrote the first entry and
+  // a lookup of the first returned the second ref.
+  const left: RelayResourceRef = { kind: RELAY_KIND.TILE, ns: "a", key: "b|c", revision: "r1", rendition: "x" };
+  const right: RelayResourceRef = { kind: RELAY_KIND.TILE, ns: "a|b", key: "c", revision: "r2", rendition: "x" };
+  expect(relayResourceKey(left)).not.toBe(relayResourceKey(right));
+  const { wire, client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  for (const ref of [left, right]) {
+    const started = client.get(1, ref, { accept: [RELAY_CODEC.OPAQUE_BYTES], maxObjectBytes: 16 }, () => {});
+    expect("correlation" in started).toBe(true);
+    for (const env of chunks(auth, {
+      type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
+      ref, codec: RELAY_CODEC.OPAQUE_BYTES, data: zeros(8),
+    })) feed(client, env, RELAY_CODEC.OPAQUE_BYTES);
+  }
+  expect(client.stats().entries).toBe(2);
+  expect(client.localEntry(left)?.ref).toEqual(left);
+  expect(client.localEntry(right)?.ref).toEqual(right);
+
+  // The assembler compares chunk identity the same way: a second chunk that
+  // names the aliasing identity is an identity change, hence INVALID.
+  const a = makeAssembler();
+  expect(reserve(a, 1, 16)).toEqual({ ok: true });
+  const push = (ref: RelayResourceRef, offset: number, final: boolean) => a.push({
+    stream: 1, channel: 1, space: "get", codec: RELAY_CODEC.OPAQUE_BYTES, resource: ref,
+    final, transfer: { id: 1, offset: hex16(offset), total: hex16(16) }, data: zeros(8),
+  });
+  expect(push({ ...left, revision: "r" }, 0, false)).toEqual({ ok: true, complete: false });
+  expect(push({ ...right, revision: "r" }, 8, true)).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+});
+
+// ---------------------------------------------------------------------------
 // Review 1070 B2: chunk metadata against the negotiated maxMetaBytes
 // ---------------------------------------------------------------------------
 
