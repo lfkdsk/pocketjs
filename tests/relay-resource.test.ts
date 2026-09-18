@@ -1046,7 +1046,7 @@ test("F4: a notModified revalidation keeps the resident bytes instead of materia
 });
 
 test("M12 teeth: notModified must be final and name a concrete revision", () => {
-  const { wire, client } = makeClient();
+  const { wire, client, assembler } = makeClient();
   const results: unknown[] = [];
   client.get(1, tileRef("r1"), {
     accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072, ifRevision: "r1",
@@ -1054,7 +1054,8 @@ test("M12 teeth: notModified must be final and name a concrete revision", () => 
 
   // notModified without a concrete revision on the resource is malformed:
   // §3.6 requires the response to still name the revision. It must not be
-  // delivered as {notModified:true, revision:undefined}.
+  // delivered as {notModified:true, revision:undefined}; the get ends as
+  // INVALID and its reservation is released (review 1070 B1).
   client.handleFrame({
     type: RELAY_TYPE.RESPONSE, codec: RELAY_CODEC.NONE, stream: 1,
     correlation: wire.lastRequest().correlation,
@@ -1065,8 +1066,10 @@ test("M12 teeth: notModified must be final and name a concrete revision", () => 
     },
     data: new Uint8Array(0),
   });
-  expect(results.length).toBe(0);
+  expect(results).toEqual([{ ok: false, error: { code: RELAY_ERROR.INVALID } }]);
   expect(client.stats().protocolErrors).toBe(1);
+  expect(client.stats().pending).toBe(0);
+  expect(assembler.stats().assemblies).toBe(0);
 
   // notModified without final is non-terminal and rejected the same way.
   const results2: unknown[] = [];
@@ -1082,8 +1085,84 @@ test("M12 teeth: notModified must be final and name a concrete revision", () => 
     },
     data: new Uint8Array(0),
   });
-  expect(results2.length).toBe(0);
+  expect(results2).toEqual([{ ok: false, error: { code: RELAY_ERROR.INVALID } }]);
   expect(client.stats().protocolErrors).toBe(2);
+  expect(client.stats().pending).toBe(0);
+  expect(assembler.stats().assemblies).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// Review 1070 B1: a malformed terminal must release pending state
+// ---------------------------------------------------------------------------
+
+/** A schema-invalid successful response for `correlation` (an unknown key). */
+const malformedOk = (correlation: number, ref: RelayResourceRef, final: boolean): RelayResourceIncomingFrame => ({
+  type: RELAY_TYPE.RESPONSE, codec: RELAY_CODEC.NONE, stream: 1, correlation,
+  metadata: { op: RELAY_OP.RESOURCE_GET, resource: ref, status: RELAY_STATUS.OK, final, bogus: 1 },
+  data: new Uint8Array(0),
+});
+
+test("B1: two malformed successful terminals release both pending gets and their assembler slots; a third get is admitted", () => {
+  // Review 1070's MALFORMED_TERMINAL_LEAK probe: maxAssemblies=2, two gets
+  // answered by schema-invalid `status:"ok", final:true` responses. Before
+  // the fix the client kept pending=2 / assemblies=2 and the third get was
+  // BUSY for the life of the stream.
+  const { wire, client, assembler } = makeClient({ maxAssemblies: 2, maxObjectBytes: 4096 });
+  const ref = (key: string): RelayResourceRef => ({ kind: RELAY_KIND.TILE, ns: "map/demo", key, revision: "r1", rendition: "rgb" });
+  const outcomes: Array<ResourceResult<unknown>> = [];
+  for (const key of ["one", "two"]) {
+    const started = client.get(1, ref(key), { accept: [RELAY_CODEC.OPAQUE_BYTES], maxObjectBytes: 4096 }, (r) => outcomes.push(r));
+    expect("correlation" in started).toBe(true);
+    client.handleFrame(malformedOk(wire.lastRequest().correlation, ref(key), true));
+  }
+  expect(outcomes).toEqual([
+    { ok: false, error: { code: RELAY_ERROR.INVALID } },
+    { ok: false, error: { code: RELAY_ERROR.INVALID } },
+  ]);
+  expect(client.stats()).toMatchObject({ pending: 0, protocolErrors: 2 });
+  expect(assembler.stats()).toMatchObject({ assemblies: 0, stagedBytes: 0 });
+  const third = client.get(1, ref("three"), { accept: [RELAY_CODEC.OPAQUE_BYTES], maxObjectBytes: 4096 }, () => {});
+  expect("correlation" in third).toBe(true);
+  // The late well-formed terminal for a request that ended as INVALID is
+  // consumed and dropped: no second completion, no new protocol error.
+  const auth = new RelayResourceAuthority();
+  feed(client, auth.answerNotModified({ stream: 1, correlation: wire.sent[0].correlation }, ref("one")));
+  expect(outcomes.length).toBe(2);
+  expect(client.stats()).toMatchObject({ pending: 1, protocolErrors: 2 });
+});
+
+test("B1: a malformed non-final response ends the get as INVALID too, and a malformed error body ends it as INVALID", () => {
+  const { wire, client, assembler } = makeClient({ maxAssemblies: 1 });
+  const outcomes: Array<ResourceResult<unknown>> = [];
+  client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, (r) => outcomes.push(r));
+  client.handleFrame(malformedOk(wire.lastRequest().correlation, tileRef("r1"), false));
+  expect(outcomes).toEqual([{ ok: false, error: { code: RELAY_ERROR.INVALID } }]);
+  expect(client.stats().pending).toBe(0);
+  expect(assembler.stats().assemblies).toBe(0);
+
+  // The slot is free again: a second get is admitted; its error terminal
+  // without an error.code is malformed and ends it as INVALID as well.
+  const started = client.get(1, tileRef("r2"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, (r) => outcomes.push(r));
+  expect("correlation" in started).toBe(true);
+  client.handleFrame({
+    type: RELAY_TYPE.RESPONSE, codec: RELAY_CODEC.NONE, stream: 1, correlation: wire.lastRequest().correlation,
+    metadata: { op: RELAY_OP.RESOURCE_GET, status: RELAY_STATUS.ERROR, final: true, error: { message: "no code" } },
+    data: new Uint8Array(0),
+  });
+  expect(outcomes[1]).toEqual({ ok: false, error: { code: RELAY_ERROR.INVALID } });
+  expect(client.stats()).toMatchObject({ pending: 0, protocolErrors: 2 });
+  expect(assembler.stats().assemblies).toBe(0);
+
+  // A subscribe answered by a malformed terminal is released the same way.
+  const sub = client.subscribe(1, tileRef("r1"), RELAY_DELIVERY.RELIABLE_DELTA, { onObject() {} }, (r) => outcomes.push(r));
+  expect("correlation" in sub).toBe(true);
+  client.handleFrame({
+    type: RELAY_TYPE.RESPONSE, codec: RELAY_CODEC.NONE, stream: 1, correlation: wire.lastRequest().correlation,
+    metadata: { op: RELAY_OP.RESOURCE_SUBSCRIBE, status: RELAY_STATUS.OK, final: true, value: { subscription: "seven" } },
+    data: new Uint8Array(0),
+  });
+  expect(outcomes[2]).toEqual({ ok: false, error: { code: RELAY_ERROR.INVALID } });
+  expect(client.stats()).toMatchObject({ pending: 0, subscriptions: 0, protocolErrors: 3 });
 });
 
 // ---------------------------------------------------------------------------
