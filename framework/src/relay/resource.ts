@@ -193,9 +193,12 @@ export class RelayResourceClient {
   private readonly entries = new Map<string, RelayLocalEntry>();
   /** Monotonic per-identity invalidation generations: the single counter a
    * get captures and a late response is compared against; a resident entry
-   * mirrors it and never feeds it. Outlives the entry itself: a
-   * revision-scope invalidation deletes the entry but a late response must
-   * still observe the moved generation. */
+   * mirrors it and never feeds it. A marker outlives the entry while a get
+   * that captured the older value is in flight (a revision-scope
+   * invalidation deletes the entry but the late response must observe the
+   * moved generation) and is dropped once neither an entry nor a pending
+   * get references it, so the map is bounded by entries + pending
+   * (review 1070 M2). */
   private readonly generations = new Map<string, number>();
   /** Subscriptions the provider holds active after this end refused their
    * push channel, each awaiting a resource.unsubscribe the request window
@@ -380,8 +383,24 @@ export class RelayResourceClient {
    * accepts the frame. */
   reportEvict(ref: RelayResourceRef, reason: string): void {
     if (reason !== RELAY_EVICT_REASON.BUDGET && reason !== RELAY_EVICT_REASON.VIEW_CLOSE) return;
-    this.entries.delete(relayResourceKey(ref));
+    const key = relayResourceKey(ref);
+    this.entries.delete(key);
+    this.pruneGeneration(key);
     this.opts.wire.advise({ op: RELAY_OP.CACHE_EVICT, resource: ref, args: { reason } });
+  }
+
+  /** Drop an identity's generation marker once nothing references it: no
+   * resident entry mirrors it and no in-flight get captured it. The fence
+   * compares a captured value with the current one, so with neither an
+   * entry nor a pending get the absolute value carries no information; the
+   * next get captures whatever the counter holds. Callers prune after the
+   * fence decision of the frame they are handling, never before it. */
+  private pruneGeneration(key: string): void {
+    if (this.entries.has(key)) return;
+    for (const p of this.pending.values()) {
+      if (p.kind === "get" && relayResourceKey(p.ref) === key) return;
+    }
+    this.generations.delete(key);
   }
 
   /** INVALIDATE received from the authority. Session pumps may also call
@@ -406,8 +425,13 @@ export class RelayResourceClient {
       if (!inScope(entry.ref)) continue;
       if (revisionScope) {
         // Revision scope removes only the concrete revision; a newer resident
-        // revision of the same identity stays.
-        if (entry.ref.revision === ref!.revision) { entry.stale = true; this.entries.delete(key); }
+        // revision of the same identity stays. The marker stays while a get
+        // of the identity is in flight and goes with the entry otherwise.
+        if (entry.ref.revision === ref!.revision) {
+          entry.stale = true;
+          this.entries.delete(key);
+          this.pruneGeneration(key);
+        }
         continue;
       }
       // The stale value is retained under the moved generation.
@@ -484,6 +508,16 @@ export class RelayResourceClient {
   private handleResponse(frame: RelayResourceIncomingFrame): void {
     const pending = this.pending.get(frame.correlation);
     if (!pending) return; // late response for a forgotten request; L1 consumed credit
+    this.handlePendingResponse(frame, pending);
+    // The request ended on this frame (any terminal path): its identity's
+    // marker is released unless an entry or another get holds it. This runs
+    // after the fence decision, which reads the marker.
+    if (pending.kind === "get" && !this.pending.has(frame.correlation)) {
+      this.pruneGeneration(relayResourceKey(pending.ref));
+    }
+  }
+
+  private handlePendingResponse(frame: RelayResourceIncomingFrame, pending: Pending): void {
     const op = typeof frame.metadata.op === "string" ? frame.metadata.op : "";
 
     if (frame.metadata.status === RELAY_STATUS.ERROR) {
@@ -752,6 +786,7 @@ export class RelayResourceClient {
         } else {
           pending.complete({ ok: false, error: { code: RELAY_ERROR.RESYNC_REQUIRED } });
         }
+        if (pending.kind === "get") this.pruneGeneration(relayResourceKey(pending.ref));
       }
     }
   }
@@ -767,6 +802,8 @@ export class RelayResourceClient {
       fencedRevisions,
       /** Refused subscriptions still awaiting their resource.unsubscribe send. */
       orphanedSubscriptions: this.orphans.size,
+      /** Identity generation markers held; at most entries + pending gets. */
+      generationMarkers: this.generations.size,
     };
   }
 }

@@ -963,6 +963,77 @@ test("M1: two refs whose fields contain the old delimiter are two identities in 
 });
 
 // ---------------------------------------------------------------------------
+// Review 1070 M2: generation markers are bounded by entries + pending gets
+// ---------------------------------------------------------------------------
+
+test("M2: invalidating, evicting and resetting 64 identities leaves no generation marker behind", () => {
+  // Review 1070's GENERATION_MARKERS_AFTER_EVICT_RESET probe: entries=0 but
+  // generationMarkers=64 before the fix.
+  const count = 64;
+  const { wire, client } = makeClient({ maxAssemblies: 1, maxObjectBytes: 16, maxScratchBytes: 16 });
+  const auth = new RelayResourceAuthority();
+  const refs: RelayResourceRef[] = [];
+  for (let i = 0; i < count; i++) {
+    const ref: RelayResourceRef = { kind: RELAY_KIND.TILE, ns: "growth", key: `k${i}`, revision: "r1", rendition: "x" };
+    refs.push(ref);
+    const started = client.get(1, ref, { accept: [RELAY_CODEC.OPAQUE_BYTES], maxObjectBytes: 16 }, () => {});
+    expect("correlation" in started).toBe(true);
+    for (const env of chunks(auth, {
+      type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
+      ref, codec: RELAY_CODEC.OPAQUE_BYTES, data: zeros(8),
+    })) feed(client, env, RELAY_CODEC.OPAQUE_BYTES);
+  }
+  expect(client.stats()).toMatchObject({ entries: count, generationMarkers: 0 });
+  client.applyInvalidate({ op: RELAY_OP.RESOURCE_INVALIDATE, args: { scope: RELAY_INVALIDATE_SCOPE.NAMESPACE, namespace: "growth" } });
+  // The resident (stale) entries mirror the moved markers.
+  expect(client.stats()).toMatchObject({ entries: count, generationMarkers: count });
+  for (const ref of refs) client.reportEvict(ref, RELAY_EVICT_REASON.BUDGET);
+  expect(client.stats()).toMatchObject({ entries: 0, generationMarkers: 0 });
+  client.resetStream(1);
+  expect(client.stats()).toMatchObject({ entries: 0, pending: 0, generationMarkers: 0 });
+});
+
+test("M2: a marker survives an eviction while a get that captured the older generation is in flight, and fences that get", () => {
+  const { wire, client } = makeClient();
+  const auth = new RelayResourceAuthority();
+  const deliver = (correlation: number, ref: RelayResourceRef) => {
+    for (const env of chunks(auth, { type: RELAY_TYPE.RESPONSE, stream: 1, correlation, ref, codec: RELAY_CODEC.R5G6B5LE, data: zeros(8) })) {
+      feed(client, env, RELAY_CODEC.R5G6B5LE);
+    }
+  };
+  // Seed a resident r1.
+  client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 8 }, () => {});
+  deliver(wire.lastRequest().correlation, tileRef("r1"));
+  expect(client.stats()).toMatchObject({ entries: 1, generationMarkers: 0 });
+
+  // A second get captures generation 0; a key-scope invalidate moves the
+  // identity to 1; the resident entry is evicted before the response lands.
+  const results: Array<ResourceResult<unknown>> = [];
+  client.get(1, tileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 8 }, (r) => results.push(r));
+  const inFlight = wire.lastRequest().correlation;
+  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
+  client.reportEvict(tileRef("r1"), RELAY_EVICT_REASON.BUDGET);
+  expect(client.stats()).toMatchObject({ entries: 0, pending: 1, generationMarkers: 1 });
+  // The late response is fenced; the marker goes with the get.
+  deliver(inFlight, tileRef("r2"));
+  expect(results).toEqual([{ ok: false, error: { code: RELAY_ERROR.RESYNC_REQUIRED } }]);
+  expect(client.stats()).toMatchObject({ entries: 0, pending: 0, generationMarkers: 0 });
+
+  // A fresh get after the prune captures the reset counter and publishes.
+  client.get(1, tileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 8 }, (r) => results.push(r));
+  deliver(wire.lastRequest().correlation, tileRef("r3"));
+  expect(results[1]?.ok).toBe(true);
+  expect(client.localEntry(tileRef())?.revision).toBe("r3");
+  // A resident entry keeps its marker after an invalidate until it is evicted.
+  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r3") }));
+  expect(client.stats()).toMatchObject({ entries: 1, generationMarkers: 1 });
+  expect(client.localEntry(tileRef())?.stale).toBe(true);
+  // A revision-scope invalidate of the resident revision releases both.
+  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r3") }));
+  expect(client.stats()).toMatchObject({ entries: 0, generationMarkers: 0 });
+});
+
+// ---------------------------------------------------------------------------
 // Review 1070 B2: chunk metadata against the negotiated maxMetaBytes
 // ---------------------------------------------------------------------------
 
