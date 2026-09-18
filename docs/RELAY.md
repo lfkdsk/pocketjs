@@ -516,7 +516,7 @@ a lone surrogate escape, a RESPONSE without `final`) are asserted to decode
 here, which is where the handoff sits.
 
 ```sh
-cargo test -p pocket-relay                       # 41 tests, 46 vectors
+cargo test -p pocket-relay                       # 46 tests, 48 vectors
 cargo build -p pocket-relay --no-default-features --target thumbv7em-none-eabi
 cargo test -p pocket-relay --release --test throughput -- --ignored --nocapture
 ```

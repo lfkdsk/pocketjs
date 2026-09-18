@@ -581,6 +581,12 @@ invalidFromBase({
 invalidFromBase({ name: "bad-session-pin", base: mapGet, baseBytes: mapGetBytes, options: { ...CONTROL_OPTS, session: "0000000000000099" }, errorCode: RELAY_FRAME_ERROR.BAD_SESSION });
 invalidFromBase({ name: "seq-zero", base: mapGet, baseBytes: mapGetBytes, mutate: b => b.set(u32le(0), 24), errorCode: RELAY_FRAME_ERROR.BAD_SEQ });
 invalidFromBase({ name: "correlation-zero-request", base: mapGet, baseBytes: mapGetBytes, mutate: b => b.set(u32le(0), 32), errorCode: RELAY_FRAME_ERROR.BAD_CORRELATION });
+// §3.6: a CANCEL rides the control stream and names its target in
+// metadata.targetStream. The legal cancel vector with header bytes 28..32
+// (stream) set to 1; the rule is a header field, so it is BAD_CORRELATION in
+// all three frame layers rather than an envelope error.
+const cancel = vectors.find(v => v.name === "cancel") as ValidVector;
+invalidFromBase({ name: "cancel-nonzero-stream", base: cancel, baseBytes: legalBytes(cancel), mutate: b => b.set(u32le(1), 28), errorCode: RELAY_FRAME_ERROR.BAD_CORRELATION });
 invalidFromBase({ name: "codec-not-negotiated", base: chunk1, baseBytes: chunkBytes, mutate: b => { /* 257 stays; options restrict */ }, options: { maxWireBytes: 65536, maxMetaBytes: 2048, codecs: [0] }, errorCode: RELAY_FRAME_ERROR.BAD_CODEC });
 invalidFromBase({
   name: "codec0-with-data", base: mapGet, baseBytes: mapGetBytes,

@@ -49,7 +49,8 @@ pub enum FrameError {
     BadSession,
     /// `seq` is zero; sequence numbers start at 1.
     BadSeq,
-    /// `correlation` is zero on REQUEST/RESPONSE/CANCEL, or nonzero elsewhere.
+    /// `correlation` is zero on REQUEST/RESPONSE/CANCEL, nonzero elsewhere, or
+    /// a CANCEL is off the control stream (`stream != 0`).
     BadCorrelation,
     /// Metadata is not strict UTF-8 JSON. This crate decides the byte half of
     /// that rule: a metadata region that is not valid UTF-8 is refused by
@@ -465,6 +466,11 @@ pub fn decode<'a>(record: &'a [u8], opts: &FrameOptions) -> Result<Frame<'a>, Fr
     } else if correlation != 0 {
         return Err(FrameError::BadCorrelation);
     }
+    // R5 §3.6: a CANCEL rides the control stream and names its target in
+    // metadata, so the header field decides this before any metadata is read.
+    if kind == spec::type_::CANCEL && stream != 0 {
+        return Err(FrameError::BadCorrelation);
+    }
 
     // The length identity above proves both regions sit inside the record.
     let meta_start = HEADER_BYTES;
@@ -542,6 +548,9 @@ pub fn encode_into(
             return Err(FrameError::BadCorrelation.into());
         }
     } else if input.correlation != 0 {
+        return Err(FrameError::BadCorrelation.into());
+    }
+    if input.kind == spec::type_::CANCEL && input.stream != 0 {
         return Err(FrameError::BadCorrelation.into());
     }
     if core::str::from_utf8(input.meta).is_err() {
@@ -777,6 +786,14 @@ mod tests {
         let push = FrameInput { correlation: 0, ..push };
         assert!(encode(&push, &mut out).is_ok(), "PUSH carries no correlation");
 
+        // R5 §3.6: a CANCEL rides stream 0; its target stream is metadata.
+        let cancel = FrameInput { kind: spec::type_::CANCEL, ..request(spec::codec::NONE, b"") };
+        assert!(encode(&cancel, &mut out).is_ok(), "CANCEL on the control stream");
+        let off_stream = FrameInput { stream: 1, ..cancel };
+        assert_eq!(encode(&off_stream, &mut out), Err(FrameError::BadCorrelation.into()));
+        let request_off_stream = FrameInput { stream: 1, ..request(spec::codec::NONE, b"") };
+        assert!(encode(&request_off_stream, &mut out).is_ok(), "only CANCEL is bound to stream 0");
+
         // Codec 0 means "no data region"; data with it is a contradiction.
         assert_eq!(
             encode(&request(spec::codec::NONE, b"x"), &mut out),
@@ -795,6 +812,22 @@ mod tests {
         let mut untouched = [0u8; 256];
         assert_eq!(encode(&not_utf8, &mut untouched), Err(FrameError::BadMetadata.into()));
         assert!(untouched.iter().all(|&b| b == 0), "a refused frame wrote nothing");
+    }
+
+    /// R5 §3.6: a CANCEL rides the control stream. Review 965 built this
+    /// record from the legal `cancel` vector by writing 1 over the stream
+    /// field; the same edit on a REQUEST is a legal stream change.
+    #[test]
+    fn decode_refuses_a_cancel_off_the_control_stream() {
+        let mut out = [0u8; 256];
+        let cancel = FrameInput { kind: spec::type_::CANCEL, ..request(spec::codec::NONE, b"") };
+        let n = encode(&cancel, &mut out).unwrap();
+        assert!(decode(&out[..n], &FrameOptions::unbounded()).is_ok());
+        out[h::STREAM_OFFSET..][..4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(decode(&out[..n], &FrameOptions::unbounded()), Err(FrameError::BadCorrelation));
+        out[h::TYPE_OFFSET] = spec::type_::REQUEST;
+        let frame = decode(&out[..n], &FrameOptions::unbounded()).unwrap();
+        assert_eq!(frame.header.stream, 1);
     }
 
     /// R5 §3.3: the metadata region is strict UTF-8. The check covers exactly
@@ -1047,7 +1080,7 @@ mod tests {
                 codec,
                 session: next(),
                 seq: (next() as u32).max(1),
-                stream: next() as u32,
+                stream: if kind == spec::type_::CANCEL { 0 } else { next() as u32 },
                 correlation: if Header::correlation_required(kind) {
                     (next() as u32).max(1)
                 } else {

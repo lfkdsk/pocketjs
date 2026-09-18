@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { decodeFrame, encodeFrame, RelayRecordDecoder } from "../framework/src/relay/frame.ts";
-import { RELAY_FRAME, RELAY_HEADER } from "../contracts/spec/relay.ts";
+import { decodeFrame, encodeFrame, encodePreparedFrame, prepareFrameBody, RelayRecordDecoder } from "../framework/src/relay/frame.ts";
+import { RELAY_FRAME, RELAY_FRAME_ERROR, RELAY_HEADER } from "../contracts/spec/relay.ts";
 
 const FIX = new URL("./fixtures/relay/", import.meta.url);
 const indexJson = await Bun.file(new URL("index.json", FIX)).json() as { vectors: string[] };
@@ -85,6 +85,28 @@ test("decoding then re-encoding every legal vector is byte-identical", async () 
     if (!again.ok) throw new Error(`${name}: re-encode rejected ${again.code}`);
     expect(Buffer.compare(Buffer.from(again.bytes), Buffer.from(bin))).toBe(0);
   }
+});
+
+test("the prepared-frame path refuses a CANCEL off stream 0 with the vector's code", async () => {
+  // §3.6: a CANCEL rides header stream 0. cancel-nonzero-stream pins
+  // BAD_CORRELATION for decodeFrame; prepareFrameBody fixes the stream before
+  // encodePreparedFrame stamps seq/correlation, so it must give the same
+  // answer, and the legal cancel must still reproduce its committed bytes.
+  const { spec, bin } = await loadVector("cancel");
+  const f = spec.expect!;
+  const body = { type: f.type, codec: f.codec, metadata: f.metadata as Record<string, unknown> };
+  const refused = prepareFrameBody({ ...body, stream: 1 }, decodeOptions(spec));
+  expect(refused.ok).toBe(false);
+  if (!refused.ok) expect(refused.code).toBe(RELAY_FRAME_ERROR.BAD_CORRELATION);
+  const oneShot = encodeFrame({ ...body, stream: 1, session: BigInt("0x" + f.session), seq: f.seq, correlation: f.correlation }, decodeOptions(spec));
+  expect(oneShot.ok).toBe(false);
+  if (!oneShot.ok) expect(oneShot.code).toBe(RELAY_FRAME_ERROR.BAD_CORRELATION);
+
+  const prepared = prepareFrameBody({ ...body, stream: 0 }, decodeOptions(spec));
+  if (!prepared.ok) throw new Error(`legal cancel rejected at prepare: ${prepared.code}`);
+  const encoded = encodePreparedFrame(prepared.body, { session: BigInt("0x" + f.session), seq: f.seq, correlation: f.correlation });
+  if (!encoded.ok) throw new Error(`legal cancel rejected at encode: ${encoded.code}`);
+  expect(Buffer.compare(Buffer.from(encoded.bytes), Buffer.from(bin))).toBe(0);
 });
 
 // --- property tests with a deterministic PRNG (reproducible, no flake) --------
