@@ -507,10 +507,14 @@ and no hash work; the recorder's counters stay at 0. `toTape()` serializes
 the entries, and `parseFrameTape` shape-validates the JSON back.
 
 **Recording sits off the live path.** `send(frame)` calls the inner
-transport first and hands the frame to the recorder after it returns;
-`recv()` returns the inner frame before recording it. A frame the recorder
+transport first and hands the frame to the recorder after that call
+returns. `recv()` calls the inner transport, hands a non-null result to
+the recorder, and returns that result; an inner `null` or `undefined`
+result is returned as `null` and records nothing. The recorder's
+`observe()` entry point does not throw, so a recorder rejection cannot
+withhold a frame the transport has produced. A frame the recorder
 rejects (a session other than the pinned one, a zero seq, or the
-`maxFrames` cap) crosses the wire, and an error thrown by the inner
+`maxFrames` cap) is sent or returned, and an error thrown by the inner
 transport propagates without recording the frame. The first rejected frame
 latches an `incomplete: {index, reason}` field onto the tape, and
 no later frame is appended: the stored tuples stay a clean single-session
