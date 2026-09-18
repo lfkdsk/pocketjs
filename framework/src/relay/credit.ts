@@ -256,13 +256,22 @@ export class RelayCreditLedger {
   }
 
   /** relay.reset keeps the counter row (late frames still settle through
-   * it) but forbids new admission; the stream id is never reused. */
+   * it) but forbids new admission; the stream id is never reused. The
+   * stream's slice returns to the attachment window for a later OPEN: the
+   * peer's receiver discards the dead stream's staging and drops its late
+   * frames without holding them, so the capacity is free on both ends. */
   markDead(stream: number) {
     if (stream === 0) {
       for (const s of this.alloc.keys()) this.dead.add(s);
       return;
     }
+    if (this.dead.has(stream)) return;
     this.dead.add(stream);
+    const slice = this.alloc.get(stream);
+    if (slice) {
+      this.sumFrames -= slice.frames;
+      this.sumBytes -= slice.bytes;
+    }
   }
 }
 
@@ -1162,7 +1171,7 @@ export class RelayRequestTable {
   /** Correlation allocates once per session across all streams (§3.6). */
   private nextCorrelation = 1;
 
-  constructor(private readonly maxPending = RELAY_LIMITS.maxPending) {}
+  constructor(private readonly maxPending: number = RELAY_LIMITS.maxPending) {}
 
   /** Number of slots whose terminal has not been consumed. */
   get active(): number {
@@ -1181,13 +1190,26 @@ export class RelayRequestTable {
     return { ok: true, correlation };
   }
 
-  /** Registers a provider-assigned correlation (the provider reuses this
-   * table for accepted work). */
-  admitKnown(stream: number, correlation: number): P3Result {
+  /** Registers a correlation allocated elsewhere: the provider registers
+   * the peer's request ids, and the composed guest draws its ids from the
+   * session's one correlation space. `reserve` keeps slots for
+   * input/control as in admit(). */
+  admitKnown(stream: number, correlation: number, reserve = 0): P3Result {
     if (this.byId.has(correlation)) return { ok: false, code: RELAY_P3_ERROR.PENDING_FULL };
-    if (this.active + 1 > this.maxPending) return { ok: false, code: RELAY_P3_ERROR.PENDING_FULL };
+    if (this.active + 1 > this.maxPending - reserve) return { ok: false, code: RELAY_P3_ERROR.PENDING_FULL };
     this.byId.set(correlation, { stream, correlation, cancelRequested: false, terminalConsumed: false });
     return { ok: true };
+  }
+
+  /** Releases a slot whose REQUEST never entered the send queue: no frame
+   * left, so no terminal will come. The correlation stays consumed (§3.6:
+   * ids do not repeat within a session). A slot with a recorded terminal is
+   * not abandonable. */
+  abandon(correlation: number): boolean {
+    const s = this.byId.get(correlation);
+    if (!s || s.terminal) return false;
+    this.byId.delete(correlation);
+    return true;
   }
 
   get(correlation: number): RelayRequestState | undefined {

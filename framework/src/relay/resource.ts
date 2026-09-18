@@ -83,9 +83,10 @@ export class RelayIdAllocator {
 // --- frame seam --------------------------------------------------------------
 
 /** What L1 must provide. request() returns the correlation it allocated, or
- * 0 when the bounded request window is full. */
+ * 0 when the bounded request window is full. A data-bearing request names
+ * its codec; without data the frame carries codec 0. */
 export interface RelayResourceWire {
-  request(stream: number, metadata: Record<string, unknown>, data?: Uint8Array): number;
+  request(stream: number, metadata: Record<string, unknown>, data?: Uint8Array, codec?: number): number;
   /** Send a correlation-less INVALIDATE-type advisory (cache.evict). */
   advise(metadata: Record<string, unknown>): void;
   /** request.cancel on stream 0; the terminal RESPONSE still arrives on the
@@ -649,7 +650,9 @@ export class RelayResourceClient {
       }
       if (!result.complete) return;
       this.terminatePending(frame.correlation, pending);
-      this.publishGet(pending, result.resource, result.codec, result.bytes, result.digest);
+      // Every chunk repeats the object's value (§3.7); the final chunk's copy
+      // is published with the bytes, as the push path does.
+      this.publishGet(pending, result.resource, result.codec, result.bytes, result.digest, meta.value);
       return;
     }
 
@@ -1068,11 +1071,13 @@ export class RelayResourceAuthority {
     return { ok: true, frames };
   }
 
-  /** Build an authority INVALIDATE. Namespace scope may name only an ns;
-   * revision/key scopes require the resource ref. */
+  /** Build an authority INVALIDATE on the business stream bound to the
+   * namespace (stream 0 carries control ops only; a session drops an
+   * INVALIDATE there). Namespace scope may name only an ns; revision/key
+   * scopes require the resource ref. */
   buildInvalidate(input:
-    | { scope: typeof RELAY_INVALIDATE_SCOPE.NAMESPACE; ns: string; reason?: string }
-    | { scope: typeof RELAY_INVALIDATE_SCOPE.KEY | typeof RELAY_INVALIDATE_SCOPE.REVISION; ref: RelayResourceRef; reason?: string },
+    | { stream: number; scope: typeof RELAY_INVALIDATE_SCOPE.NAMESPACE; ns: string; reason?: string }
+    | { stream: number; scope: typeof RELAY_INVALIDATE_SCOPE.KEY | typeof RELAY_INVALIDATE_SCOPE.REVISION; ref: RelayResourceRef; reason?: string },
   ): RelayResourceEnvelope {
     const metadata: Record<string, unknown> = { op: RELAY_OP.RESOURCE_INVALIDATE };
     const args: Record<string, unknown> = { scope: input.scope };
@@ -1084,7 +1089,32 @@ export class RelayResourceAuthority {
       if (input.reason) args.reason = input.reason;
     }
     metadata.args = args;
-    return { type: RELAY_TYPE.INVALIDATE, stream: 0, correlation: 0, metadata };
+    return { type: RELAY_TYPE.INVALIDATE, stream: input.stream, correlation: 0, metadata };
+  }
+
+  /** Terminal error for any resource op (the op's `.error` schema). A
+   * CANCELLED terminal names its effect (§3.4/§3.6: none is the only value
+   * that guarantees nothing was committed). */
+  answerError(frame: { stream: number; correlation: number }, op: string, code: string, message = code,
+    ref?: RelayResourceRef, effect?: string): RelayResourceEnvelope {
+    const envelope = this.error(frame, op, code, message, ref);
+    if (effect !== undefined) envelope.metadata.effect = effect;
+    return envelope;
+  }
+
+  /** relay.reset / stream end on the provider: every subscription the
+   * stream carried is gone; ids are never reused. Returns the ids closed. */
+  resetStream(stream: number): number[] {
+    const closed: number[] = [];
+    for (const [id, sub] of this.subscriptions) {
+      if (sub.stream === stream) { sub.active = false; this.subscriptions.delete(id); closed.push(id); }
+    }
+    return closed;
+  }
+
+  /** Active subscriptions on one stream, ascending by id. */
+  subscriptionsOn(stream: number): RelayAuthoritySubscription[] {
+    return [...this.subscriptions.values()].filter((s) => s.stream === stream && s.active);
   }
 
   subscriptionEntry(id: number): RelayAuthoritySubscription | undefined {
