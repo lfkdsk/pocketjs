@@ -527,12 +527,18 @@ exposes the strict `note()`/`noteOut()`/`noteIn()` entry points that throw
 on the same rules, and the non-throwing `observe()` entry point the
 transport wrapper uses.
 
-The §3.2 bootstrap reaches the cap rule in ordinary use: HELLO carries
-session 0 and the first frame on the assigned session uses a different
-session value. An unpinned recorder pins the tape to the bootstrap
-session; the assigned-session frames reach the peer and mark the trace
-incomplete. Pin the recorder with `{ session }` or start recording after
-READY to capture a full post-bootstrap session.
+The §3.2 bootstrap reaches the session-pin rule in ordinary use: HELLO
+carries session 0 and the first frame on the assigned session carries a
+different session value. A recorder created without `{ session }` pins
+the tape to the session of its first recorded frame, here the bootstrap
+session 0, and rejects every later frame from another session; the
+assigned-session frames reach the peer and mark the trace incomplete at
+the first of them. A recorder pinned to the assigned session that wraps
+the transport from HELLO rejects the HELLO frame at index 0 and has no
+serializable tape (`toTape()` throws). To capture a full post-bootstrap
+session, wrap the transport after READY; a `{ session }` pin on that
+recorder marks the trace incomplete at the first frame from any other
+session.
 
 Replay uses a fake transport from `createRelayFrameReplay`: `recv()` returns
 the next recorded inbound record in capture order and `send(frame)` hashes
