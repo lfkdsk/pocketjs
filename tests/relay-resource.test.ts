@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { sha256Hex, verifySha256Digest } from "../framework/src/relay/sha256.ts";
 import { RelayChunkAssembler } from "../framework/src/relay/assembler.ts";
 import { validateRelayMetadata } from "../framework/src/relay/metadata.ts";
+import { RELAY_FRAME_ERROR, encodeFrame, prepareFrameBody } from "../framework/src/relay/frame.ts";
 import {
   RELAY_MAX_FENCED_REVISIONS,
   RelayIdAllocator,
@@ -22,6 +23,7 @@ import {
   RELAY_EVICT_REASON,
   RELAY_INVALIDATE_SCOPE,
   RELAY_KIND,
+  RELAY_LIMITS,
   RELAY_OP,
   RELAY_STATUS,
   RELAY_TYPE,
@@ -349,6 +351,13 @@ function toFrame(env: RelayResourceEnvelope, codec: number = RELAY_CODEC.NONE): 
 const feed = (client: RelayResourceClient, env: RelayResourceEnvelope, codec?: number) =>
   client.handleFrame(toFrame(env, codec));
 
+/** The frames of one chunk plan; a refused plan fails the test. */
+function chunks(auth: RelayResourceAuthority, input: Parameters<RelayResourceAuthority["chunkObject"]>[0]): RelayResourceEnvelope[] {
+  const plan = auth.chunkObject(input);
+  if (!plan.ok) throw new Error(`chunkObject refused: ${plan.message}`);
+  return plan.frames;
+}
+
 // ---------------------------------------------------------------------------
 // resource.get / notModified
 // ---------------------------------------------------------------------------
@@ -363,7 +372,7 @@ test("get delivers a chunked object once, at the final frame", () => {
   const auth = new RelayResourceAuthority({ maxWireBytes: 65536 });
   const data = zeros(131072);
   for (let i = 0; i < data.length; i++) data[i] = i & 0xff;
-  const frames = auth.chunkObject({
+  const frames = chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
     ref: tileRef(), codec: RELAY_CODEC.R5G6B5LE, data,
     value: { width: 256, height: 256, logicalSize: 256 },
@@ -457,7 +466,7 @@ test("subscribe reliable-delta receives revision-increasing pushes in order", ()
   const subId = (subEnv.metadata.value as { subscription: number }).subscription;
 
   const push = (revision: string, baseRevision: string) => {
-    const frames = auth.chunkObject({
+    const frames = chunks(auth, {
       type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: subId,
       ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE,
       data: zeros(100), baseRevision,
@@ -482,7 +491,7 @@ test("a reliable delta on the wrong base signals resync and does not advance rev
   feed(client, auth.answerSubscribe({ stream: 1, correlation: wire.lastRequest().correlation, metadata: wire.lastRequest().metadata }));
   const id = 1; // the authority's first subscription id
   // r3 delta based on r9 while the client holds r1: broken chain.
-  const frames = auth.chunkObject({
+  const frames = chunks(auth, {
     type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: id,
     ref: tileRef("r3"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100), baseRevision: "r9",
   });
@@ -502,7 +511,7 @@ test("out-of-order chunks never publish: a gap frame terminates the push with IN
   const auth = new RelayResourceAuthority();
   feed(client, auth.answerSubscribe({ stream: 1, correlation: wire.lastRequest().correlation, metadata: wire.lastRequest().metadata }));
   const id = 1;
-  const frames = auth.chunkObject({
+  const frames = chunks(auth, {
     type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: id,
     ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(200000),
   });
@@ -545,7 +554,7 @@ test("unsubscribe then a queued push is consumed and dropped", () => {
   feed(client, auth.answerUnsubscribe({ stream: 1, correlation: wire.lastRequest().correlation, metadata: wire.lastRequest().metadata }));
   expect(client.subscription(id)).toBeUndefined();
   // A push already on the wire after unsubscribe.
-  const frames = auth.chunkObject({
+  const frames = chunks(auth, {
     type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: id,
     ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
   });
@@ -581,7 +590,7 @@ test("F3: a subscription id equal to an in-flight get correlation does not colli
   expect(client.subscription(1)).toBeDefined();
 
   // Pushes on subscription 1 deliver while get correlation 1 is still open.
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: 1,
     ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64),
   })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -589,7 +598,7 @@ test("F3: a subscription id equal to an in-flight get correlation does not colli
 
   // The in-flight get completes through its own channel and is not killed by
   // the overlapping subscription id.
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: 1,
     ref: tileRef("r1"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64),
   })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -606,7 +615,7 @@ test("invalidate scope=revision removes the local entry and fences an in-flight 
   const auth = new RelayResourceAuthority();
   feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }), RELAY_CODEC.NONE);
   // The late response now fences on generation.
-  const frames = auth.chunkObject({
+  const frames = chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.sent[0].correlation,
     ref: tileRef("r1"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
   });
@@ -622,7 +631,7 @@ test("invalidate scope=key advances local generation but keeps the stale value",
   const auth = new RelayResourceAuthority();
   const results: unknown[] = [];
   seeded.client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, (r) => results.push(r));
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: seeded.wire.lastRequest().correlation,
     ref: tileRef("r1"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
   })) seeded.client.handleFrame(toFrame(f, RELAY_CODEC.R5G6B5LE));
@@ -643,7 +652,7 @@ test("invalidate scope=namespace moves every matching namespace generation forwa
   for (const ref of [a, b, other]) {
     const corr = seeded.client.get(1, ref, { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, () => {});
     if (!("correlation" in corr)) throw new Error("budget");
-    for (const f of auth.chunkObject({
+    for (const f of chunks(auth, {
       type: RELAY_TYPE.RESPONSE, stream: 1, correlation: corr.correlation,
       ref, codec: RELAY_CODEC.R5G6B5LE, data: zeros(10),
     })) seeded.client.handleFrame(toFrame(f, RELAY_CODEC.R5G6B5LE));
@@ -671,7 +680,7 @@ test("F1: a key-scope invalidate fences an in-flight revisionless get", () => {
     (r) => results.push(r as { ok: boolean; error?: { code: string } }));
   feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
   // The late response names the concrete revision (§3.5).
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
     ref: tileRef("r1"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
   })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -692,7 +701,7 @@ test("F1: a revision-scope invalidate fences only the invalidated concrete revis
   feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
   // Authority answers with the current revision, r2: a different concrete
   // revision that the fence must not reject.
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
     ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
   })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -705,7 +714,7 @@ test("F1: a revision-scope invalidate fences only the invalidated concrete revis
   client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
     (r) => named.push(r as { ok: boolean; error?: { code: string } }));
   feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
     ref: tileRef("r1"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
   })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -719,7 +728,7 @@ test("F1: revision scope removes only the current concrete revision; an invalida
   const serve = (revision: string) => {
     const out = seeded.client.get(1, tileRef(revision), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, () => {});
     if (!("correlation" in out)) throw new Error("budget");
-    for (const f of auth.chunkObject({
+    for (const f of chunks(auth, {
       type: RELAY_TYPE.RESPONSE, stream: 1, correlation: out.correlation,
       ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE, data: zeros(10),
     })) seeded.client.handleFrame(toFrame(f, RELAY_CODEC.R5G6B5LE));
@@ -757,7 +766,7 @@ test("invalidate after subscribe forces resync on the next delta", () => {
     resource: tileRef("r1"),
     args: { scope: RELAY_INVALIDATE_SCOPE.KEY },
   });
-  const frames = auth.chunkObject({
+  const frames = chunks(auth, {
     type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: 1,
     ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100), baseRevision: "r1",
   });
@@ -782,7 +791,7 @@ test("F2: a full snapshot re-bases a resyncing reliable-delta subscription", () 
   });
 
   // §3.7 recovery: a full snapshot carries no baseRevision.
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription,
     ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64),
   })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -790,7 +799,7 @@ test("F2: a full snapshot re-bases a resyncing reliable-delta subscription", () 
   expect(client.subscription(subscription)?.resyncRequired).toBe(false);
 
   // A delta on the snapshot base applies cleanly.
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription,
     ref: tileRef("r3"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64), baseRevision: "r2",
   })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -816,7 +825,7 @@ test("F2: a delta alone never clears the resync flag; recovery needs the snapsho
   });
   // Two deltas while resyncing: both stay marked and the base never advances.
   for (const revision of ["r2", "r3"]) {
-    for (const f of auth.chunkObject({
+    for (const f of chunks(auth, {
       type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: 1,
       ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64), baseRevision: "r1",
     })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -854,7 +863,7 @@ test("local eviction sends one cache.evict advisory and never waits for an ACK (
   const auth = new RelayResourceAuthority();
   const corr = client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, () => {});
   if (!("correlation" in corr)) throw new Error("budget");
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: corr.correlation,
     ref: tileRef("r1"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(10),
   })) client.handleFrame(toFrame(f, RELAY_CODEC.R5G6B5LE));
@@ -883,9 +892,9 @@ test("id allocator never wraps or reuses", () => {
 // ---------------------------------------------------------------------------
 
 test("authority chunks respect the wire ceiling with contiguous offsets and one final chunk", () => {
-  const auth = new RelayResourceAuthority({ maxWireBytes: 65536 });
+  const auth = new RelayResourceAuthority({ maxWireBytes: 65536, maxMetaBytes: 2048 });
   const data = zeros(131072);
-  const frames = auth.chunkObject({
+  const frames = chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: 1,
     ref: tileRef(), codec: RELAY_CODEC.R5G6B5LE, data,
     value: { width: 256, height: 256 },
@@ -896,18 +905,132 @@ test("authority chunks respect the wire ceiling with contiguous offsets and one 
     expect(Number(BigInt("0x" + t.offset))).toBe(offset);
     offset += f.data!.length;
     expect(f.metadata.final).toBe(i === frames.length - 1);
-    // 48B header + metadata + data within the wire ceiling.
-    expect(48 + stringToUtf8(JSON.stringify(f.metadata)).length + f.data!.length).toBeLessThanOrEqual(65536);
+    expect(f.codec).toBe(RELAY_CODEC.R5G6B5LE);
+    // 48B header + metadata + data within the wire ceiling, metadata within
+    // the metadata ceiling: the canonical encoder accepts every chunk.
+    const metaLen = stringToUtf8(JSON.stringify(f.metadata)).length;
+    expect(48 + metaLen + f.data!.length).toBeLessThanOrEqual(65536);
+    expect(metaLen).toBeLessThanOrEqual(2048);
+    expect(prepareFrameBody({ type: f.type, codec: f.codec, stream: f.stream, metadata: f.metadata, data: f.data },
+      { maxWireBytes: 65536, maxMetaBytes: 2048 }).ok).toBe(true);
   });
   expect(offset).toBe(131072);
   // Distinct objects get distinct, non-reused transfer ids.
-  const again = auth.chunkObject({
+  const again = chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: 2,
     ref: tileRef(), codec: RELAY_CODEC.R5G6B5LE, data: zeros(10),
   });
   const idA = (frames[0].metadata.transfer as { id: number }).id;
   const idB = (again[0].metadata.transfer as { id: number }).id;
   expect(idB).toBeGreaterThan(idA);
+});
+
+// ---------------------------------------------------------------------------
+// Review 1070 B2: chunk metadata against the negotiated maxMetaBytes
+// ---------------------------------------------------------------------------
+
+const metaBytesOf = (meta: Record<string, unknown>) => stringToUtf8(JSON.stringify(meta)).length;
+
+test("B2: a chunk plan whose metadata exceeds the negotiated maxMetaBytes is refused TOO_LARGE, never handed to the encoder", () => {
+  // Review 1070's CHUNK_META_CAP probe: standard bulk limits, a legal 4000
+  // byte value.note. Before the fix the chunker emitted 4,308-byte metadata
+  // and encodeFrame refused the authority's own frame with META_TOO_LARGE.
+  const auth = new RelayResourceAuthority({
+    maxWireBytes: RELAY_LIMITS.bulkMaxWireBytes, maxMetaBytes: RELAY_LIMITS.bulkMaxMetaBytes,
+  });
+  const ref: RelayResourceRef = { kind: RELAY_KIND.TILE, ns: "map/demo", key: "k", revision: "r1", rendition: "rgb" };
+  const plan = auth.chunkObject({
+    type: RELAY_TYPE.RESPONSE, stream: 1, correlation: 1, ref,
+    codec: RELAY_CODEC.OPAQUE_BYTES, data: zeros(4096), value: { note: "x".repeat(4000) },
+  });
+  expect(plan.ok).toBe(false);
+  if (plan.ok) throw new Error("plan accepted");
+  expect(plan.code).toBe(RELAY_ERROR.TOO_LARGE);
+  expect(plan.limit).toBe("maxMetaBytes");
+  expect(plan.metaBytes).toBeGreaterThan(RELAY_LIMITS.bulkMaxMetaBytes);
+
+  // The same object with a value under the ceiling chunks, and every chunk
+  // encodes under the bulk limits the receiver negotiated.
+  const fits = auth.chunkObject({
+    type: RELAY_TYPE.RESPONSE, stream: 1, correlation: 1, ref,
+    codec: RELAY_CODEC.OPAQUE_BYTES, data: zeros(4096), value: { note: "x".repeat(1500) },
+  });
+  expect(fits.ok).toBe(true);
+  if (!fits.ok) throw new Error(fits.message);
+  for (const chunk of fits.frames) {
+    expect(metaBytesOf(chunk.metadata)).toBeLessThanOrEqual(RELAY_LIMITS.bulkMaxMetaBytes);
+    const encoded = encodeFrame({
+      type: chunk.type, codec: chunk.codec, session: 0x0102030405060708n, seq: 1,
+      stream: chunk.stream, correlation: chunk.correlation, metadata: chunk.metadata, data: chunk.data,
+    }, { maxWireBytes: RELAY_LIMITS.bulkMaxWireBytes, maxMetaBytes: RELAY_LIMITS.bulkMaxMetaBytes });
+    expect(encoded.ok).toBe(true);
+  }
+  // The wire ceiling is refused the same way when metadata leaves no data room.
+  const tight = new RelayResourceAuthority({ maxWireBytes: 300, maxMetaBytes: 2048 });
+  const noRoom = tight.chunkObject({ type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: 1, ref, codec: RELAY_CODEC.OPAQUE_BYTES, data: zeros(10) });
+  expect(noRoom.ok).toBe(false);
+  if (noRoom.ok) throw new Error("plan accepted");
+  expect(noRoom.limit).toBe("maxWireBytes");
+  expect(48 + noRoom.metaBytes + 1).toBeGreaterThan(300);
+  // A zero-length object is one final chunk under the same two checks.
+  const empty = auth.chunkObject({ type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: 1, ref, codec: RELAY_CODEC.OPAQUE_BYTES, data: zeros(0) });
+  expect(empty.ok && empty.frames.length === 1 && empty.frames[0].metadata.final === true && empty.frames[0].codec === RELAY_CODEC.NONE).toBe(true);
+});
+
+test("B2 property: under random tiny negotiated limits every planned chunk encodes, or the plan names the limit its metadata cannot fit", () => {
+  let seed = 0x1087;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 0x100000000; };
+  const between = (lo: number, hi: number) => lo + Math.floor(rnd() * (hi - lo + 1));
+  let accepted = 0, refusedMeta = 0, refusedWire = 0;
+  for (let run = 0; run < 400; run++) {
+    const maxMetaBytes = between(150, 700);
+    const maxWireBytes = between(RELAY_LIMITS.controlMaxWireBytes / 16, 1500);
+    const auth = new RelayResourceAuthority({ maxWireBytes, maxMetaBytes });
+    const total = between(0, 3000);
+    const data = new Uint8Array(total);
+    for (let i = 0; i < total; i++) data[i] = (i * 31 + run) & 0xff;
+    const push = rnd() < 0.5;
+    const ref: RelayResourceRef = {
+      kind: RELAY_KIND.TILE, ns: "n".repeat(between(1, 20)), key: "k".repeat(between(1, 40)),
+      revision: `r${run}`, rendition: "x",
+    };
+    const plan = auth.chunkObject({
+      type: push ? RELAY_TYPE.PUSH : RELAY_TYPE.RESPONSE, stream: 1,
+      correlation: push ? 0 : 1, subscription: push ? 3 : undefined, ref,
+      codec: RELAY_CODEC.OPAQUE_BYTES, data,
+      ...(rnd() < 0.7 ? { value: { note: "v".repeat(between(0, 400)) } } : {}),
+      ...(push && rnd() < 0.3 ? { baseRevision: "b" } : {}),
+    });
+    if (!plan.ok) {
+      expect(plan.code).toBe(RELAY_ERROR.TOO_LARGE);
+      if (plan.limit === "maxMetaBytes") { expect(plan.metaBytes).toBeGreaterThan(maxMetaBytes); refusedMeta++; }
+      else { expect(48 + plan.metaBytes + 1).toBeGreaterThan(maxWireBytes); refusedWire++; }
+      continue;
+    }
+    accepted++;
+    let offset = 0;
+    plan.frames.forEach((f, i) => {
+      // The L1 encoder accepts every chunk under the negotiated limits.
+      const body = prepareFrameBody({ type: f.type, codec: f.codec, stream: f.stream, metadata: f.metadata, data: f.data },
+        { maxWireBytes, maxMetaBytes });
+      expect(body.ok, `run ${run}: ${body.ok ? "" : body.code}`).toBe(true);
+      const t = f.metadata.transfer as { offset: string; total: string };
+      expect(Number(BigInt("0x" + t.offset))).toBe(offset);
+      expect(Number(BigInt("0x" + t.total))).toBe(total);
+      offset += f.data!.length;
+      expect(f.metadata.final).toBe(i === plan.frames.length - 1);
+      if (!f.metadata.final) expect(f.data!.length).toBeGreaterThan(0);
+    });
+    expect(offset).toBe(total);
+    expect(Buffer.concat(plan.frames.map((f) => Buffer.from(f.data!)))).toEqual(Buffer.from(data));
+  }
+  // The generator covered every branch.
+  expect(accepted).toBeGreaterThan(50);
+  expect(refusedMeta).toBeGreaterThan(5);
+  expect(refusedWire).toBeGreaterThan(5);
+  // The pre-fix failure is what the encoder returns for metadata over the
+  // ceiling; the plan refuses first, so this code never reaches the wire.
+  expect(RELAY_FRAME_ERROR.META_TOO_LARGE).toBe("META_TOO_LARGE");
 });
 
 // ---------------------------------------------------------------------------
@@ -956,7 +1079,7 @@ test("adapter: 72 tiles x 40960B enqueue/publish counts and peak resident bytes"
     // Serve every request started this frame with one chunked tile.
     for (const req of wire.sent.splice(0)) {
       if (req.metadata.op !== RELAY_OP.RESOURCE_GET) continue;
-      const out = auth.chunkObject({
+      const out = chunks(auth, {
         type: RELAY_TYPE.RESPONSE, stream: 1, correlation: req.correlation,
         ref: req.metadata.resource as RelayResourceRef, codec: RELAY_CODEC.R5G6B5LE,
         data: zeros(TILE_BYTES),
@@ -1020,7 +1143,7 @@ test("F4: a notModified revalidation keeps the resident bytes instead of materia
   // Round 1: a real 4096 B object lands in the cache.
   scheduler.step();
   for (const req of wire.sent.splice(0)) {
-    for (const env of auth.chunkObject({
+    for (const env of chunks(auth, {
       type: RELAY_TYPE.RESPONSE, stream: 1, correlation: req.correlation,
       ref, codec: RELAY_CODEC.R5G6B5LE, data: zeros(TILE_BYTES),
     })) feed(client, env, RELAY_CODEC.R5G6B5LE);
@@ -1175,7 +1298,7 @@ test("G1: the identity generation is one monotonic counter moved once per invali
   const auth = new RelayResourceAuthority();
   const results: Record<string, { ok: boolean; error?: { code: string } }> = {};
   const answer = (correlation: number, revision: string) => {
-    for (const f of auth.chunkObject({
+    for (const f of chunks(auth, {
       type: RELAY_TYPE.RESPONSE, stream: 1, correlation,
       ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE, data: zeros(100),
     })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -1238,7 +1361,7 @@ test("G2: revision markers on an in-flight get are bounded; overflow fences the 
   // Past the bound the marker escalates to the whole get: a response naming
   // a revision that was never invalidated is dropped too (a re-fetch, never a
   // guess about which revision the burst reached).
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation,
     ref: tileRef("r-current"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(16),
   })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -1250,7 +1373,7 @@ test("G2: revision markers on an in-flight get are bounded; overflow fences the 
   const again: { ok: boolean }[] = [];
   client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
     (r) => again.push(r as { ok: boolean }));
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
     ref: tileRef("r-current"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(16),
   })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -1269,7 +1392,7 @@ test("G2: below the bound the fence stays exact and a repeated revision is one m
     return out.correlation;
   };
   const answer = (correlation: number, revision: string) => {
-    for (const f of auth.chunkObject({
+    for (const f of chunks(auth, {
       type: RELAY_TYPE.RESPONSE, stream: 1, correlation,
       ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE, data: zeros(16),
     })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -1336,7 +1459,7 @@ test("G3: a push reservation that fails after the subscribe was sent withdraws t
   expect(auth.subscriptionEntry(id)).toBeUndefined();
   // Only the get is still pending; a push already on the wire is dropped.
   expect(client.stats()).toMatchObject({ pending: 1, subscriptions: 0, orphanedSubscriptions: 0 });
-  for (const f of auth.chunkObject({
+  for (const f of chunks(auth, {
     type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: id,
     ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(16),
   })) feed(client, f, RELAY_CODEC.R5G6B5LE);
@@ -1433,7 +1556,7 @@ test("TEETH B5: a wrong-base delta latches resync for the next object", () => {
   }));
   const id = client.subscription(1)!.id;
   const push = (revision: string, baseRevision?: string) => {
-    for (const f of auth.chunkObject({
+    for (const f of chunks(auth, {
       type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: id,
       ref: tileRef(revision), codec: RELAY_CODEC.R5G6B5LE, data: zeros(64), baseRevision,
     })) feed(client, f, RELAY_CODEC.R5G6B5LE);
