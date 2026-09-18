@@ -190,6 +190,12 @@ export class RelayResourceClient {
    * revision-scope invalidation deletes the entry but a late response must
    * still observe the moved generation. */
   private readonly generations = new Map<string, number>();
+  /** Subscriptions the provider holds active after this end refused their
+   * push channel, each awaiting a resource.unsubscribe the request window
+   * could not take yet (subscription id -> stream). Retried on the next
+   * incoming frame; dropped with the stream on reset. One per refused
+   * subscribe response, so bounded by the subscribes the caller issued. */
+  private readonly orphans = new Map<number, number>();
   private readonly assembler: RelayChunkAssembler;
   private readonly maxFencedRevisions: number;
   private protocolErrors = 0;
@@ -270,6 +276,10 @@ export class RelayResourceClient {
       return { ok: false, code: RELAY_ERROR.INVALID };
     }
     const isRef = "kind" in target;
+    // Reserve-then-accept (§3.7), as the get path: refuse (BUSY) before
+    // consuming a request slot when the push channel could not be admitted
+    // now. The reservation itself needs the id the terminal response carries.
+    if (!this.assembler.canReserve(this.opts.negotiated.maxObjectBytes)) return { ok: false, code: RELAY_ERROR.BUSY };
     const metadata: Record<string, unknown> = {
       op: RELAY_OP.RESOURCE_SUBSCRIBE,
       args: isRef ? { delivery } : { delivery, namespace: (target as { ns: string }).ns },
@@ -286,7 +296,16 @@ export class RelayResourceClient {
           // from get correlations (§3.7); admission failure closes the
           // subscription.
           const reservation = this.assembler.reserve({ stream, channel: id, space: "push" }, this.opts.negotiated.maxObjectBytes);
-          if (!reservation.ok) { handler.onEnd?.({ code: reservation.code }); complete(result); return; }
+          if (!reservation.ok) {
+            // The provider holds the subscription active and would keep
+            // pushing to a channel this end cannot assemble: withdraw it with
+            // resource.unsubscribe (§3.8 lease teardown) and report the
+            // admission failure, not an id the caller never held.
+            this.withdrawSubscription(stream, id);
+            handler.onEnd?.({ code: reservation.code });
+            complete({ ok: false, error: { code: reservation.code } });
+            return;
+          }
           if (isRef) {
             const ref = target as RelayResourceRef;
             this.subscriptions.set(id, {
@@ -429,10 +448,30 @@ export class RelayResourceClient {
     if (frame.type === RELAY_TYPE.INVALIDATE) {
       if (frame.metadata.op === RELAY_OP.RESOURCE_INVALIDATE) this.applyInvalidate(frame.metadata);
       // cache.evict travels consumer -> authority only; receiving one is a no-op.
-      return;
-    }
-    if (frame.type === RELAY_TYPE.RESPONSE) this.handleResponse(frame);
+    } else if (frame.type === RELAY_TYPE.RESPONSE) this.handleResponse(frame);
     else if (frame.type === RELAY_TYPE.PUSH) this.handlePush(frame);
+    // A consumed terminal response may have freed the request window: retry
+    // the withdrawals it refused earlier.
+    if (this.orphans.size) this.withdrawOrphans();
+  }
+
+  /** resource.unsubscribe for a subscription this end never admitted. The
+   * terminal response is consumed and dropped. A full request window keeps
+   * the id in `orphans` for the next attempt instead of losing it. */
+  private withdrawSubscription(stream: number, id: number): boolean {
+    const correlation = this.opts.wire.request(stream, {
+      op: RELAY_OP.RESOURCE_UNSUBSCRIBE, args: { subscription: id },
+    });
+    if (correlation === 0) { this.orphans.set(id, stream); return false; }
+    this.orphans.delete(id);
+    this.pending.set(correlation, { kind: "unsubscribe", stream, complete: () => {} });
+    return true;
+  }
+
+  private withdrawOrphans(): void {
+    for (const [id, stream] of this.orphans) {
+      if (!this.withdrawSubscription(stream, id)) return; // window still full; keep the rest
+    }
   }
 
   private handleResponse(frame: RelayResourceIncomingFrame): void {
@@ -669,6 +708,9 @@ export class RelayResourceClient {
     for (const [id, sub] of this.subscriptions) {
       if (sub.stream === stream) { this.closeSubscription(id); sub.handler.onEnd?.(); }
     }
+    // The reset ends the stream's subscriptions on the provider as well, so a
+    // pending withdrawal has nothing left to withdraw.
+    for (const [id, s] of this.orphans) if (s === stream) this.orphans.delete(id);
     for (const [correlation, pending] of this.pending) {
       if (pending.stream === stream) {
         this.pending.delete(correlation);
@@ -692,6 +734,8 @@ export class RelayResourceClient {
       protocolErrors: this.protocolErrors,
       /** Revision markers held across in-flight gets: at most pending × maxFencedRevisions. */
       fencedRevisions,
+      /** Refused subscriptions still awaiting their resource.unsubscribe send. */
+      orphanedSubscriptions: this.orphans.size,
     };
   }
 }

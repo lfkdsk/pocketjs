@@ -1225,3 +1225,103 @@ test("G2: below the bound the fence stays exact and a repeated revision is one m
   expect(results[3].error?.code).toBe(RELAY_ERROR.RESYNC_REQUIRED);
   expect(client.localEntry(tileRef("t-new"))?.revision).toBe("s-new");
 });
+
+test("G3: a push reservation that fails after the subscribe was sent withdraws the provider subscription", () => {
+  const { wire, client } = makeClient({ maxAssemblies: 1 });
+  const auth = new RelayResourceAuthority();
+  const ended: ({ code: string } | undefined)[] = [];
+  const completions: { ok: boolean; error?: { code: string } }[] = [];
+  const sub = client.subscribe(1, tileRef("r1"), RELAY_DELIVERY.LATEST_SNAPSHOT,
+    { onObject: () => { throw new Error("must not deliver"); }, onEnd: (e) => ended.push(e) },
+    (r) => completions.push(r as { ok: boolean; error?: { code: string } }));
+  expect("correlation" in sub).toBe(true);
+  const subscribeReq = wire.lastRequest();
+  // Between the send and the terminal response a get takes the last slot.
+  const got = client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 1024 }, () => {});
+  expect("correlation" in got).toBe(true);
+  const answer = auth.answerSubscribe({ stream: 1, correlation: subscribeReq.correlation, metadata: subscribeReq.metadata });
+  const id = (answer.metadata.value as { subscription: number }).subscription;
+  feed(client, answer);
+  // This end admitted nothing and says so to the caller and the handler;
+  // review 989 G3 completed the subscribe ok with an id the client never held.
+  expect(ended).toEqual([{ code: RELAY_ERROR.BUSY }]);
+  expect(completions).toEqual([{ ok: false, error: { code: RELAY_ERROR.BUSY } }]);
+  expect(client.subscription(id)).toBeUndefined();
+  // The provider holds it active until the withdrawal on the wire is answered.
+  expect(auth.subscriptionEntry(id)?.active).toBe(true);
+  const withdrawal = wire.lastRequest();
+  expect(withdrawal.stream).toBe(1);
+  expect(withdrawal.metadata).toEqual({ op: RELAY_OP.RESOURCE_UNSUBSCRIBE, args: { subscription: id } });
+  feed(client, auth.answerUnsubscribe({ stream: 1, correlation: withdrawal.correlation, metadata: withdrawal.metadata }));
+  expect(auth.subscriptionEntry(id)).toBeUndefined();
+  // Only the get is still pending; a push already on the wire is dropped.
+  expect(client.stats()).toMatchObject({ pending: 1, subscriptions: 0, orphanedSubscriptions: 0 });
+  for (const f of auth.chunkObject({
+    type: RELAY_TYPE.PUSH, stream: 1, correlation: 0, subscription: id,
+    ref: tileRef("r2"), codec: RELAY_CODEC.R5G6B5LE, data: zeros(16),
+  })) feed(client, f, RELAY_CODEC.R5G6B5LE);
+  expect(client.stats().protocolErrors).toBe(0);
+});
+
+test("G3: subscribe refuses BUSY before sending when the assembly budget is full", () => {
+  const { wire, client } = makeClient({ maxAssemblies: 1 });
+  client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 1024 }, () => {});
+  const sentBefore = wire.sent.length;
+  const ended: unknown[] = [];
+  const out = client.subscribe(1, tileRef("r1"), RELAY_DELIVERY.LATEST_SNAPSHOT,
+    { onObject: () => {}, onEnd: (e) => ended.push(e) }, () => { throw new Error("no request, no completion"); });
+  // Reserve-then-accept (§3.7), as the get path: nothing reaches the
+  // provider, so nothing can leak there; the caller retries on a later frame.
+  expect(out).toEqual({ ok: false, code: RELAY_ERROR.BUSY });
+  expect(wire.sent.length).toBe(sentBefore);
+  expect(ended).toEqual([]);
+});
+
+test("G3: a withdrawal the request window refuses is retried on the next incoming frame", () => {
+  const { wire, client } = makeClient({ maxAssemblies: 1 });
+  const auth = new RelayResourceAuthority();
+  client.subscribe(1, tileRef("r1"), RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject: () => {} }, () => {});
+  const subscribeReq = wire.lastRequest();
+  const getResults: unknown[] = [];
+  client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 1024 }, (r) => getResults.push(r));
+  const getReq = wire.lastRequest();
+  const answer = auth.answerSubscribe({ stream: 1, correlation: subscribeReq.correlation, metadata: subscribeReq.metadata });
+  const id = (answer.metadata.value as { subscription: number }).subscription;
+  wire.refuseRequest = true; // the L1 request window is full when the response lands
+  feed(client, answer);
+  expect(wire.lastRequest()).toBe(getReq);
+  expect(client.stats().orphanedSubscriptions).toBe(1);
+  // Still full: an unrelated frame changes nothing.
+  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
+  expect(client.stats().orphanedSubscriptions).toBe(1);
+  expect(wire.lastRequest()).toBe(getReq);
+  // The get's terminal response frees the window; the withdrawal goes out then.
+  wire.refuseRequest = false;
+  feed(client, auth.answerGetError({ stream: 1, correlation: getReq.correlation }, RELAY_ERROR.NOT_FOUND));
+  expect(getResults.length).toBe(1);
+  const withdrawal = wire.lastRequest();
+  expect(withdrawal.metadata).toEqual({ op: RELAY_OP.RESOURCE_UNSUBSCRIBE, args: { subscription: id } });
+  expect(client.stats().orphanedSubscriptions).toBe(0);
+  feed(client, auth.answerUnsubscribe({ stream: 1, correlation: withdrawal.correlation, metadata: withdrawal.metadata }));
+  expect(auth.subscriptionEntry(id)).toBeUndefined();
+  expect(client.stats()).toMatchObject({ pending: 0, orphanedSubscriptions: 0 });
+});
+
+test("G3: a stream reset drops a pending withdrawal with the stream's subscriptions", () => {
+  const { wire, client } = makeClient({ maxAssemblies: 1 });
+  const auth = new RelayResourceAuthority();
+  client.subscribe(1, tileRef("r1"), RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject: () => {} }, () => {});
+  const subscribeReq = wire.lastRequest();
+  client.get(1, tileRef("r1"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 1024 }, () => {});
+  wire.refuseRequest = true;
+  feed(client, auth.answerSubscribe({ stream: 1, correlation: subscribeReq.correlation, metadata: subscribeReq.metadata }));
+  expect(client.stats().orphanedSubscriptions).toBe(1);
+  // relay.reset / session end: the provider ends every subscription of the
+  // stream itself, so the withdrawal has nothing left to withdraw.
+  client.resetStream(1);
+  wire.refuseRequest = false;
+  const sentBefore = wire.sent.length;
+  feed(client, auth.buildInvalidate({ scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
+  expect(wire.sent.length).toBe(sentBefore);
+  expect(client.stats()).toMatchObject({ pending: 0, subscriptions: 0, orphanedSubscriptions: 0 });
+});
