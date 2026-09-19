@@ -738,3 +738,9 @@ pub extern "C" fn ui_font_stream_stats() -> usize {
 pub extern "C" fn ui_font_stream_json_ptr() -> *const u8 {
     unsafe { FONT_STREAM_JSON.as_ptr() }
 }
+#[no_mangle]
+pub extern "C" fn ui_upload_mesh(ptr: *const u8, len: usize) -> i32 { ui().upload_mesh(unsafe { bytes(ptr,len) }) }
+#[no_mangle]
+pub extern "C" fn ui_free_mesh(handle: i32) { ui().free_mesh(handle); }
+#[no_mangle]
+pub extern "C" fn ui_set_mesh(id: i32, handle: i32) { ui().set_mesh(id,handle); }

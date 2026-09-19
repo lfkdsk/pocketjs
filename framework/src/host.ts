@@ -64,6 +64,10 @@ export interface HostOps {
   uploadTexture(buf: Uint8Array, w: number, h: number, psm: number): number;
   /** texHandle < 0 clears the image (handles are 0-based: 0 is a real one). */
   setImage(id: number, texHandle: number): void;
+  /** Optional prepared 2D geometry; handles have a separate ownership namespace. */
+  setMesh?(id: number, handle: number): void;
+  freeMesh?(handle: number): void;
+  uploadMesh?(bytes: Uint8Array): number;
   /** Bind a native application surface to a surface node. Optional on
    *  hosts without ui.compositor-surfaces; handle < 0 clears the binding. */
   setCompositorSurface?(id: number, handle: number, focused: number): void;
@@ -431,6 +435,7 @@ export function installFrameHandler(
     hits?: readonly number[],
     touchSurfaces?: readonly number[],
     rightAnalog?: number,
+    inputElapsedUs?: number,
   ) => void,
 ): void {
   (
@@ -442,6 +447,7 @@ export function installFrameHandler(
         hits?: readonly number[],
         touchSurfaces?: readonly number[],
         rightAnalog?: number,
+        inputElapsedUs?: number,
       ) => void;
     }
   ).frame = fn;

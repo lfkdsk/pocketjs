@@ -313,7 +313,8 @@ unsafe extern "C" fn js_free_texture(
     argc: i32,
     argv: *mut JSValue,
 ) -> JSValue {
-    ui().free_texture(arg_i32(ctx, argc, argv, 0));
+    let handle=arg_i32(ctx,argc,argv,0);
+    crate::ge::free_texture(ui(),handle);
     JS_UNDEFINED
 }
 
@@ -923,6 +924,57 @@ unsafe extern "C" fn js_audio_poll(
     }
 }
 
+
+unsafe extern "C" fn js_mesh_set(
+    ctx: *mut JSContext,
+    _: JSValue,
+    n: i32,
+    a: *mut JSValue,
+) -> JSValue {
+    ui().set_mesh(arg_i32(ctx, n, a, 0), arg_i32(ctx, n, a, 1));
+    JS_UNDEFINED
+}
+unsafe extern "C" fn js_mesh_free(
+    ctx: *mut JSContext,
+    _: JSValue,
+    n: i32,
+    a: *mut JSValue,
+) -> JSValue {
+    crate::mesh::free(ui(), arg_i32(ctx, n, a, 0));
+    JS_UNDEFINED
+}
+unsafe extern "C" fn js_offload_mesh(
+    ctx: *mut JSContext,
+    _: JSValue,
+    n: i32,
+    a: *mut JSValue,
+) -> JSValue {
+    JS_NewInt32(
+        ctx,
+        crate::offload::upload(arg_i32(ctx, n, a, 0) as u32, true, ui()),
+    )
+}
+unsafe extern "C" fn js_offload_image(
+    ctx: *mut JSContext,
+    _: JSValue,
+    n: i32,
+    a: *mut JSValue,
+) -> JSValue {
+    JS_NewInt32(
+        ctx,
+        crate::offload::upload(arg_i32(ctx, n, a, 0) as u32, false, ui()),
+    )
+}
+unsafe extern "C" fn js_offload_release(
+    ctx: *mut JSContext,
+    _: JSValue,
+    n: i32,
+    a: *mut JSValue,
+) -> JSValue {
+    crate::offload::release(arg_i32(ctx, n, a, 0) as u32);
+    JS_UNDEFINED
+}
+
 // ---------------------------------------------------------------------------
 // registration
 // ---------------------------------------------------------------------------
@@ -1249,6 +1301,7 @@ pub unsafe fn register(
     sprites: &[crate::pak::SpriteReg],
 ) {
     if crate::offload::enabled() {
+        ui().set_mesh_commands(true);
         let io = JS_NewObject(ctx);
         add_fn(ctx, io, b"session\0", js_offload_session, 0);
         add_fn(ctx, io, b"submit\0", js_offload_submit, 1);
@@ -1260,9 +1313,15 @@ pub unsafe fn register(
         JS_SetPropertyStr(ctx, io, b"local\0".as_ptr() as *const _, local);
         add_fn(ctx, io, b"uploadCoverage\0", js_offload_upload_coverage, 6);
         add_fn(ctx, io, b"uploadIndexedImage\0", js_offload_upload_indexed, 4);
+        add_fn(ctx, io, b"uploadMesh\0", js_offload_mesh, 1);
+        add_fn(ctx, io, b"uploadImage\0", js_offload_image, 1);
+        add_fn(ctx, io, b"releaseMesh\0", js_offload_release, 1);
+        add_fn(ctx, io, b"releaseImage\0", js_offload_release, 1);
         JS_SetPropertyStr(ctx, global, b"offload\0".as_ptr() as *const _, io);
     }
     let ui_obj = JS_NewObject(ctx);
+    add_fn(ctx, ui_obj, b"setMesh\0", js_mesh_set, 2);
+    add_fn(ctx, ui_obj, b"freeMesh\0", js_mesh_free, 1);
 
     add_fn(ctx, ui_obj, b"createNode\0", js_create_node, 1);
     add_fn(ctx, ui_obj, b"destroyNode\0", js_destroy_node, 1);
