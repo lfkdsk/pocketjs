@@ -598,16 +598,16 @@ arriving.
 
 `relayChannelRxLimits()` is what a guest on the lane advertises. Negotiation
 takes `min(local, peer)`, so a device shrinks the window and never widens
-it; an OPEN may name a smaller per-stream window still, which is how a guest
+it. An OPEN may name a smaller per-stream window, which is how a guest
 that needs three streams divides one attachment window between them.
 
 **Hosts that publish the lane today: none.** `hosts/3ds` and `hosts/psp`
 carry the offload record transport (`hosts/3ds/src/offload.c`,
 `hosts/psp/src/offload.rs`) and no relay lane, so a guest on either falls
 back to offload. The remaining work per host is the socket or link plumbing
-plus three bindings; `hosts/shared/relay_frame.h` already provides the
-bounded admission queue (`RelayFrameQueue`, `relay_frame_admit`) a C host
-needs for both directions.
+plus three bindings, on top of the bounded admission queue
+`hosts/shared/relay_frame.h` provides (`RelayFrameQueue`,
+`relay_frame_admit`) for both directions.
 
 ## C frame layer
 
@@ -825,9 +825,9 @@ would need an authorize-subscribe hook, which this runtime does not have.
 **§3.7 subscription scratch.** The draft requires an assembler reservation
 before the first chunk. The runtime reserved the whole negotiated
 `maxObjectBytes` for every subscription push channel, which is not what a
-subscriber accepts on that channel. `resource.subscribe` now takes an
-optional `maxObjectBytes`, still checked against the negotiated ceiling; a
-larger push fails the assembly exactly as an oversized get does.
+subscriber accepts on that channel. `resource.subscribe` takes an
+optional `maxObjectBytes`, checked against the negotiated ceiling; a
+larger push fails the assembly as an oversized get does.
 
 **§3.7 native assembly.** The draft puts bulk assembly and decode in
 native/worker code and gives JS a bounded typed ticket. The TypeScript
