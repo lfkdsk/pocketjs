@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { RELAY_CHANNEL, createRelayChannel, relayChannelRxLimits, relayChannel, resetRelayChannel, type RelayChannelOps } from "../framework/src/relay/channel.ts";
+import { RELAY_CHANNEL, attachRelaySession, createRelayChannel, relayChannelRxLimits, relayChannel, resetRelayChannel, type RelayChannelOps, type RelayChannelSession } from "../framework/src/relay/channel.ts";
 import { runServicePumps } from "../framework/src/services.ts";
 
 /** A host lane with the contract's bounds: `slots` records and
@@ -140,4 +140,42 @@ test("relayChannel() is absent without the host global and memoized with it", ()
     resetRelayChannel();
     delete (globalThis as unknown as { relayChannel?: RelayChannelOps }).relayChannel;
   }
+});
+
+test("a relay session attached to the channel rehandshakes on every generation change, including positive to positive", () => {
+  const lane = fakeLane();
+  const channel = createRelayChannel(lane.ops, peer);
+  const log: string[] = [];
+  const session: RelayChannelSession = {
+    connect: () => log.push("connect"),
+    disconnect: reason => log.push(`disconnect:${reason}`),
+    handleRecord: () => log.push("record"),
+    step: () => log.push("step"),
+  };
+  attachRelaySession(channel, session);
+  // The attachment was already up: one handshake, no discard before it.
+  expect(log).toEqual(["connect", "step"]);
+  // One positive generation replaces another with no detached frame between
+  // them: the old session is discarded, one new handshake runs, and both
+  // happen before the first record of generation 2.
+  log.length = 0;
+  lane.attach(2);
+  lane.push(new Uint8Array(48));
+  channel.step();
+  expect(log).toEqual(["disconnect:relay attachment replaced", "connect", "record", "step"]);
+  // No change: neither a discard nor a second handshake.
+  log.length = 0;
+  channel.step();
+  expect(log).toEqual(["step"]);
+  // Detached, then a third generation: the zero discards and the positive
+  // handshakes; a detached lane starts no session.
+  log.length = 0;
+  lane.detach();
+  channel.step();
+  expect(log).toEqual(["disconnect:relay channel detached"]);
+  log.length = 0;
+  lane.attach(3);
+  channel.step();
+  expect(log).toEqual(["connect", "step"]);
+  channel.close();
 });
