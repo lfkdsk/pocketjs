@@ -307,15 +307,24 @@ export class RelayResourceClient {
     delivery: string,
     handler: RelaySubscriptionHandler,
     complete: PendingControl["complete"],
+    options: { maxObjectBytes?: number } = {},
   ): { correlation: number } | { ok: false; code: string } {
     if (delivery !== RELAY_DELIVERY.RELIABLE_DELTA && delivery !== RELAY_DELIVERY.LATEST_SNAPSHOT) {
       return { ok: false, code: RELAY_ERROR.INVALID };
     }
+    // The push channel reserves what this subscriber accepts for this
+    // resource, not the whole negotiated ceiling (§3.7 reserve-then-accept):
+    // a namespace whose pushes are small documents must not hold the scratch
+    // a 256px tile would need. A larger push fails the assembly, as an
+    // oversized get does.
+    const maxObjectBytes = options.maxObjectBytes ?? this.opts.negotiated.maxObjectBytes;
+    if (!Number.isSafeInteger(maxObjectBytes) || maxObjectBytes <= 0
+      || maxObjectBytes > this.opts.negotiated.maxObjectBytes) return { ok: false, code: RELAY_ERROR.INVALID };
     const isRef = "kind" in target;
     // Reserve-then-accept (§3.7), as the get path: refuse (BUSY) before
     // consuming a request slot when the push channel could not be admitted
     // now. The reservation itself needs the id the terminal response carries.
-    if (!this.assembler.canReserve(this.opts.negotiated.maxObjectBytes)) return { ok: false, code: RELAY_ERROR.BUSY };
+    if (!this.assembler.canReserve(maxObjectBytes)) return { ok: false, code: RELAY_ERROR.BUSY };
     const metadata: Record<string, unknown> = {
       op: RELAY_OP.RESOURCE_SUBSCRIBE,
       args: isRef ? { delivery } : { delivery, namespace: (target as { ns: string }).ns },
@@ -331,7 +340,7 @@ export class RelayResourceClient {
           // Reserve the push channel in the subscription id space, distinct
           // from get correlations (§3.7); admission failure closes the
           // subscription.
-          const reservation = this.assembler.reserve({ stream, channel: id, space: "push" }, this.opts.negotiated.maxObjectBytes);
+          const reservation = this.assembler.reserve({ stream, channel: id, space: "push" }, maxObjectBytes);
           if (!reservation.ok) {
             // The provider holds the subscription active and would keep
             // pushing to a channel this end cannot assemble: withdraw it with

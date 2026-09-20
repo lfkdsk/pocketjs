@@ -452,6 +452,35 @@ test("local assembler BUSY: once the assembly budget is full, a new get is refus
 // subscribe / push / invalidation
 // ---------------------------------------------------------------------------
 
+test("a subscription reserves the push scratch it accepts, not the negotiated ceiling", () => {
+  // Two subscriptions whose pushes are small documents leave the assembly
+  // budget for the objects a consumer actually gets (§3.7). With the ceiling
+  // reserved instead, the second get below would be refused BUSY.
+  const { wire, client } = makeClient({ maxAssemblies: 3, maxScratchBytes: 131072 * 2 + 8192 });
+  const auth = new RelayResourceAuthority();
+  const accept = (label: string) => {
+    const request = wire.lastRequest();
+    const env = auth.answerSubscribe({ stream: 1, correlation: request.correlation, metadata: request.metadata });
+    feed(client, env);
+    return { label, id: (env.metadata.value as { subscription: number }).subscription };
+  };
+  const first = client.subscribe(1, { ns: "map/demo" }, RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject: () => {} }, () => {}, { maxObjectBytes: 4096 });
+  expect("correlation" in first).toBe(true);
+  accept("catalog");
+  const second = client.subscribe(1, { ns: "map/other" }, RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject: () => {} }, () => {}, { maxObjectBytes: 4096 });
+  expect("correlation" in second).toBe(true);
+  accept("source");
+  // 8,192 of the scratch is held by the two push channels; a 131,072-byte
+  // get still fits, and so does a second one.
+  expect("correlation" in client.get(1, tileRef("a"), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 }, () => {})).toBe(true);
+  expect(client.stats().subscriptions).toBe(2);
+  // A subscription may not reserve more than the negotiated ceiling.
+  expect(client.subscribe(1, { ns: "map/too-big" }, RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject: () => {} }, () => {}, { maxObjectBytes: 131073 }))
+    .toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+  expect(client.subscribe(1, { ns: "map/zero" }, RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject: () => {} }, () => {}, { maxObjectBytes: 0 }))
+    .toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+});
+
 test("subscribe reliable-delta receives revision-increasing pushes in order", () => {
   const { wire, client } = makeClient();
   const objects: { revision?: string; resync: boolean }[] = [];

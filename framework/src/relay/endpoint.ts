@@ -361,10 +361,13 @@ export class RelayEndpoint {
     delivery: string,
     handler: RelaySubscriptionHandler,
     complete: (result: ResourceResult<{ subscription?: number }>) => void,
+    /** Push-channel scratch this subscriber reserves; defaults to the
+     * negotiated maxObjectBytes. */
+    options?: { maxObjectBytes?: number },
   ): { correlation: number } | { ok: false; code: string } {
     const client = this.bound?.client;
     if (!client) return { ok: false, code: RELAY_ERROR.BUSY };
-    const result = client.subscribe(stream, target, delivery, handler, complete);
+    const result = client.subscribe(stream, target, delivery, handler, complete, options);
     this.flush();
     return result;
   }
