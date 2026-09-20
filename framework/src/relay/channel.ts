@@ -45,6 +45,10 @@ export interface RelayChannel {
    * discards the old one. Reported from step(), before any record of the
    * new generation is delivered. */
   onSession(handler: (session: number) => void): void;
+  /** End of one lane frame, after the delivery budget was spent. A session
+   * whose outbox the lane refused earlier retries here: without it, an
+   * endpoint with nothing arriving has no event to send on. */
+  onStep(handler: (delivered: number) => void): void;
   stats(): RelayChannelStats;
   /** Release the service pump; the ops stay owned by the host. */
   close(): void;
@@ -58,6 +62,7 @@ export function createRelayChannel(ops: RelayChannelOps, peer: RelayPeerContext)
   const scratch = new Uint8Array(RELAY_CHANNEL.recordBytes);
   let handler: ((record: Uint8Array) => void) | undefined;
   let sessionHandler: ((session: number) => void) | undefined;
+  let stepHandler: ((delivered: number) => void) | undefined;
   let lastSession = 0;
   let sent = 0, refused = 0, received = 0, oversized = 0, bytesIn = 0, bytesOut = 0;
   let submissions = 0, pumped = false;
@@ -78,15 +83,18 @@ export function createRelayChannel(ops: RelayChannelOps, peer: RelayPeerContext)
     submissions = 0;
     const session = ops.session();
     if (session !== lastSession) { lastSession = session; sessionHandler?.(session); }
-    if (!handler || session <= 0) return 0;
+    if (session <= 0) return 0;
     let moved = 0;
-    for (let i = 0; i < RELAY_CHANNEL.deliveriesPerFrame; i++) {
-      const length = ops.take(scratch);
-      if (length <= 0) break;
-      if (length > scratch.length) { oversized++; continue; }
-      received++; bytesIn += length; moved++;
-      handler(scratch.subarray(0, length));
+    if (handler) {
+      for (let i = 0; i < RELAY_CHANNEL.deliveriesPerFrame; i++) {
+        const length = ops.take(scratch);
+        if (length <= 0) break;
+        if (length > scratch.length) { oversized++; continue; }
+        received++; bytesIn += length; moved++;
+        handler(scratch.subarray(0, length));
+      }
     }
+    stepHandler?.(moved);
     return moved;
   };
   let unregister: (() => void) | undefined;
@@ -97,8 +105,9 @@ export function createRelayChannel(ops: RelayChannelOps, peer: RelayPeerContext)
     step() { pump(); return step(); },
     onRecord(next) { handler = next; pump(); },
     onSession(next) { sessionHandler = next; pump(); },
+    onStep(next) { stepHandler = next; pump(); },
     stats: () => ({ session: ops.session(), sent, refused, received, oversized, bytesIn, bytesOut, native: ops.stats?.() }),
-    close() { unregister?.(); unregister = undefined; pumped = false; handler = undefined; sessionHandler = undefined; lastSession = 0; },
+    close() { unregister?.(); unregister = undefined; pumped = false; handler = undefined; sessionHandler = undefined; stepHandler = undefined; lastSession = 0; },
   };
 }
 
