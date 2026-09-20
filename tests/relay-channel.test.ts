@@ -91,6 +91,25 @@ test("takes are bounded per frame and reuse one scratch buffer; an oversized rec
   channel.close();
 });
 
+test("an attachment generation change is reported before the records of the new generation", () => {
+  const lane = fakeLane();
+  const channel = createRelayChannel(lane.ops, peer);
+  const seen: (number | string)[] = [];
+  channel.onSession(session => seen.push(session));
+  channel.onRecord(() => seen.push("record"));
+  lane.push(new Uint8Array(48));
+  channel.step();
+  expect(seen).toEqual([1, "record"]);
+  channel.step();
+  lane.detach();
+  channel.step();
+  lane.attach(2);
+  lane.push(new Uint8Array(48));
+  channel.step();
+  expect(seen).toEqual([1, "record", 0, 2, "record"]);
+  channel.close();
+});
+
 test("the channel registers one service pump and releases it on close", () => {
   const lane = fakeLane();
   const channel = createRelayChannel(lane.ops, peer);

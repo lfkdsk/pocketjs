@@ -41,6 +41,10 @@ export interface RelayChannel {
   step(): number;
   /** The single record sink. Replacing it replaces the session above. */
   onRecord(handler: (record: Uint8Array) => void): void;
+  /** The attachment generation changed: the owner starts a new session or
+   * discards the old one. Reported from step(), before any record of the
+   * new generation is delivered. */
+  onSession(handler: (session: number) => void): void;
   stats(): RelayChannelStats;
   /** Release the service pump; the ops stay owned by the host. */
   close(): void;
@@ -53,6 +57,8 @@ const nativeOps = () => (globalThis as unknown as { relayChannel?: RelayChannelO
 export function createRelayChannel(ops: RelayChannelOps, peer: RelayPeerContext): RelayChannel {
   const scratch = new Uint8Array(RELAY_CHANNEL.recordBytes);
   let handler: ((record: Uint8Array) => void) | undefined;
+  let sessionHandler: ((session: number) => void) | undefined;
+  let lastSession = 0;
   let sent = 0, refused = 0, received = 0, oversized = 0, bytesIn = 0, bytesOut = 0;
   let submissions = 0, pumped = false;
   const transport: RelayTransportAdapter = {
@@ -70,7 +76,9 @@ export function createRelayChannel(ops: RelayChannelOps, peer: RelayPeerContext)
   };
   const step = (): number => {
     submissions = 0;
-    if (!handler || ops.session() <= 0) return 0;
+    const session = ops.session();
+    if (session !== lastSession) { lastSession = session; sessionHandler?.(session); }
+    if (!handler || session <= 0) return 0;
     let moved = 0;
     for (let i = 0; i < RELAY_CHANNEL.deliveriesPerFrame; i++) {
       const length = ops.take(scratch);
@@ -82,16 +90,15 @@ export function createRelayChannel(ops: RelayChannelOps, peer: RelayPeerContext)
     return moved;
   };
   let unregister: (() => void) | undefined;
+  const pump = () => { if (!pumped) { pumped = true; unregister = registerServicePump(() => { step(); }); } };
   return {
     transport,
     session: () => ops.session(),
-    step() {
-      if (!pumped) { pumped = true; unregister = registerServicePump(() => { step(); }); }
-      return step();
-    },
-    onRecord(next) { handler = next; if (!pumped) { pumped = true; unregister = registerServicePump(() => { step(); }); } },
+    step() { pump(); return step(); },
+    onRecord(next) { handler = next; pump(); },
+    onSession(next) { sessionHandler = next; pump(); },
     stats: () => ({ session: ops.session(), sent, refused, received, oversized, bytesIn, bytesOut, native: ops.stats?.() }),
-    close() { unregister?.(); unregister = undefined; pumped = false; handler = undefined; },
+    close() { unregister?.(); unregister = undefined; pumped = false; handler = undefined; sessionHandler = undefined; lastSession = 0; },
   };
 }
 
