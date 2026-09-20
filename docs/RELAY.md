@@ -564,6 +564,51 @@ Two distinct operations use the INVALIDATE frame type:
   holds a copy; **the provider may ignore it and there is no ACK.** Remote
   lease teardown uses resource.release.
 
+## Host byte lane (L0)
+
+A device host reaches its companion through one authenticated record lane.
+`contracts/spec/relay-channel.ts` fixes what that lane carries and
+`framework/src/relay/channel.ts` is the guest half:
+
+| Bound | Value | Meaning |
+| --- | --- | --- |
+| `recordBytes` | 16384 | largest complete record, header included; the `maxWireBytes` a guest on this lane may advertise |
+| `slots` | 8 | records one direction holds before `send` refuses |
+| `windowBytes` | 65536 | bytes charged to one direction until its consumer drains them |
+| `deliveriesPerFrame` | 2 | records the guest takes per host frame |
+| `submissionsPerFrame` | 2 | records the guest hands the host per frame |
+| `port` | 8742 | where the companion listens (offload uses 8741) |
+
+The lane carries **complete records only**: one never spans two `take` calls
+and two never merge, so the guest reassembles nothing. A host publishes
+`globalThis.relayChannel` with `session()`, `send(record)`,
+`take(into): number` and an optional `stats()`; `take` copies into a buffer
+the caller owns, so the guest holds exactly one `recordBytes` scratch buffer
+for the channel's lifetime and a record larger than that buffer is dropped
+by the host and counted, never truncated into the guest.
+
+`createRelayChannel(ops, peer)` turns those ops into a
+`RelayTransportAdapter` plus a per-frame `step()` registered as a service
+pump. `step()` reports a changed `session()` before it delivers any record
+of the new generation, and reports the frame edge afterwards through
+`onStep`, which is where an endpoint whose send the lane refused retries:
+a lane admits a fixed number of records per frame, so without that edge a
+stream with a small window stalls after its first chunk when nothing is
+arriving.
+
+`relayChannelRxLimits()` is what a guest on the lane advertises. Negotiation
+takes `min(local, peer)`, so a device shrinks the window and never widens
+it; an OPEN may name a smaller per-stream window still, which is how a guest
+that needs three streams divides one attachment window between them.
+
+**Hosts that publish the lane today: none.** `hosts/3ds` and `hosts/psp`
+carry the offload record transport (`hosts/3ds/src/offload.c`,
+`hosts/psp/src/offload.rs`) and no relay lane, so a guest on either falls
+back to offload. The remaining work per host is the socket or link plumbing
+plus three bindings; `hosts/shared/relay_frame.h` already provides the
+bounded admission queue (`RelayFrameQueue`, `relay_frame_admit`) a C host
+needs for both directions.
+
 ## C frame layer
 
 `hosts/shared/relay_frame.h` and `relay_frame.c` decode the fixed header on a
@@ -738,3 +783,53 @@ cargo test -p pocket-relay                       # 46 tests, 48 vectors
 cargo build -p pocket-relay --no-default-features --target thumbv7em-none-eabi
 cargo test -p pocket-relay --release --test throughput -- --ignored --nocapture
 ```
+
+## Draft errata
+
+Where this implementation departs from
+`/var/tmp/oss/relay-survey/findings/relay-protocol-draft.md`, the departure
+is recorded here. Each entry states the draft clause, what the runtime does,
+and why.
+
+**§3.5 cache identity.** The draft's cache key is
+`(authenticatedAuthority, ns, kind, key, revision, rendition)`. The runtime
+keys entries and generation fences by `(kind, ns, key, rendition)` and
+compares `revision` separately; the authenticated authority is the pinned
+session grant and is not repeated in a local key. The full reasoning is in
+*Resource identity* above: a literal per-revision key gives a revisionless
+get and its concrete response two unrelated counters, so §3.5, the
+revisionless get and §3.8's key-scope rule cannot all hold at once.
+`revision` stays in the wire identity and on every entry and response.
+
+**§3.6 INVALIDATE field placement.** The draft says the INVALIDATE fields
+are top level (`resource` or `ns`, `scope`, `reason`). The runtime carries
+`scope`, `namespace` and `reason` inside `args`, with `resource` at the top
+level — the placement every other resource op uses, and the one the
+`resource.invalidate` schema in `contracts/spec/relay.ts` validates. The
+draft's own general rule is that operation inputs live in `args` and only
+credit, reset and CANCEL fields are top level; INVALIDATE was the
+exception, and the runtime removes it. A consumer reads `metadata.resource?.ns`
+first and `metadata.args.namespace` second, so a namespace-scope frame
+carrying only `args.namespace` is understood.
+
+**§3.6/§3.7 PUSH and INVALIDATE delivery bind to a subscription.** The draft
+describes `resource.subscribe` as what binds PUSH and INVALIDATE delivery.
+The runtime authority does not enforce that: `RelayResourceAuthority`
+answers every `resource.subscribe` without an application hook, and
+`endpoint.invalidate(...)` sends to whatever stream the caller names. An
+authority that wants the draft's behaviour must check
+`endpoint.inspect()?.authority?.subscriptionsOn(stream)` itself, as
+`host/relay-host.ts` in pocket-map does. Enforcing it inside the endpoint
+would need an authorize-subscribe hook, which this runtime does not have.
+
+**§3.7 subscription scratch.** The draft requires an assembler reservation
+before the first chunk. The runtime reserved the whole negotiated
+`maxObjectBytes` for every subscription push channel, which is not what a
+subscriber accepts on that channel. `resource.subscribe` now takes an
+optional `maxObjectBytes`, still checked against the negotiated ceiling; a
+larger push fails the assembly exactly as an oversized get does.
+
+**§3.7 native assembly.** The draft puts bulk assembly and decode in
+native/worker code and gives JS a bounded typed ticket. The TypeScript
+endpoint assembles in JS. The host lane above is the seam that would let a
+host assemble natively; nothing in the protocol changes when it does.
