@@ -596,6 +596,15 @@ a lane admits a fixed number of records per frame, so without that edge a
 stream with a small window stalls after its first chunk when nothing is
 arriving.
 
+`attachRelaySession(channel, session)` binds one relay session to that
+generation. It discards the session and runs the handshake once more on
+**every change of `session()`, one positive generation replacing another
+included**: a host that re-attaches between two `step()` calls shows the
+guest no zero, and a session carried across that edge holds streams,
+subscriptions and correlations the new peer has no record of. The discard
+runs inside the `onSession` report, ahead of the first record of the new
+generation.
+
 `relayChannelRxLimits()` is what a guest on the lane advertises. Negotiation
 takes `min(local, peer)`, so a device shrinks the window and never widens
 it. An OPEN may name a smaller per-stream window, which is how a guest

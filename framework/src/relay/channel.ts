@@ -111,6 +111,45 @@ export function createRelayChannel(ops: RelayChannelOps, peer: RelayPeerContext)
   };
 }
 
+/** The relay session a channel owner binds to one attachment. RelayEndpoint
+ * owners (the guest client that wraps it) implement these four. */
+export interface RelayChannelSession {
+  /** Start the §3.2 handshake; a no-op unless the endpoint is idle. */
+  connect(): void;
+  /** Discard the session: pending work fails and the endpoint returns to
+   * idle, so the next connect() is a new handshake. */
+  disconnect(reason: string): void;
+  handleRecord(record: Uint8Array): void;
+  /** End of one lane frame. */
+  step(): void;
+}
+
+/** Bind one relay session to the channel's attachment generation.
+ *
+ * Every generation change is a different companion link
+ * (contracts/spec/relay-channel.ts), so the old session is discarded and the
+ * handshake runs once against the new peer. That holds when one positive
+ * generation follows another: a host that re-attaches between two step()
+ * calls never shows the guest a zero, and a session kept across that edge
+ * would hold streams, subscriptions and correlations the new peer has no
+ * record of. The discard runs inside the onSession report, which step()
+ * makes before it delivers any record of the new generation.
+ */
+export function attachRelaySession(channel: RelayChannel, session: RelayChannelSession): void {
+  let attached = 0;
+  channel.onSession(generation => {
+    if (attached > 0) session.disconnect(generation > 0 ? "relay attachment replaced" : "relay channel detached");
+    attached = generation > 0 ? generation : 0;
+    if (generation > 0) session.connect();
+  });
+  channel.onRecord(record => session.handleRecord(record));
+  channel.onStep(() => session.step());
+  // One step now, so an attachment that is already up starts its handshake
+  // here rather than a frame later, and the channel holds the generation
+  // every later step compares against.
+  channel.step();
+}
+
 let channel: RelayChannel | undefined;
 
 /** The realm's relay channel, or undefined on a host without the lane. One
