@@ -110,6 +110,30 @@ test("visible demand preempts speculative requests without consuming retry attem
   x.requests[1].done({ ok: true, value: "V" }); x.scheduler.step(); expect(x.requests[2].key).toBe("prefetch");
 });
 
+test("transport saturation preserves desired prefetch work until replacement can start", () => {
+  let raw: string | undefined;
+  const sent: { id: number; payload: string }[] = [];
+  const io = createOffloadClient({ session: () => 1,
+    submit(record) { sent.push(JSON.parse(record)); return true; },
+    take() { const result = raw; raw = undefined; return result; } });
+  const scheduler = createResourceScheduler({ maxConcurrent: 1, startsPerFrame: 1,
+    completionsPerFrame: 1, maxCollections: 1, available: () => io.pending() < 1 });
+  const cache = scheduler.createCache({ key: (s: string) => s, maxEntries: 2,
+    maxResponseBytes: 100, maxCost: 2, cost: () => 1,
+    load: offloadResource<string>(io, "test.read", s => s), materialize: (s: string) => s });
+  cache.reconcile([{ input: "edge", priority: 1000 }]); scheduler.step(); io.step();
+  cache.reconcile([{ input: "visible", priority: 0, pin: true }, { input: "edge", priority: 1000 }]);
+  for (let n = 0; n < 30; n++) { scheduler.step(); io.step(); }
+  raw = JSON.stringify({ id: sent[0].id, payload: "EDGE" }); io.step(); scheduler.step(); io.step();
+  expect(cache.state("edge")).toEqual({ status: "ready", value: "EDGE" });
+  expect(sent.map(r => r.payload)).toEqual(["edge", "visible"]);
+  raw = JSON.stringify({ id: sent[1].id, payload: "VISIBLE" }); io.step(); scheduler.step();
+  cache.reconcile([{ input: "edge", priority: 0, pin: true }]);
+  scheduler.step(); io.step();
+  expect(sent).toHaveLength(2); // Re-entering the edge needs no duplicate wire image.
+  scheduler.dispose(); io.dispose();
+});
+
 test("frame expiry revalidates only desired entries and keeps the old value visible", () => {
   const x = setup(); let loads = 0;
   const cache = x.scheduler.createCache({ key: (s: string) => s, maxEntries: 1, maxCost: 4, maxResponseBytes: 4, cost: () => 4, maxAgeFrames: 2,
@@ -117,6 +141,38 @@ test("frame expiry revalidates only desired entries and keeps the old value visi
   cache.reconcile([{ input: "live", priority: 0 }]); x.scheduler.step(); x.scheduler.step(); x.scheduler.step();
   expect(loads).toBe(1); x.scheduler.step(); expect(loads).toBe(2); expect(cache.state("live")).toEqual({ status: "ready", value: "1" });
   cache.reconcile([]); for (let i = 0; i < 5; i++) x.scheduler.step(); expect(loads).toBe(2);
+});
+
+test("a revalidated refresh keeps the resident value: no materialize, no dispose, refreshed age", () => {
+  const x = setup(); let loads = 0; const decoded: string[] = []; const freed: string[] = [];
+  const cache = x.scheduler.createCache({ key: (s: string) => s, maxEntries: 1, maxCost: 4, maxResponseBytes: 4, cost: () => 4, maxAgeFrames: 2,
+    load(_, done) { loads++; done(loads === 1 ? { ok: true, value: "V" } : { ok: true, revalidated: true }); return { cancel() {} }; },
+    materialize: (s: string) => { decoded.push(s); return s; }, dispose: (v) => freed.push(v) });
+  cache.reconcile([{ input: "live", priority: 0 }]);
+  x.scheduler.step(); // frame 1: start the initial load
+  x.scheduler.step(); // frame 2: complete -> ready "V", loadedAt=2
+  expect(cache.state("live")).toEqual({ status: "ready", value: "V" });
+  x.scheduler.step(); // frame 3: age 1 < 2, no revalidation
+  expect(loads).toBe(1);
+  x.scheduler.step(); // frame 4: age 2, start the conditional revalidation
+  expect(loads).toBe(2);
+  x.scheduler.step(); // frame 5: revalidated completes; resident value kept
+  expect(cache.state("live")).toEqual({ status: "ready", value: "V" });
+  expect(decoded).toEqual(["V"]); // materialized once, never again
+  expect(freed).toEqual([]); // the resident value is not disposed
+  x.scheduler.step(); // frame 6: refreshed age (6-5=1 < 2), no new load
+  expect(loads).toBe(2);
+});
+
+test("a revalidated result with no resident value fails the entry", () => {
+  const scheduler = createResourceScheduler({ maxConcurrent: 1, startsPerFrame: 1, completionsPerFrame: 1, maxCollections: 1 });
+  const cache = scheduler.createCache({ key: (s: string) => s, maxEntries: 1, maxCost: 4, maxResponseBytes: 4, cost: () => 4,
+    load(_, done) { done({ ok: true, revalidated: true }); return { cancel() {} }; }, materialize: (s: string) => s });
+  cache.reconcile([{ input: "live", priority: 0 }]);
+  scheduler.step(); scheduler.step();
+  const state = cache.state("live");
+  expect(state.status).toBe("error");
+  scheduler.dispose();
 });
 
 

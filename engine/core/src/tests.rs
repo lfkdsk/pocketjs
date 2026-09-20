@@ -4285,3 +4285,31 @@ fn streamed_detach_reclaims_capacity_and_restores_baked_cells_across_slots() {
         }
     }
 }
+
+#[test]
+fn retiring_texture_invalidates_handle_before_gpu_owner_drops() {
+    let mut ui = Ui::new();
+    let old = ui.upload_texture(&[3u8; 16 * 16 * 2], 16, 16, spec::psm::PSM_5650);
+    let owner = ui.take_texture(old).unwrap();
+    assert!(ui.texture(old).is_none());
+    let next = ui.upload_texture(&[9u8; 16 * 16 * 2], 16, 16, spec::psm::PSM_5650);
+    assert_ne!(old, next);
+    assert_eq!(owner.view().pixels[0], 3);
+    assert_eq!(ui.texture(next).unwrap().pixels[0], 9);
+    assert!(ui.take_texture(old).is_none());
+}
+
+#[test]
+fn external_texture_has_dimensions_and_generations_without_cpu_pixels() {
+    let mut ui = Ui::new();
+    assert_eq!(ui.register_external_texture(0, 256), -1);
+    assert_eq!(ui.register_external_texture(255, 256), -1);
+    let handle = ui.register_external_texture(256, 256);
+    let view = ui.texture(handle).unwrap();
+    assert_eq!((view.w, view.h), (256, 256));
+    assert!(view.pixels.is_empty());
+    assert_eq!(view.psm, u32::MAX);
+    ui.free_texture(handle);
+    assert!(ui.texture(handle).is_none());
+    assert_ne!(handle, ui.register_external_texture(256, 256));
+}

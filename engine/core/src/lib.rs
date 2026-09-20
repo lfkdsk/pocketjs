@@ -40,6 +40,7 @@ pub mod anim;
 pub mod codec;
 pub mod damage;
 pub mod draw;
+pub mod mesh;
 pub mod layout;
 pub mod package;
 pub mod pak;
@@ -80,7 +81,7 @@ pub struct Texture {
     byte_len: usize,
     pub w: u32,
     pub h: u32,
-    /// spec::psm::* pixel format.
+    /// spec::psm::* pixel format, or u32::MAX for backend-owned storage.
     pub psm: u32,
     /// CLUT (PSM_T8 only): exactly TEX_PALETTE_BYTES bytes (256 x u32 ABGR)
     /// in a 16-byte-aligned backing like `data`, so the PSP GE can point
@@ -261,6 +262,8 @@ pub struct Ui {
     tex_free: Vec<u32>,
     /// Core-owned corner masks and scaled-glyph pages (see draw::PaintCache).
     paint_cache: draw::PaintCache,
+    meshes: mesh::Meshes,
+    mesh_commands: bool,
     /// Raster pixels baked for each logical UI pixel. Layout and DrawList
     /// coordinates always remain logical; only core-owned bitmap resources
     /// (currently rounded-corner masks) use this density.
@@ -348,6 +351,8 @@ impl Ui {
             textures: Vec::new(),
             tex_free: Vec::new(),
             paint_cache: draw::PaintCache::new(),
+            meshes: mesh::Meshes::new(),
+            mesh_commands: false,
             raster_density,
             raster_revision: 1,
             focused: 0,
@@ -642,6 +647,21 @@ impl Ui {
         self.upload_texture_flags(data, w, h, psm, 0)
     }
 
+    /// Register an image whose pixels are owned by the native GPU backend.
+    /// The backend must attach storage before drawing this handle and retire
+    /// it after its final GPU use. No CPU pixel buffer is allocated or sampled.
+    pub fn register_external_texture(&mut self, w: u32, h: u32) -> i32 {
+        let valid = |n: u32| n > 0 && n <= spec::TEX_MAX_DIM && n.is_power_of_two();
+        if !valid(w) || !valid(h) { return -1; }
+        let texture = Texture {
+            data: alloc::vec::Vec::new(), byte_len: 0, w, h, psm: u32::MAX,
+            palette: None, linear: true, revision: 0,
+        };
+        let handle = tex_alloc(&mut self.textures, &mut self.tex_free, texture);
+        if handle >= 0 { self.bump_raster_revision(); }
+        handle
+    }
+
     /// `upload_texture` honoring spec::img flags: FLAG_RLE marks the pixel
     /// stream (for PSM_T8: the index bytes AFTER the palette — the palette
     /// itself is never compressed) as PackBits-RLE, which must decode to
@@ -805,19 +825,50 @@ impl Ui {
     /// core-internal texture (a baked corner disc) is safe: the PaintCache
     /// re-validates its handles each use and re-bakes dead ones.
     pub fn free_texture(&mut self, handle: i32) {
-        let Some(slot) = tex_resolve(&self.textures, handle) else {
-            return;
-        };
+        drop(self.take_texture(handle));
+    }
+
+    /// Invalidate a handle immediately and transfer its storage to the backend.
+    /// A pipelined GPU keeps this owner until its previous commands complete.
+    pub fn take_texture(&mut self, handle: i32) -> Option<Texture> {
+        let slot = tex_resolve(&self.textures, handle)?;
         let s = &mut self.textures[slot as usize];
-        s.tex = None;
+        let texture = s.tex.take();
         s.gen = ((s.gen as u32 + 1) & TEX_GEN_MASK) as u16;
         self.tex_free.push(slot);
         self.bump_raster_revision();
+        texture
+    }
+
+    /// Validate a bounded prepared geometry entry and own its native storage.
+    /// Opt into retained geometry commands only when the backend implements them.
+    pub fn set_mesh_commands(&mut self, enabled: bool) { self.mesh_commands = enabled; self.bump_raster_revision(); }
+    pub fn mesh(&self, handle: i32) -> Option<&mesh::Mesh> { self.meshes.get(handle) }
+
+    pub fn upload_mesh(&mut self, bytes: &[u8]) -> i32 {
+        let handle = self.meshes.upload(bytes);
+        if handle >= 0 { self.bump_raster_revision(); }
+        handle
+    }
+
+    pub fn free_mesh(&mut self, handle: i32) {
+        self.meshes.free(handle);
+        self.bump_raster_revision();
+    }
+
+    /// Views borrow a generation-tagged geometry handle; a negative value clears it.
+    pub fn set_mesh(&mut self, id: i32, handle: i32) {
+        if handle >= 0 && self.meshes.get(handle).is_none() { return; }
+        let Some(slot) = self.tree.resolve(id) else { return; };
+        let node = &mut self.tree.slots[slot as usize];
+        if node.node_type == spec::NodeType::View as u8 {
+            node.mesh = handle.max(-1);
+            self.bump_raster_revision();
+        }
     }
 
     /// Bind an uploaded texture to an image node. Handles are 0-based, so
-    /// tex < 0 CLEARS the binding (node.tex = -1, the "none" sentinel);
-    /// unknown/stale positive handles are ignored.
+    /// tex < 0 clears the binding; unknown/stale positive handles are ignored.
     pub fn set_image(&mut self, id: i32, tex: i32) {
         if tex >= 0 && tex_resolve(&self.textures, tex).is_none() {
             return;
@@ -1475,6 +1526,8 @@ impl Ui {
             &self.styles,
             &self.fonts,
             &self.font_revisions,
+            &self.meshes,
+            self.mesh_commands,
             self.frame,
             self.layout.viewport,
             &mut self.textures,
@@ -1502,6 +1555,8 @@ impl Ui {
                 &self.styles,
                 &self.fonts,
                 &self.font_revisions,
+                &self.meshes,
+                self.mesh_commands,
                 self.frame,
                 self.layout.viewport,
                 &mut self.textures,
@@ -1549,6 +1604,8 @@ impl Ui {
             &self.styles,
             &self.fonts,
             &self.font_revisions,
+            &self.meshes,
+            self.mesh_commands,
             self.frame,
             auxiliary.root,
             auxiliary.layout.viewport,
@@ -1576,6 +1633,8 @@ impl Ui {
                 &self.styles,
                 &self.fonts,
                 &self.font_revisions,
+                &self.meshes,
+                self.mesh_commands,
                 self.frame,
                 auxiliary.root,
                 auxiliary.layout.viewport,

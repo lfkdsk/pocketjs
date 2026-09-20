@@ -26,7 +26,7 @@ struct SlotData {
     len: usize,
     req: [u8; 4096],
     header: [u8; 64],
-    data: [u8; 4096],
+    data: [u8; 131072],
 }
 struct Slot {
     state: AtomicU32,
@@ -45,7 +45,7 @@ impl Slot {
                 len: 0,
                 req: [0; 4096],
                 header: [0; 64],
-                data: [0; 4096],
+                data: [0; 131072],
             }),
         }
     }
@@ -77,6 +77,7 @@ static mut SEQUENCE: u32 = 0;
 static mut STARTED: bool = false;
 static mut SENT_FRAME: u32 = 0;
 static mut TAKEN_FRAME: u32 = u32::MAX;
+static mut UPLOADED_FRAME: u32 = u32::MAX;
 pub fn enabled() -> bool {
     !env!("POCKETJS_OFFLOAD_SLOT").is_empty()
 }
@@ -178,10 +179,54 @@ pub unsafe fn take() -> Option<alloc::string::String> {
                 slot.state.store(FREE, Release);
                 return value;
             }
-            slot.state.store(FREE, Release);
+            slot.state.store(BORROWED, Release);
+            return Some(alloc::format!(
+                "{{\"id\":{},\"{}\":{{\"token\":{},\"width\":{},\"height\":{},\"bytes\":{}}}}}",
+                pkt::word(&s.header, 20),
+                if kind == 1 { "mesh" } else { "image" },
+                s.seq,
+                pkt::word(&s.header, 24),
+                pkt::word(&s.header, 28),
+                len
+            ));
         }
     }
     None
+}
+pub unsafe fn release(token: u32) {
+    for slot in &SLOTS {
+        if slot.state.load(Acquire) == BORROWED && (*slot.data.get()).seq == token {
+            slot.state.store(FREE, Release);
+            return;
+        }
+    }
+}
+pub unsafe fn upload(token: u32, mesh: bool, ui: &mut pocketjs_core::Ui) -> i32 {
+    let f = FRAMES.load(Relaxed);
+    if UPLOADED_FRAME == f {
+        return -1;
+    }
+    UPLOADED_FRAME = f;
+    for slot in &SLOTS {
+        if slot.state.load(Acquire) == BORROWED && (*slot.data.get()).seq == token {
+            let s = &*slot.data.get();
+            let kind = pkt::word(&s.header, 16);
+            let bytes = &s.data[..pkt::word(&s.header, 32) as usize];
+            if mesh && kind == 1 {
+                return crate::mesh::upload(ui, bytes);
+            }
+            if !mesh && kind == 2 {
+                let w = pkt::word(&s.header, 24);
+                let h = pkt::word(&s.header, 28);
+                let handle = ui.upload_texture(bytes, w, h, pocketjs_core::spec::psm::PSM_5650);
+                if handle >= 0 {
+                    crate::ge::writeback_texture(ui, handle);
+                }
+                return handle;
+            }
+        }
+    }
+    -1
 }
 unsafe fn path(name: &[u8]) -> [u8; 160] {
     let mut b = [0; 160];

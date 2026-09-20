@@ -1,3 +1,4 @@
+import { encodeSymbianNavigation } from "./symbian-navigation.ts";
 import { createHash } from "node:crypto";
 import {
   createReadStream,
@@ -321,9 +322,14 @@ export interface SymbianBuildTransaction {
 }
 
 export interface SymbianBuildAppOptions {
+  /** Opt-in, bounded on-device frame trace. Omitted from release builds. */
+  perfTrace?: boolean;
+  /** Presentation rate; the fixed 60 Hz core must divide into whole ticks. */
+  frameRate?: number;
   projectRoot?: string;
   outputRoot?: string;
   uid?: string;
+  navigation?: string;
   catalogIndex?: string;
   catalogBlob?: string;
   /**
@@ -365,6 +371,10 @@ export async function buildApp(
   sisVersion: string,
   options: SymbianBuildAppOptions = {},
 ): Promise<string> {
+  const frameRate = options.frameRate ?? SYMBIAN_TOOLCHAIN.runtime.frameRate;
+  if (!Number.isInteger(frameRate) || frameRate <= 0 || 60 % frameRate !== 0) {
+    throw new Error("Symbian frame rate must be a positive integer divisor of 60");
+  }
   const version = sisVersion.match(/^([0-9]+)\.([0-9]+)\.([0-9]+)$/);
   if (!version || version.slice(1).some((part) => Number(part) > 32767)) {
     throw new Error(
@@ -403,6 +413,9 @@ export async function buildApp(
   const manifest = JSON.parse(readFileSync(absoluteManifest, "utf8")) as unknown;
   const plan = resolveSymbianE7BuildPlan(manifest);
   const packageIdentity = symbianPackageIdentity(plan, options.uid);
+  const navigation = options.navigation === undefined ? "" : encodeSymbianNavigation(
+    JSON.parse(readFileSync(resolve(options.navigation), "utf8")), packageIdentity.uid);
+  if (navigation && options.catalogIndex) throw new Error("Native navigation and an embedded catalog are separate launch modes");
   const manifestRelativeToPocketJs = relative(root, absoluteManifest);
   const defaultProjectRoot =
     manifestRelativeToPocketJs !== ".." &&
@@ -516,7 +529,9 @@ export async function buildApp(
       copyFileSync(catalogIndex, resolve(payload, "catalog.tsv"));
       copyFileSync(catalogBlob, resolve(payload, "catalog.bin"));
     }
+    await Bun.write(resolve(payload, "navigation.tsv"), navigation);
     const embeddedPaths = [
+      resolve(payload, "navigation.tsv"),
       resolve(payload, "app.js"),
       resolve(payload, "app.pak"),
       ...(catalogIndex !== undefined
@@ -543,6 +558,8 @@ export async function buildApp(
         "build",
         "--release",
         "--locked",
+        "--config",
+        "profile.release.opt-level=3",
         "--target",
         resolve(root, "hosts/nokia-e7/targets/armv6-symbian-eabi.json"),
         "-Z",
@@ -575,6 +592,8 @@ export async function buildApp(
         sisVersion,
         dataBase,
         String(embeddedBytes),
+        String(frameRate),
+        options.perfTrace ? "1" : "0",
       ],
       {
         repository: root,
@@ -634,6 +653,7 @@ const HELP = `PocketJS Nokia E7 / Symbian toolchain
                            [--catalog-index <catalog.tsv> --catalog-blob <catalog.bin>]
                            [--core-library <application-core.a>]
                            [--mass-storage-data-root <dir>]
+                           [--frame-rate 30] [--perf-trace] [--navigation <apps.json>]
                                     build an independently installable PocketJS E7 SIS
   pocket symbian deploy <sis>       copy to Mass memory/Installs and verify by MTP readback
   pocket symbian coda usb           run the CODA USB ping + Locator handshake
@@ -680,8 +700,12 @@ export async function symbianMain(
           sisVersion,
           {
             projectRoot: flagValue(args.slice(2), "--project-root"),
+            perfTrace: args.includes("--perf-trace"),
+            frameRate: flagValue(args, "--frame-rate") === undefined
+              ? undefined : Number(flagValue(args, "--frame-rate")),
             outputRoot: flagValue(args.slice(2), "--outdir"),
             uid: flagValue(args.slice(2), "--uid"),
+            navigation: flagValue(args.slice(2), "--navigation"),
             catalogIndex: flagValue(args.slice(2), "--catalog-index"),
             catalogBlob: flagValue(args.slice(2), "--catalog-blob"),
             coreLibrary: flagValue(args.slice(2), "--core-library"),

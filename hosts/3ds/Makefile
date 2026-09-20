@@ -84,7 +84,11 @@ CFLAGS := -Wall -Wextra -O2 -g -std=gnu11 -mword-relocations -ffunction-sections
   -DPOCKETJS_AUX_VIEW_H=$(POCKETJS_AUX_LOGICAL_HEIGHT) \
   -DPOCKETJS_RASTER_DENSITY=$(POCKETJS_RASTER_DENSITY) \
   -I$(INCLUDE_DIR) -I$(BUILD) -I$(POCKETJS_QUICKJS_DIR) \
-  -I$(DEVKITPRO)/libctru/include
+  -I$(DEVKITPRO)/libctru/include -I$(DEVKITPRO)/portlibs/3ds/include
+
+ifeq ($(POCKETJS_ASSET_PACK),1)
+CFLAGS += -DPOCKETJS_ASSET_PACK
+endif
 
 ifeq ($(POCKETJS_OFFLOAD),1)
 CFLAGS += -DPOCKETJS_OFFLOAD -DPOCKETJS_OFFLOAD_KEY='"sdmc:/pocketjs/offload/$(POCKETJS_OFFLOAD_SLOT).key"'
@@ -103,10 +107,10 @@ CFLAGS += -DPOCKETJS_CAPTURE \
 endif
 
 LDFLAGS := -specs=3dsx.specs $(ARCH) -Wl,--gc-sections -Wl,-Map,$(BUILD)/pocketjs-3ds.map
-LIBPATHS := -L$(DEVKITPRO)/libctru/lib
-LIBS := -lcitro3d -lctru -lm
+LIBPATHS := -L$(DEVKITPRO)/libctru/lib -L$(DEVKITPRO)/portlibs/3ds/lib
+LIBS := -lcitro3d -lctru -lz -lm
 
-OBJECTS := $(BUILD)/main.o $(BUILD)/media.o $(BUILD)/offload.o $(BUILD)/soc.o $(BUILD)/svcwire.o $(BUILD)/runtime.o $(BUILD)/dev_protocol.o $(BUILD)/devserver.o $(BUILD)/devmenu.o $(BUILD)/gfx.o $(BUILD)/qjs.o $(BUILD)/input.o $(BUILD)/vshader_shbin.o
+OBJECTS := $(BUILD)/main.o $(BUILD)/media.o $(BUILD)/asset_pack.o $(BUILD)/offload.o $(BUILD)/soc.o $(BUILD)/svcwire.o $(BUILD)/runtime.o $(BUILD)/dev_protocol.o $(BUILD)/devserver.o $(BUILD)/devmenu.o $(BUILD)/gfx.o $(BUILD)/qjs.o $(BUILD)/input.o $(BUILD)/vshader_shbin.o
 ELF := $(BUILD)/pocketjs-3ds.elf
 SMDH := $(BUILD)/pocketjs-3ds.smdh
 
@@ -150,7 +154,7 @@ $(FLAGS_STAMP): $(FLAGS_STAMP).probe ;
 $(BUILD)/%.o: $(SOURCE)/%.c $(BUILD)/vshader_shbin.h $(FLAGS_STAMP) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/offload.o: $(SOURCE)/offload.h $(SOURCE)/offload_queue.h
+$(BUILD)/offload.o: $(SOURCE)/offload.h $(SOURCE)/offload_queue.h $(SOURCE)/offload_image.h
 $(BUILD)/qjs.o: $(SOURCE)/offload.h $(SOURCE)/offload_coverage.h
 $(BUILD)/media.o: $(SOURCE)/media.h $(SOURCE)/media_wire.h $(SOURCE)/media_adpcm.h
 $(BUILD)/main.o $(BUILD)/qjs.o $(BUILD)/gfx.o: $(SOURCE)/media.h

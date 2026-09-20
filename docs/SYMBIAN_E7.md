@@ -261,8 +261,10 @@ The experimental host has these runtime semantics:
   `360x360`–`640x640` dynamic variant with a `640x360` default.
 - The default host calls the JavaScript frame at 30 Hz and advances the
   PocketJS core with `60 / POCKETJS_FRAME_RATE` fixed ticks per frame (two at
-  the default rate). Builds reject non-positive rates and rates that do not
-  divide the core's fixed 60 Hz clock exactly.
+  the default rate). **`build app --frame-rate 60` requests a 60 Hz host timer.**
+  Builds reject non-positive rates and rates that do not divide the core's
+  fixed 60 Hz clock. The requested rate is a scheduling target; frame work
+  and presentation can reduce the achieved rate.
 - Arrow keys map to the four directions, the navigation center/Select key and
   keyboard Enter to `CIRCLE`, Escape to `CROSS`, Space to `START`, Q/E to the
   left/right triggers, and T/S to `TRIANGLE`/`SQUARE`.
@@ -274,6 +276,63 @@ The experimental host has these runtime semantics:
   axis while retaining the original untagged 9-bit wire for PSP/Vita-era
   hosts. `symbian-e7-dev` advertises `input.touch`; the framework exposes the
   same immutable per-frame contact snapshots on both encodings.
+
+### Measure frame work
+
+The GLES backend joins adjacent ranges with matching textures and scissors,
+skips repeated scissor state, and uses direct coordinates for a native-sized
+viewport. **A 4 × 4 opaque patch in unused font-atlas padding** lets solid fills
+share a batch with surrounding glyphs. A two-pixel gap protects glyph filtering;
+atlases without room use the separate white texture.
+
+**`build app --perf-trace` enables a bounded native trace.** It records the
+GLES version, vendor and renderer, then buffers a 30-second workload with
+limits of 60 wall-clock seconds and 2,048 frames. After measurement, it writes
+`E:/Installs/pocketjs-perf.tsv`. Normal builds omit tracing and replay.
+Collection and replay begin after 120 warmup frames, allowing first-presentation
+uploads and deferred context cleanup to settle before the opening gesture.
+The SIS receipt records the requested frame rate, tracing flag and QuickJS
+optimization level (`-O2`, with wrapping signed arithmetic and strict aliasing
+disabled). **The E7 host, QuickJS and Rust core use VFPv2 instructions with the
+soft argument ABI** required by the Symbian C libraries and Qt. The E7 HAL
+reports `EHardwareFloatingPoint=EFpTypeVFPv2`; the SIS receipt identifies this
+as `vfpv2-softfp`.
+The built-in E7 Rust core uses `opt-level=3`; other hosts retain their build
+profiles. A caller-supplied `--core-library` retains its caller's compiler flags.
+
+The frame rows contain elapsed time, frame interval, JavaScript execution,
+core ticks, GLES submission and presentation time in milliseconds.
+**Replay uses the framework's virtual frame clock** (`replay_ms`), so a slow
+frame cannot skip a whole press/release sequence. Phase assignment uses this
+clock; FPS and CPU durations use wall time. Without replay, both clocks use
+wall time. This measures rendering throughput for a fixed input sequence.
+Drawing is split into scene generation, resource synchronization, vertex
+generation, buffer upload and GLES submission, with batch and vertex counts.
+The C ABI `ui_gl_set_trace` callback supplies these boundaries on the render
+thread; a null callback disables them. Callbacks must not re-enter the UI or
+issue GL commands.
+`present_ms` includes `draw_ms` and Qt's swap. **These are CPU wall times,
+not GPU timer queries or panel scanout measurements.** The measured loop does
+not read pixels, call `glFinish`, or write files.
+The next completed frame after measurement is saved to
+`E:/Installs/pocketjs-perf.png` for visual inspection. This readback is outside
+the measured interval.
+On Symbian, diagnostic builds reset the inactivity timer once per second
+for five minutes, covering collection and inspection: packed replay bypasses
+the window server's input activity tracking. Replay fixes orientation to the
+manifest's initial viewport so icon hit targets stay at the recorded positions.
+Normal builds retain automatic orientation and device sleep behavior.
+Keep the device unlocked with the application in front. `inactive_frames`
+counts samples taken without an active window after the first startup second;
+discard such runs when measuring interactive performance.
+
+For repeatable input, a trace build reads `E:/Installs/pocketjs-perf-input.tsv`
+at startup. Each row contains an elapsed millisecond timestamp and one packed
+touch-v2 contact, separated by a tab; zero releases the contact. Timestamps
+must stay ordered, remain within 0–30,000 ms and end with a release. The file is
+limited to 128 KiB and 4,096 points. Remove it before measuring manual input.
+Replay exercises the guest input path; it does not measure physical touch
+delivery through Qt.
 
 ## Build the E7 Pocket Launcher
 
@@ -406,3 +465,88 @@ application build.
 - [Qt Creator 2.4 CODA serial transport](https://code.qt.io/cgit/qt-creator/qt-creator.git/tree/src/shared/symbianutils/codadevice.cpp?h=v2.4.1)
 - [Qt Creator 2.4 macOS Symbian device discovery](https://code.qt.io/cgit/qt-creator/qt-creator.git/tree/src/shared/symbianutils/symbiandevicemanager.cpp?h=v2.4.1)
 - [libmtp `mtp-sendfile` implementation](https://github.com/libmtp/libmtp/blob/v1.1.23/examples/sendfile.c)
+
+## Installed-app navigation
+
+**`--navigation <file.json>` packages an allowlist of separate SIS apps.** Each
+app keeps its QuickJS guest, native extension and resources in its own process.
+The foreground app runs frames; background apps stop advancing the guest and
+simulation. **Background apps release GLES resources and reset their EGL
+context and surface.** A navigation handoff releases the outgoing surface
+before activating the destination, so their GPU allocations do not overlap
+during startup. Qt repaint delivery stays disabled until foreground restoration.
+Qt chrome uses the raster graphics system; app content uses GLES. The host also
+terminates its process-owned EGL connection and releases thread state: destroying
+the context alone leaves VideoCore client allocations resident. The next
+activation initializes EGL, recreates the context and uploads textures from
+retained CPU data.
+Launching an existing task brings it to the foreground. Launching
+an absent task starts its installed UID through the application server.
+This mode cannot be combined with an embedded `--catalog`.
+
+The registry has `shell` (the Shell UID) and `apps` (2–32 entries). Every entry
+contains `uid`, `id`, `output` and `title`; `orientation` accepts `auto` or
+`portrait`. UIDs, manifest IDs and output keys must be unique. Build every
+participating package with the same registry, including its own UID. The build
+receipt records the encoded registry hash.
+
+```json
+{
+  "shell": "0xEA360236",
+  "apps": [
+    { "uid": "0xEA360236", "id": "dev.pocket-stack.fluid", "output": "pocketshell-touch", "title": "Pocket Shell" },
+    { "uid": "0xE16ACD8E", "id": "dev.pocket-stack.clear", "output": "clear-main", "title": "Pocket Clear", "orientation": "portrait" }
+  ]
+}
+```
+
+```sh
+bun tools/symbian.ts build app --manifest apps/clear/pocket.symbian.json \
+  --navigation /path/to/pocket-shell/shells/touch/native-apps.json \
+  --frame-rate 60 --sis-version 0.3.12
+```
+
+**Child apps reserve the bottom 28 pixels for a host-owned return gesture.**
+The guest receives the remaining viewport and never receives a contact that
+starts in the return strip. A tap or upward swipe returns to Shell Home; a
+220 ms hold after lifting opens the Shell switcher. The app presentation
+shrinks with the contact. Release passes its normalized pose and last frame to
+Shell before the first resumed guest frame. Focus loss, rotation and additional
+contacts cancel the gesture. The operating system Home key is unchanged.
+
+`appTable()` reports `kind: "native"` and each configured entry's `installed`
+state. `launchApp(output)` schedules activation after presentation;
+`onNativeAppReturn(listener)` receives return destination, normalized pose,
+last-frame texture and launch errors. `closeApp(output)` lets Shell request
+`EndTask` for a configured child. A successful return means the close request
+was sent, not that the process has exited. Other hosts can omit `appClose`.
+Missing packages and rejected activation leave the calling app usable.
+
+Return metadata and screenshots live under
+`E:/Data/PocketJS/navigation/<shell-uid>/`. The host consumes a return mailbox
+once and uploads a 256×512 (portrait) or 512×256 (landscape) thumbnail. A texture
+belongs to the host and is replaced on that app's next return. Shell must bind
+the new handle before its next paint. These files contain app content; they are
+not an OS window server or a security boundary between installed apps.
+
+**Process retention lasts until the app closes or the OS terminates it.** This
+protocol does not serialize JavaScript state or implement cross-process deep
+links. Native children can return to a cold Shell. Background snapshots do not
+update until another return. Native rendering and touch controls can use the
+same host gesture without adding application-specific navigation code.
+
+For `--perf-trace` builds, a nonempty
+`E:/Installs/pocketjs-perf-<uid>-input.tsv` selects a per-app replay and output
+prefix; otherwise the host uses `pocketjs-perf`. Native replay passes through
+the Qt touch routing and return-strip ownership. Its virtual clock pauses
+with the background process. `*-navigation.tsv` records activations alongside
+the frame trace. Release builds do not read replay files.
+
+Native renderers opt into graphics suspension with the optional
+`PocketJsSymbianGraphicsExtensionV1` / `GraphicsExtensionV1` tail. Its V1 prefix
+and provider symbol remain unchanged; `base.struct_size` covers the full table.
+`release_graphics(gl_context_current)` releases GPU handles and retains CPU
+scene/game data. The next `render` rebuilds GPU resources. A host checks the
+size before accessing the tail. Existing extensions without it retain their
+previous lifecycle; native navigation ports must add it to release background
+graphics memory.

@@ -282,6 +282,9 @@ export const OP = {
   fontStreamRequests: 48, // () -> JSON of at most 32 [generation,slot,scalar] misses.
   fontStreamCommit: 49, // (PFG1 bytes) -> accepted count, at most four cells.
   fontStreamStats: 50, // () -> JSON: residency, visible misses, eviction counters.
+  appClose: 51, // (output: string) -> 0|1. Native navigation only: request
+  //                graceful closure of a configured child app. Never closes
+  //                the shell or caller. Embedded hosts omit this operation.
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -1449,6 +1452,13 @@ export const FONT_FLAG_BOLD = 1 << 0;
 //                           in shell painter order, so later shell ops remain
 //                           above the child surface.
 
+//   MESH (10 words): op, meshHandle, a,b,c,d,tx,ty (f32 affine), clipXY,clipWH.
+//                           Opt-in retained geometry command. Vertices remain
+//                           in the native mesh resource's logical coordinates;
+//                           the GPU applies the affine and clips. Only hosts
+//                           enabling Ui::set_mesh_commands receive this op.
+//                           Other hosts retain CPU-clipped TRI output. The
+//                           resource revision participates in render invalidation.
 export const DRAW_OP = {
   rect: 1,
   gradRect: 2,
@@ -1460,6 +1470,7 @@ export const DRAW_OP = {
   texTri: 8,
   textRun: 9,
   surfaceQuad: 10,
+  mesh: 11,
 } as const;
 
 // ---------------------------------------------------------------------------

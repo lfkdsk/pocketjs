@@ -557,6 +557,22 @@ pub extern "C" fn ui_gl_shutdown() {
 }
 
 #[no_mangle]
+pub extern "C" fn ui_gl_set_trace(callback: Option<extern "C" fn(u32, u32, u32)>) {
+    #[cfg(all(
+        any(target_os = "none", feature = "bare-platform"),
+        not(feature = "software-only")
+    ))]
+    unsafe {
+        gl::set_trace(callback);
+    }
+    #[cfg(any(
+        feature = "software-only",
+        not(any(target_os = "none", feature = "bare-platform"))
+    ))]
+    let _ = callback;
+}
+
+#[no_mangle]
 pub extern "C" fn ui_gl_render(
     target_x: i32,
     target_y: i32,
@@ -918,3 +934,10 @@ mod tests {
         assert!(unsafe { with_initialized_ui_unchecked(|_| ()) }.is_none());
     }
 }
+
+#[no_mangle]
+pub extern "C" fn ui_upload_mesh(ptr: *const u8, len: usize) -> i32 { ui().upload_mesh(unsafe { bytes(ptr,len) }) }
+#[no_mangle]
+pub extern "C" fn ui_free_mesh(handle: i32) { ui().free_mesh(handle); }
+#[no_mangle]
+pub extern "C" fn ui_set_mesh(id: i32, handle: i32) { ui().set_mesh(id,handle); }

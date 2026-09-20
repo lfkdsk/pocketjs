@@ -8,8 +8,6 @@
 //! PSP (this is the movement code air-strafing depends on; both targets run
 //! the exact same source). `pocket3d::collide` re-exports this module.
 
-use alloc::vec::Vec;
-
 use glam::Vec3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +141,8 @@ fn clip_velocity(v: Vec3, normal: Vec3) -> Vec3 {
 /// (up to 4 bumps). Returns the covered time fraction spent not stuck.
 fn slide_move(world: &impl TraceWorld, hull: HullKind, pos: &mut Vec3, vel: &mut Vec3, dt: f32) {
     let original = *vel;
-    let mut planes: Vec<Vec3> = Vec::with_capacity(4);
+    let mut planes = [Vec3::ZERO; 4];
+    let mut plane_count = 0;
     let mut time_left = dt;
 
     for _ in 0..4 {
@@ -159,23 +158,24 @@ fn slide_move(world: &impl TraceWorld, hull: HullKind, pos: &mut Vec3, vel: &mut
         }
         if tr.fraction > 0.0 {
             *pos = tr.end;
-            planes.clear();
+            plane_count = 0;
         }
         if tr.fraction >= 1.0 {
             return;
         }
         time_left -= time_left * tr.fraction;
-        if planes.len() >= 4 {
+        if plane_count >= 4 {
             *vel = Vec3::ZERO;
             return;
         }
-        planes.push(tr.normal);
+        planes[plane_count] = tr.normal;
+        plane_count += 1;
 
         // Find a velocity that leaves every touched plane.
         let mut found = false;
-        for i in 0..planes.len() {
+        for i in 0..plane_count {
             let candidate = clip_velocity(*vel, planes[i]);
-            if planes
+            if planes[..plane_count]
                 .iter()
                 .enumerate()
                 .all(|(j, p)| j == i || candidate.dot(*p) >= 0.0)
@@ -186,7 +186,7 @@ fn slide_move(world: &impl TraceWorld, hull: HullKind, pos: &mut Vec3, vel: &mut
             }
         }
         if !found {
-            if planes.len() == 2 {
+            if plane_count == 2 {
                 let dir = planes[0].cross(planes[1]).normalize_or_zero();
                 *vel = dir * dir.dot(*vel);
             } else {
@@ -203,7 +203,7 @@ fn slide_move(world: &impl TraceWorld, hull: HullKind, pos: &mut Vec3, vel: &mut
 
 /// Slide move with stair stepping: try both the direct slide and an
 /// up-step/slide/down-step variant, keep whichever travels further.
-fn step_slide_move(
+fn step_slide_move<const SKIP_CLEAR: bool>(
     world: &impl TraceWorld,
     hull: HullKind,
     pos: &mut Vec3,
@@ -217,6 +217,15 @@ fn step_slide_move(
     let mut down_pos = start_pos;
     let mut down_vel = start_vel;
     slide_move(world, hull, &mut down_pos, &mut down_vel, dt);
+
+    // A clear direct sweep already covers the full requested horizontal
+    // distance. The stepped route cannot improve it; avoid three more traces.
+    let target = start_pos + start_vel * dt;
+    if SKIP_CLEAR && start_vel.y == 0.0 && down_pos.x == target.x && down_pos.z == target.z {
+        *pos = down_pos;
+        *vel = down_vel;
+        return;
+    }
 
     // Stepped variant.
     let up = world.trace(hull, start_pos, start_pos + Vec3::Y * step_height);
@@ -270,6 +279,17 @@ pub fn step_character(
     input: &MoveInput,
     dt: f32,
 ) {
+    step_character_inner::<true>(world, hull, state, params, input, dt);
+}
+
+fn step_character_inner<const SKIP_CLEAR: bool>(
+    world: &impl TraceWorld,
+    hull: HullKind,
+    state: &mut CharacterState,
+    params: &MoveParams,
+    input: &MoveInput,
+    dt: f32,
+) {
     categorize_ground(world, hull, state, false);
 
     // Jump consumes ground state before friction.
@@ -314,7 +334,7 @@ pub fn step_character(
     }
 
     if state.on_ground {
-        step_slide_move(
+        step_slide_move::<SKIP_CLEAR>(
             world,
             hull,
             &mut state.pos,
@@ -344,5 +364,135 @@ impl XzLen for Vec3 {
     fn xz_len(&self) -> f32 {
         // Via glam so the sqrt resolves in both std and libm builds.
         Vec3::new(self.x, 0.0, self.z).length()
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+
+    struct Ramp(f32);
+    impl TraceWorld for Ramp {
+        fn trace(&self, _: HullKind, start: Vec3, end: Vec3) -> Trace {
+            let normal = Vec3::new(-self.0, 1.0, 0.0).normalize();
+            let a = start.dot(normal);
+            let b = end.dot(normal);
+            let fraction = if b < 0.0 {
+                (a / (a - b)).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            Trace {
+                fraction,
+                end: start.lerp(end, fraction),
+                normal,
+                start_solid: a < -0.001,
+            }
+        }
+    }
+
+    #[test]
+    fn clear_ground_and_slopes_match_full_stair_search() {
+        for slope in [0.0, 0.25, -0.25] {
+            let world = Ramp(slope);
+            let mut slow = CharacterState::new(Vec3::ZERO);
+            for tick in 0..600 {
+                let mut fast = slow;
+                let input = MoveInput {
+                    wish_dir: Vec3::X,
+                    speed: 1.0,
+                    jump: tick % 120 == 60,
+                };
+                step_character_inner::<true>(
+                    &world,
+                    HullKind::Stand,
+                    &mut fast,
+                    &MoveParams::default(),
+                    &input,
+                    1.0 / 60.0,
+                );
+                step_character_inner::<false>(
+                    &world,
+                    HullKind::Stand,
+                    &mut slow,
+                    &MoveParams::default(),
+                    &input,
+                    1.0 / 60.0,
+                );
+                // The reference can choose a step after horizontal lerp
+                // rounding. Compare each step within four coordinate ulps.
+                let epsilon = slow.pos.abs().max_element().max(1.0) * f32::EPSILON * 4.0;
+                assert!(
+                    fast.pos.abs_diff_eq(slow.pos, epsilon),
+                    "slope {slope} tick {tick}: {:?} {:?}",
+                    fast.pos,
+                    slow.pos
+                );
+                assert_eq!(fast.vel, slow.vel);
+                assert_eq!(fast.on_ground, slow.on_ground);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires POCKET3D_COOKED_MAPS containing user-supplied .p3d files"]
+    fn real_map_motion_matches_full_stair_search() {
+        let dir = std::env::var("POCKET3D_COOKED_MAPS").unwrap();
+        let mut maps = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "p3d") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let map = crate::cooked::read(&bytes).unwrap();
+            let mut steps = 0;
+            for spawn in map.ct_spawns.iter().chain(&map.t_spawns).take(12) {
+                for config in [
+                    MoveParams::default(),
+                    MoveParams {
+                        max_speed: 190.0,
+                        gravity: 400.0,
+                        step_height: 24.0,
+                        ..MoveParams::default()
+                    },
+                ] {
+                    let mut fast = CharacterState::new(spawn.pos);
+                    let mut slow = fast;
+                    for tick in 0..600 {
+                        let angle = (tick / 90) as f32 * 1.3 + spawn.yaw;
+                        let input = MoveInput {
+                            wish_dir: Vec3::new(angle.cos(), 0.0, angle.sin()),
+                            speed: 1.0,
+                            jump: tick % 120 == 80,
+                        };
+                        step_character_inner::<true>(
+                            &map.collision,
+                            HullKind::Stand,
+                            &mut fast,
+                            &config,
+                            &input,
+                            1.0 / 60.0,
+                        );
+                        step_character_inner::<false>(
+                            &map.collision,
+                            HullKind::Stand,
+                            &mut slow,
+                            &config,
+                            &input,
+                            1.0 / 60.0,
+                        );
+                        assert_eq!(fast.pos, slow.pos, "{} tick {tick}", path.display());
+                        assert_eq!(fast.vel, slow.vel, "{} tick {tick}", path.display());
+                        assert_eq!(fast.on_ground, slow.on_ground);
+                        steps += 1;
+                    }
+                }
+            }
+            assert!(steps > 0);
+            println!("{}: {steps} matching character steps", path.display());
+            maps += 1;
+        }
+        assert!(maps > 0);
     }
 }

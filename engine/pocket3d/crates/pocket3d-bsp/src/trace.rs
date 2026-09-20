@@ -88,6 +88,76 @@ pub struct MapCollision {
     /// Solid brush entities to clip against in addition to the world:
     /// (model index, world offset).
     solids: Vec<(usize, Vec3)>,
+    // Conservative bounds of each model/hull's solid leaves. None preserves
+    // the exact traversal for unbounded or unusually complex hulls.
+    model_bounds: Vec<[Option<HullBounds>; 4]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HullBounds {
+    mins: Vec3,
+    maxs: Vec3,
+}
+
+impl HullBounds {
+    fn intersects_segment(self, start: Vec3, end: Vec3) -> bool {
+        let epsilon = Vec3::splat(DIST_EPSILON);
+        (start.min(end).cmple(self.maxs + epsilon)).all()
+            && (start.max(end).cmpge(self.mins - epsilon)).all()
+    }
+}
+
+// Axis planes bound the union of solid cells. Oblique planes leave the box
+// unchanged, so this can overestimate geometry but cannot cut it away.
+fn solid_bounds(nodes: &[ClipNode], planes: &[Plane], head: i32) -> Option<HullBounds> {
+    let infinite = HullBounds {
+        mins: Vec3::splat(f32::NEG_INFINITY),
+        maxs: Vec3::splat(f32::INFINITY),
+    };
+    let mut pending = alloc::vec![(head, infinite)];
+    let mut result = HullBounds {
+        mins: Vec3::splat(f32::INFINITY),
+        maxs: Vec3::splat(f32::NEG_INFINITY),
+    };
+    let mut visited = 0;
+    while let Some((node, bounds)) = pending.pop() {
+        visited += 1;
+        if visited > 4096 {
+            return None;
+        }
+        if node < 0 {
+            if node == CONTENTS_SOLID {
+                result.mins = result.mins.min(bounds.mins);
+                result.maxs = result.maxs.max(bounds.maxs);
+            }
+            continue;
+        }
+        let node = nodes.get(node as usize)?;
+        let plane = planes.get(node.plane as usize)?;
+        let axis = (0..3).find(|&axis| {
+            plane.normal[axis].abs() == 1.0
+                && (0..3).all(|other| other == axis || plane.normal[other] == 0.0)
+        });
+        for side in 0..2 {
+            let mut child_bounds = bounds;
+            if let Some(axis) = axis {
+                let at = plane.dist / plane.normal[axis];
+                if (side == 0) == (plane.normal[axis] > 0.0) {
+                    child_bounds.mins[axis] = child_bounds.mins[axis].max(at);
+                } else {
+                    child_bounds.maxs[axis] = child_bounds.maxs[axis].min(at);
+                }
+            }
+            if child_bounds.mins.cmple(child_bounds.maxs).all() {
+                pending.push((node.children[side], child_bounds));
+            }
+        }
+    }
+    if result.mins.is_finite() && result.maxs.is_finite() {
+        Some(result)
+    } else {
+        None
+    }
 }
 
 impl MapCollision {
@@ -119,13 +189,27 @@ impl MapCollision {
         models: Vec<ModelHulls>,
         solids: Vec<(usize, Vec3)>,
     ) -> Self {
-        Self {
+        let mut collision = Self {
             planes,
             hull0,
             clipnodes,
             models,
             solids,
+            model_bounds: Vec::new(),
+        };
+        collision
+            .model_bounds
+            .resize(collision.models.len(), [None; 4]);
+        // The world is not a bounded brush; avoid traversing its tree here.
+        for model in 1..collision.models.len() {
+            for hull in [Hull::Point, Hull::Stand, Hull::Crouch, Hull::Large] {
+                if let Some((nodes, head)) = collision.tree(hull, model) {
+                    collision.model_bounds[model][hull.index()] =
+                        solid_bounds(nodes, &collision.planes, head);
+                }
+            }
         }
+        collision
     }
 
     pub fn planes(&self) -> &[Plane] {
@@ -174,6 +258,12 @@ impl MapCollision {
         for &(model, entity_offset) in &self.solids {
             if model >= self.models.len() {
                 continue;
+            }
+            if let Some(bounds) = self.model_bounds[model][hull.index()] {
+                let offset = self.models[model].origin + entity_offset;
+                if !bounds.intersects_segment(start - offset, end - offset) {
+                    continue;
+                }
             }
             let t = self.trace_model_offset(model, entity_offset, hull, start, end);
             if t.fraction < best.fraction || (t.start_solid && !best.start_solid) {
@@ -351,6 +441,154 @@ impl HullTree<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unpruned_trace(col: &MapCollision, hull: Hull, start: Vec3, end: Vec3) -> TraceResult {
+        let mut best = col.trace_model(0, hull, start, end);
+        for &(model, offset) in &col.solids {
+            if model >= col.models.len() {
+                continue;
+            }
+            let t = col.trace_model_offset(model, offset, hull, start, end);
+            if t.fraction < best.fraction || (t.start_solid && !best.start_solid) {
+                best = t;
+            }
+        }
+        best
+    }
+
+    fn assert_same(a: TraceResult, b: TraceResult) {
+        assert_eq!(a.fraction, b.fraction);
+        assert_eq!(a.end, b.end);
+        assert_eq!(a.normal, b.normal);
+        assert_eq!(a.start_solid, b.start_solid);
+        assert_eq!(a.all_solid, b.all_solid);
+    }
+
+    #[test]
+    fn brush_bounds_preserve_hits_inside_and_outside_translated_models() {
+        let mut planes = Vec::new();
+        let mut nodes = Vec::new();
+        for axis in 0..3 {
+            for sign in [1.0, -1.0] {
+                let mut normal = Vec3::ZERO;
+                normal[axis] = sign;
+                let index = nodes.len();
+                planes.push(Plane { normal, dist: 8.0 });
+                nodes.push(ClipNode {
+                    plane: index as u32,
+                    children: [
+                        CONTENTS_EMPTY,
+                        if index == 5 {
+                            CONTENTS_SOLID
+                        } else {
+                            index as i32 + 1
+                        },
+                    ],
+                });
+            }
+        }
+        let origin = Vec3::new(10.0, 20.0, -30.0);
+        let offset = Vec3::new(40.0, -10.0, 100.0);
+        let models = alloc::vec![
+            ModelHulls {
+                headnodes: [CONTENTS_EMPTY; 4],
+                origin: Vec3::ZERO
+            },
+            ModelHulls {
+                headnodes: [0; 4],
+                origin
+            },
+        ];
+        let col = MapCollision::from_parts(
+            planes,
+            nodes.clone(),
+            nodes,
+            models,
+            alloc::vec![(1, offset)],
+        );
+        let bounds = col.model_bounds[1][0].unwrap();
+        assert_eq!(bounds.mins, Vec3::splat(-8.0));
+        assert_eq!(bounds.maxs, Vec3::splat(8.0));
+        for hull in [Hull::Point, Hull::Stand, Hull::Crouch, Hull::Large] {
+            for a in -12..=12 {
+                for b in -12..=12 {
+                    let start = origin + offset + Vec3::new(a as f32, -16.0, b as f32);
+                    let end = origin + offset + Vec3::new(a as f32, 16.0, b as f32);
+                    assert_same(
+                        col.trace(hull, start, end),
+                        unpruned_trace(&col, hull, start, end),
+                    );
+                    assert_same(
+                        col.trace(hull, end.lerp(start, 0.5), start),
+                        unpruned_trace(&col, hull, end.lerp(start, 0.5), start),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unbounded_and_excessive_hulls_keep_exact_fallback() {
+        let planes = [Plane {
+            normal: Vec3::X,
+            dist: 0.0,
+        }];
+        let half_space = [ClipNode {
+            plane: 0,
+            children: [CONTENTS_EMPTY, CONTENTS_SOLID],
+        }];
+        assert!(solid_bounds(&half_space, &planes, 0).is_none());
+        let cycle = [ClipNode {
+            plane: 0,
+            children: [0, CONTENTS_EMPTY],
+        }];
+        assert!(solid_bounds(&cycle, &planes, 0).is_none());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    #[ignore = "requires POCKET3D_COOKED_MAPS containing user-supplied .p3d files"]
+    fn real_map_brush_bounds_match_unpruned_traces() {
+        let dir = std::env::var("POCKET3D_COOKED_MAPS").expect("local map directory");
+        let mut maps = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "p3d") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let map = crate::cooked::read(&bytes).unwrap();
+            let col = &map.collision;
+            let mut seed = 0x12345678u32;
+            let mut random = || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / 16777216.0
+            };
+            for _ in 0..2000 {
+                let start = map.bounds.0
+                    + (map.bounds.1 - map.bounds.0) * Vec3::new(random(), random(), random());
+                let end =
+                    start + (Vec3::new(random(), random(), random()) - Vec3::splat(0.5)) * 500.0;
+                for hull in [Hull::Point, Hull::Stand, Hull::Crouch, Hull::Large] {
+                    assert_same(
+                        col.trace(hull, start, end),
+                        unpruned_trace(col, hull, start, end),
+                    );
+                }
+            }
+            println!(
+                "{}: 8000 matching traces; {} bounded model hulls",
+                path.display(),
+                col.model_bounds
+                    .iter()
+                    .flatten()
+                    .filter(|b| b.is_some())
+                    .count()
+            );
+            maps += 1;
+        }
+        assert!(maps > 0);
+    }
 
     /// A one-plane "floor at y=0" hull: above empty, below solid.
     fn floor_tree() -> (Vec<ClipNode>, Vec<Plane>) {

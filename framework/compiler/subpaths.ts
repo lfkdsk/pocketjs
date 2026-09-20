@@ -57,6 +57,15 @@ export const SUBPATHS: Record<string, SubpathDecl> = {
   animation: { file: "framework/src/animation.ts", aliases: TWINS },
   classic: { file: { solid: "framework/src/classic.ts" } },
   "offload/provider": { file: "tools/offload-provider.ts" },
+  // Relay (docs/RELAY.md): the L2 contract + composed endpoint a guest
+  // imports through the package boundary, and the provider-side wire
+  // adapter for companions (the offload/provider precedent).
+  "relay/spec": { file: "contracts/spec/relay.ts", aliases: TWINS },
+  "relay/endpoint": { file: "framework/src/relay/endpoint.ts", aliases: TWINS },
+  "relay/resource": { file: "framework/src/relay/resource.ts", aliases: TWINS },
+  "relay/frame": { file: "framework/src/relay/frame.ts", aliases: TWINS },
+  "relay/session": { file: "framework/src/relay/session.ts", aliases: TWINS },
+  "relay/wire": { file: "tools/relay-wire.ts" },
   "offload/usb-provider": { file: "tools/offload-usb-provider.ts" },
   "offload/capabilities": { file: "tools/offload-capabilities.ts" },
   ime: { file: "framework/src/ime.ts", aliases: TWINS },
@@ -71,7 +80,9 @@ export const SUBPATHS: Record<string, SubpathDecl> = {
   "resource-state": { file: "framework/src/resource-state.ts", aliases: TWINS },
   "resource-cache": { file: "framework/src/resource-cache.ts", aliases: TWINS },
   "resource-offload": { file: "framework/src/resource-offload.ts", aliases: TWINS },
+  "resource-pack": { file: "framework/src/resource-pack.ts", aliases: TWINS },
   "resource-view": { file: { solid: "framework/src/resource-view.ts" } },
+  "tile-viewport": { file: "framework/src/tile-viewport.ts", aliases: TWINS },
   resource: { file: { solid: "framework/src/resource.ts" } },
   audio: { file: "framework/src/audio-api.ts", aliases: TWINS },
   media: { file: "framework/src/media.ts", aliases: TWINS },

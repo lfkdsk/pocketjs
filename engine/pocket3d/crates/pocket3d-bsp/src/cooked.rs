@@ -36,6 +36,9 @@ use crate::trace::{MapCollision, ModelHulls, make_hull0_with};
 use crate::types::{Leaf, Node, Plane, SpawnPoint, SunLight, SurfaceKind};
 use crate::vis::VisData;
 
+pub mod bounds;
+pub mod strip;
+
 #[cfg(target_endian = "big")]
 compile_error!("the .p3d reader assumes a little-endian target");
 

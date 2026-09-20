@@ -34,6 +34,7 @@
 #include "qjs.h"
 #include "offload.h"
 #include "media.h"
+#include "asset_pack.h"
 #include "devserver.h"
 #include "devmenu.h"
 #include "runtime.h"
@@ -732,6 +733,9 @@ int main(void) {
 #ifdef POCKETJS_MEDIA
   if (!media_start()) { media_stop(); fail("Media worker allocation failed"); }
 #endif
+#ifdef POCKETJS_ASSET_PACK
+  asset_pack_start();
+#endif
 #ifdef POCKETJS_OFFLOAD
   GuestChoice guest = package_choice(embedded, 0, &runtime_state);
   guest.commit_on_accept = false;
@@ -877,6 +881,16 @@ int main(void) {
 #endif
 
     u64 offload_cpu_start = svcGetSystemTick();
+    uint32_t input_elapsed_us = 0;
+#ifndef POCKETJS_CAPTURE
+    static u64 previous_input_tick;
+    if (previous_input_tick) {
+      u64 elapsed = offload_cpu_start - previous_input_tick;
+      if (elapsed > SYSCLOCK_ARM11 / 15) elapsed = SYSCLOCK_ARM11 / 15;
+      input_elapsed_us = (uint32_t)(elapsed * 1000000 / SYSCLOCK_ARM11);
+    }
+    previous_input_tick = offload_cpu_start;
+#endif
     int32_t touch_hit = 0;
     size_t hit_count = ui_touch_hits_auxiliary(
       touch_count > 0 ? &touch : NULL,
@@ -885,7 +899,7 @@ int main(void) {
       1
     );
     if (hit_count != touch_count) fail("auxiliary touch hit resolution failed");
-    if (!qjs_frame(buttons, analog, &touch, &touch_hit, touch_count, right_analog)) {
+    if (!qjs_frame(buttons, analog, &touch, &touch_hit, touch_count, right_analog, input_elapsed_us)) {
 #if defined(POCKETJS_CAPTURE) || defined(POCKETJS_OFFLOAD)
       fail(qjs_last_error());
 #else
@@ -960,6 +974,7 @@ int main(void) {
 #endif
     }
     gfx_finish_frame();
+    u64 offload_prepared_at = svcGetSystemTick();
 
     C3D_RenderTargetClear(primary_target, C3D_CLEAR_ALL, 0x000000ff, 0);
     C3D_FrameDrawOn(primary_target);
@@ -972,7 +987,10 @@ int main(void) {
     C3D_SetViewport(0, 0, AUX_VIEW_H, AUX_VIEW_W);
     gfx_draw_surface(1);
     C3D_FrameEnd(0);
-    offload_measure((unsigned)((offload_ui_ticks + svcGetSystemTick() - offload_cpu_start) * 1000000 / SYSCLOCK_ARM11));
+    offload_measure_parts(
+      (unsigned)(offload_ui_ticks * 1000000 / SYSCLOCK_ARM11),
+      (unsigned)((offload_prepared_at - offload_cpu_start) * 1000000 / SYSCLOCK_ARM11),
+      (unsigned)((svcGetSystemTick() - offload_prepared_at) * 1000000 / SYSCLOCK_ARM11));
 #if !defined(POCKETJS_CAPTURE) && !defined(POCKETJS_OFFLOAD)
     guest.submitted_frames += 1;
     devserver_set_frame_stats(
@@ -1050,6 +1068,9 @@ int main(void) {
   offload_stop();
 #ifdef POCKETJS_MEDIA
   media_stop();
+#endif
+#ifdef POCKETJS_ASSET_PACK
+  asset_pack_stop();
 #endif
   input_shutdown();
   teardown_guest();

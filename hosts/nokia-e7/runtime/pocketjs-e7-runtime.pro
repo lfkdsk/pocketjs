@@ -8,7 +8,7 @@ CONFIG += release
 CONFIG -= debug app_bundle
 
 SOURCES += main.cpp
-HEADERS += pocketjs_symbian_core.h pocketjs_symbian_extension.h pocketjs_symbian_keys.h
+HEADERS += pocketjs_native_navigation.h pocketjs_navigation_gesture.h pocketjs_symbian_core.h pocketjs_symbian_extension.h pocketjs_symbian_keys.h
 RESOURCES += pocketjs-runtime.qrc
 
 isEmpty(POCKETJS_QUICKJS_INCLUDE): error(POCKETJS_QUICKJS_INCLUDE is required)
@@ -22,6 +22,8 @@ isEmpty(POCKETJS_INITIAL_LOGICAL_HEIGHT): error(POCKETJS_INITIAL_LOGICAL_HEIGHT 
 INCLUDEPATH += $$POCKETJS_QUICKJS_INCLUDE
 DEFINES += __STDC_LIMIT_MACROS
 DEFINES += POCKETJS_FRAME_RATE=$$POCKETJS_FRAME_RATE
+equals(POCKETJS_PERF_TRACE, 1): DEFINES += POCKETJS_PERF_TRACE
+equals(POCKETJS_PERF_TRACE, 1): DEFINES += POCKETJS_GL_STAGES
 DEFINES += POCKETJS_HOST_ABI=$$POCKETJS_HOST_ABI
 DEFINES += POCKETJS_INITIAL_LOGICAL_WIDTH=$$POCKETJS_INITIAL_LOGICAL_WIDTH
 DEFINES += POCKETJS_INITIAL_LOGICAL_HEIGHT=$$POCKETJS_INITIAL_LOGICAL_HEIGHT
@@ -40,12 +42,23 @@ QMAKE_LFLAGS += --no-whole-archive
 PRE_TARGETDEPS += $$POCKETJS_CORE_LIBRARY
 
 symbian {
+    # E7 reports HAL EHardwareFloatingPoint=EFpTypeVFPv2. Use its FPU while
+    # retaining the soft argument ABI used by Qt and the Symbian C libraries.
+    QMAKE_CFLAGS -= -msoft-float
+    QMAKE_CXXFLAGS -= -msoft-float
+    QMAKE_CFLAGS += -mfloat-abi=softfp -mfpu=vfp
+    QMAKE_CXXFLAGS += -mfloat-abi=softfp -mfpu=vfp
+    QMAKE_ELF2E32_FLAGS -= --fpu=softvfp
+    QMAKE_ELF2E32_FLAGS += --fpu=vfpv2
     isEmpty(POCKETJS_SYMBIAN_UID): error(POCKETJS_SYMBIAN_UID is required)
     QMAKE_LINK = /toolchain/current/bin/symbian-gcce-link
     TARGET.UID3 = $$POCKETJS_SYMBIAN_UID
+    DEFINES += POCKETJS_SYMBIAN_UID=$$POCKETJS_SYMBIAN_UID
+    LIBS += -lapparc -lcone -lws32 -lapgrfx
     TARGET.CAPABILITY = None
     TARGET.EPOCSTACKSIZE = 0x100000
-    TARGET.EPOCHEAPSIZE = 0x400000 0x2000000
+    # The maximum permits native game data; the initial commitment stays 4 MiB.
+    TARGET.EPOCHEAPSIZE = 0x400000 0x4000000
 
     QMAKE_ELF2E32_FLAGS -= --compressionmethod bytepair
     QMAKE_ELF2E32_FLAGS += --compressionmethod inflate
