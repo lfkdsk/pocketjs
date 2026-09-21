@@ -563,10 +563,69 @@ test("B3 reset: a seq hole on a business stream resets it on both ends, the slic
   expect(reopened.stream).toBe(2);
   expect(link.guest.inspect()!.allocations.get(2)).toEqual({ frames: 6, bytes: 24576 });
   expect(link.provider.inspect()!.allocations.get(2)).toEqual({ frames: 6, bytes: 24576 });
-  expect(link.guest.inspect()!.sender.ledgerView().sliceOf(1)).toBeDefined(); // the row stays for late settlement
+  expect(link.guest.inspect()!.sender.ledgerView().sliceOf(1)).toBeUndefined(); // RESET no longer retains a counter row
   expect(link.guest.inspect()!.sender.admit({ type: RELAY_TYPE.REQUEST, stream: 1, correlation: 9, metadata: { op: "x" } }).code).toBe(RELAY_P3_ERROR.STREAM_DEAD);
   expect(link.guest.protocolErrors + link.provider.protocolErrors).toBe(0);
 });
+
+for (const sync of [false, true]) {
+  test(`namespace stream churn beyond eight ids releases all retired accounting (${sync ? "sync" : "async"})`, async () => {
+    const link = makeLink({ sync });
+    let stream = await connect(link);
+    const session = link.guest.session.sessionId;
+    const retired: number[] = [];
+    try {
+      for (let replacement = 1; replacement <= 32; replacement++) {
+        await new Promise<void>((resolve) => {
+          link.guest.subscribe(stream, { ns: "map/demo" }, RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject() {} }, result => {
+            expect(result.ok).toBe(true);
+            resolve();
+          });
+        });
+        await link.settle();
+        const old = stream;
+        retired.push(old);
+        const late = encodeFrame({
+          type: RELAY_TYPE.PUSH, codec: RELAY_CODEC.NONE, session, seq: 99, stream: old, correlation: 0,
+          metadata: { op: "resource.push", subscription: 1, final: true, resource: tileRef("old"), value: {} },
+        });
+        if (!late.ok) throw new Error(late.code);
+        link.guest.resetStream(old, "namespace replaced");
+        await link.settle();
+        // The old record must not recreate a seq/window row or reset the
+        // next binding, even when it arrives after that binding exists.
+        const opened = await link.guest.open({ app: "pocket-map", namespace: "map/demo", profile: PROFILE });
+        stream = opened.stream;
+        await link.settle();
+        expect(stream).toBe(old + 1);
+        const errors = link.guest.protocolErrors + link.provider.protocolErrors;
+        link.guest.handleRecord(late.bytes);
+        link.provider.handleRecord(late.bytes);
+        await link.settle();
+        expect(link.guest.protocolErrors + link.provider.protocolErrors).toBe(errors);
+        for (const endpoint of [link.guest, link.provider]) {
+          const b = endpoint.inspect()!;
+          expect(endpoint.session.sessionId).toBe(session);
+          expect(endpoint.session.streamIds()).toEqual([stream]);
+          expect([...b.allocations.keys()]).toEqual([0, stream]);
+          expect(b.sender.ledgerView().streamIds()).toEqual([0, stream]);
+          expect(b.creditTable.size).toBeLessThanOrEqual(2);
+          expect(b.receiver.occupancy()).toEqual({ frames: 0, bytes: 0 });
+          for (const id of retired) {
+            expect(b.creditTable.counters(id)).toBeUndefined();
+            expect(b.authority?.subscriptionsOn(id) ?? []).toEqual([]);
+          }
+          // Old credit cannot mint capacity on the replacement stream.
+          const room = b.sender.ledgerView().available(stream);
+          expect(b.sender.applyCredit({ targetStream: old, framesReleased: "0000000000000001", bytesReleased: "0000000000001000" }).ok).toBe(true);
+          expect(b.sender.ledgerView().available(stream)).toEqual(room);
+          expect(b.sender.admit({ type: RELAY_TYPE.REQUEST, stream: old, correlation: 9, metadata: { op: "x" } }).code).toBe(RELAY_P3_ERROR.STREAM_DEAD);
+        }
+      }
+      expect(link.guest.protocolErrors + link.provider.protocolErrors).toBe(0);
+    } finally { link.guest.close(); link.provider.close(); }
+  });
+}
 
 test("B3 teardown: a fatal from the peer (credit out of range) closes the session, fails pending work and drops the per-session machines", async () => {
   const held: RelayIncomingRequest[] = [];

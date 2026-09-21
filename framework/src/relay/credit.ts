@@ -43,7 +43,7 @@ import {
 export const RELAY_P3_ERROR = Object.freeze({
   /** No capacity right now; caller keeps the demand and retries. */
   BUSY: "BUSY",
-  /** Stream id is outside 1..maxStreams, already open, or never opened. */
+  /** Live-stream limit, invalid/reused id, or a stream never opened. */
   STREAM_LIMIT: "STREAM_LIMIT",
   STREAM_DEAD: "STREAM_DEAD",
   /** A frame arrived past the granted window; reliable channels do not drop. */
@@ -152,6 +152,7 @@ export class RelayCreditLedger {
   private alloc = new Map<number, RelayStreamAlloc>();
   private count = new Map<number, RelayCounters>();
   private dead = new Set<number>();
+  private highestStream = 0;
   private sumFrames = 0;
   private sumBytes = 0;
 
@@ -169,14 +170,14 @@ export class RelayCreditLedger {
   /** Registers a stream's slice of the attachment window. The sum of
    * stream 0 plus every open stream must not exceed the negotiated window. */
   allocate(stream: number, slice: RelayStreamAlloc): P3Result {
-    if (stream < 1 || !Number.isInteger(stream)) return { ok: false, code: RELAY_P3_ERROR.STREAM_LIMIT };
-    if (this.alloc.has(stream) || this.dead.has(stream)) return { ok: false, code: RELAY_P3_ERROR.STREAM_LIMIT };
+    if (!Number.isInteger(stream) || stream <= this.highestStream || stream > 0xffffffff) return { ok: false, code: RELAY_P3_ERROR.STREAM_LIMIT };
     if (slice.frames < 1 || slice.bytes < 1
       || this.sumFrames + slice.frames > this.windowFrames
       || this.sumBytes + slice.bytes > this.windowBytes) {
       return { ok: false, code: RELAY_P3_ERROR.STREAM_LIMIT };
     }
     this.alloc.set(stream, { ...slice });
+    this.highestStream = stream;
     this.count.set(stream, { sentF: 0n, sentB: 0n, relF: 0n, relB: 0n });
     this.sumFrames += slice.frames;
     this.sumBytes += slice.bytes;
@@ -192,7 +193,7 @@ export class RelayCreditLedger {
   }
 
   isDead(stream: number): boolean {
-    return this.dead.has(stream);
+    return this.dead.has(stream) || (stream > 0 && stream <= this.highestStream && !this.alloc.has(stream));
   }
 
   /** Charge one selected normal frame against its stream window. Called at
@@ -216,6 +217,9 @@ export class RelayCreditLedger {
    * same values has no effect (§3.9). */
   release(stream: number, framesReleased: bigint, bytesReleased: bigint): P3Result {
     const c = this.count.get(stream);
+    // A composed endpoint forgets a reset stream's counters. Its old
+    // credit may still be in the ordered transport; it grants no capacity.
+    if (!c && this.isDead(stream)) return { ok: true };
     if (!c) return { ok: false, code: RELAY_P3_ERROR.CREDIT_RANGE };
     if (framesReleased < c.relF || bytesReleased < c.relB
       || framesReleased > c.sentF || bytesReleased > c.sentB) {
@@ -272,6 +276,15 @@ export class RelayCreditLedger {
       this.sumFrames -= slice.frames;
       this.sumBytes -= slice.bytes;
     }
+  }
+
+  /** Once RESET owns both directions, no work can use this row. A single
+   * high-water mark fences every retired id without retaining tombstones. */
+  forgetStream(stream: number): void {
+    if (stream === 0 || !this.dead.has(stream)) return;
+    this.alloc.delete(stream);
+    this.count.delete(stream);
+    this.dead.delete(stream);
   }
 }
 
@@ -452,6 +465,9 @@ export class RelayCreditTable {
       if (row) row.dirty = false;
     }
   }
+
+  /** The peer resets the same stream, so any queued credit for it is void. */
+  forgetStream(stream: number): void { if (stream !== 0) this.rows.delete(stream); }
 }
 
 // --- send planner ---------------------------------------------------------------
@@ -548,7 +564,8 @@ export class RelaySender {
   }
 
   openStream(stream: number, slice: RelayStreamAlloc): P3Result {
-    if (stream < 1 || stream > this.maxStreams) return { ok: false, code: RELAY_P3_ERROR.STREAM_LIMIT };
+    const active = this.ledger.streamIds().filter(id => id !== 0 && !this.ledger.isDead(id)).length;
+    if (active >= this.maxStreams) return { ok: false, code: RELAY_P3_ERROR.STREAM_LIMIT };
     return this.ledger.allocate(stream, slice);
   }
 
@@ -765,12 +782,12 @@ export class RelaySender {
     if (q.length === 0) this.queues.delete(stream);
   }
 
-  /** Distance to the next stream strictly after the band cursor on a ring
-   * of 0..maxStreams, so a stream just served is visited last. */
+  /** Distance on the u32 id ring: the number of live streams does not
+   * constrain their ids. A stream just served is visited last. */
   private rrDistance(stream: number, band: RelayPriority): number {
     const cursor = this.rrCursor.get(band);
     if (cursor === undefined) return stream;
-    const mod = this.maxStreams + 1;
+    const mod = 0x1_0000_0000;
     return (stream - cursor - 1 + mod) % mod;
   }
 
@@ -789,6 +806,9 @@ export class RelaySender {
     this.seq.drop(stream);
     return failed;
   }
+
+  /** Composition calls this after resetting both send and receive state. */
+  forgetStream(stream: number): void { this.ledger.forgetStream(stream); }
 }
 
 // --- bounded receive queue ------------------------------------------------------
@@ -985,7 +1005,7 @@ export class RelayReceiver {
     // A stream-0 violation ends the attachment: nothing ingests afterwards.
     if (frame.session !== this.session || this.sessionFatal) return { ok: false, code: RELAY_P3_ERROR.SESSION_FATAL };
     const { stream, seq } = frame;
-    if (stream > this.maxStreams || !this.allocations.has(stream)) {
+    if (!this.allocations.has(stream) || this.allocations.size > this.maxStreams + 1) {
       return { ok: false, code: RELAY_P3_ERROR.STREAM_LIMIT };
     }
     // A whitelisted stream-0 record belongs on ingestSideband; routing it
@@ -1068,7 +1088,7 @@ export class RelayReceiver {
   }
 
   private distance(stream: number): number {
-    return stream > this.rr ? stream - this.rr : stream + this.maxStreams + 1 - this.rr;
+    return stream > this.rr ? stream - this.rr : stream + 0x1_0000_0000 - this.rr;
   }
 
   /** Delivers staged sideband controls in FIFO order. These frames occupy
@@ -1147,6 +1167,16 @@ export class RelayReceiver {
       this.sessionFatal = true;
     }
     return { ok: true, failed, reason };
+  }
+
+  /** L1 has removed the binding and drops late records before seq checks.
+   * Release the receiver's tombstone and empty occupancy row as well. */
+  forgetStream(stream: number): void {
+    if (stream === 0) return;
+    this.dead.delete(stream);
+    this.occ.delete(stream);
+    this.expected.delete(stream);
+    this.stopped.delete(stream);
   }
 }
 

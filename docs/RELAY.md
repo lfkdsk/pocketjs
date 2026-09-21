@@ -141,7 +141,7 @@ direction reserves two 256-byte sideband slots for `relay.credit`,
 `relay.ping`, `relay.reset`, and CANCEL, so control can advance when the
 normal window is full. Bulk attachments negotiate 65536-byte frames, a
 2-frame / 131072-byte window, metadata capped at 2048 bytes, and at most two
-concurrent assemblers. A session allows one bulk attachment and at most eight
+concurrent assemblers. A session allows one bulk attachment and at most eight live
 nonzero streams. Heartbeat is 2 seconds with a 15-second no-progress
 timeout; these are timing proposals, not measured recovery latency.
 
@@ -186,9 +186,12 @@ The machine has six phases: `idle`, `hello-sent`, `hello-received`,
    selected version; the provider acks and both sides enter `ready`. Each
    direction's seq restarts at 1 on the new session.
 4. REQUEST `relay.open` on stream 0 makes the provider allocate a nonzero
-   stream id (1..8) for an app/namespace/profile binding. Stream ids are
-   never reused inside the session; each stream's two directions keep
-   independent seq counters starting at 1.
+   stream id for an app/namespace/profile binding. At most eight bindings
+   may be live at once; ids increase through the u32 space and are never
+   reused inside the session. RESET frees a binding, so the next OPEN can
+   use id 9 and beyond without increasing the live-stream budget. Exhausting
+   u32 returns RESYNC_REQUIRED and requires a new session. Each stream's
+   two directions keep independent seq counters starting at 1.
 5. Business frames are admitted in `ready` on opened streams only. Frames
    that arrive before `ready`, on an unknown stream, or with a session that
    is not the pinned session are dropped; frames with an unknown op on
@@ -297,7 +300,11 @@ leave the sender FIFO; a frame never reorders inside its stream.
   composed endpoint dispatches stream 0 in arrival order without the
   receiver's lanes. Sideband frames are selected before normal work on
   send. Outbound releases merge into at most nine credit rows (stream 0
-  plus eight nonzero streams).
+  plus eight live nonzero streams). On RESET the composed endpoint removes
+  both directions' credit, occupancy and allocation rows. L1 drops late
+  records for the retired binding before seq checks; a monotonic id fence
+  ignores late credit without granting it to a new stream or storing one
+  tombstone per retired id.
 - **Credit returns at one point:** after the receiver consumes a staged
   frame or moves it into a reserved assembler/result mailbox. Reading a
   frame or parsing its header returns no credit. `relay.credit` carries
@@ -323,7 +330,8 @@ leave the sender FIFO; a frame never reorders inside its stream.
   credit accounting, return credit, and are dropped without delivery.
 - **`relay.reset`** fails every request and subscription on the target
   stream, queues and seq state clear, and later work requires a new stream
-  id. In-flight frames settle through credit accounting.
+  id. The composed endpoint drops late frames and credit for the retired
+  binding; they cannot affect the replacement stream.
 
 ## Composed endpoint
 

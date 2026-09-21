@@ -181,6 +181,39 @@ test("credit ledger: per-stream slices never sum past the attachment window; res
   expect(ledger.allocate(1, { frames: 1, bytes: 1 }).code).toBe(RELAY_P3_ERROR.STREAM_LIMIT);
 });
 
+test("sender and receiver rotate sparse stream ids above eight without growing the live window", () => {
+  const ids = [1, 257, 65535];
+  const ep = new Endpoint(SESSION, ids.map(stream => ({ stream, slice: { frames: 2, bytes: 8192 } })), { framesPerPump: 6 });
+  for (const stream of ids) for (const correlation of [1, 2]) {
+    expect(ep.sender.admit({ type: RELAY_TYPE.REQUEST, stream, correlation, metadata: GET_META }).ok).toBe(true);
+  }
+  const frames = ep.sender.pump().frames;
+  expect(frames.map(bytes => {
+    const decoded = decodeFrame(bytes);
+    if (!decoded.ok) throw new Error(decoded.code);
+    expect(ep.receiver.ingest(decoded.frame, bytes.length).ok).toBe(true);
+    return decoded.frame.stream;
+  })).toEqual([...ids, ...ids]);
+  const received: number[] = [];
+  for (let i = 0; i < 6; i++) {
+    const [frame] = ep.receiver.pump();
+    received.push(frame.stream);
+    expect(ep.receiver.release(frame.handle).ok).toBe(true);
+  }
+  expect(received).toEqual([...ids, ...ids]);
+  expect(ep.receiver.occupancy()).toEqual({ frames: 0, bytes: 0 });
+  const sender = new RelaySender(SESSION, new RelaySideband(), {
+    windowFrames: 20, windowBytes: 10000, controlSlice: { frames: 1, bytes: 1000 }, maxWireBytes: 1000, maxStreams: 2,
+  });
+  expect(sender.openStream(9, { frames: 1, bytes: 1000 }).ok).toBe(true);
+  expect(sender.openStream(99, { frames: 1, bytes: 1000 }).ok).toBe(true);
+  expect(sender.openStream(999, { frames: 1, bytes: 1000 }).code).toBe(RELAY_P3_ERROR.STREAM_LIMIT);
+  sender.applyReset(9); sender.forgetStream(9);
+  expect(sender.openStream(999, { frames: 1, bytes: 1000 }).ok).toBe(true);
+  expect(sender.openStream(9, { frames: 1, bytes: 1000 }).code).toBe(RELAY_P3_ERROR.STREAM_LIMIT);
+  expect(sender.ledgerView().streamIds()).toEqual([0, 99, 999]);
+});
+
 test("sideband: only credit/ping/reset/CANCEL, at most two 256B slots, no normal window borrowed", () => {
   const sideband = new RelaySideband();
   let seq = 0;

@@ -268,12 +268,50 @@ for (const sync of [false, true]) {
   });
 }
 
+test("a reset stream id cannot be rebound by a later OPEN response", async () => {
+  const pair = makePair({ sync: true });
+  await handshake(pair);
+  const request = { app: "pocket-map", namespace: "map/demo", profile: { name: "map.raster", version: 1 } };
+  const opened = await pair.guest.open(request);
+  const firstResponse = decode(lastFrames(pair, "provider", 1)[0]);
+  pair.guest.forgetStream(opened.stream);
+  pair.provider.forgetStream(opened.stream);
+  pair.deliver = false;
+  const pending = pair.guest.open(request);
+  const nextRequest = decode(lastFrames(pair, "guest", 1)[0]);
+  const reused = encodeFrame({
+    type: RELAY_TYPE.RESPONSE, session: pair.guest.sessionId, seq: firstResponse.seq + 1, stream: 0,
+    correlation: nextRequest.correlation, metadata: firstResponse.metadata,
+  });
+  if (!reused.ok) throw new Error(reused.code);
+  pair.guest.handleRecord(reused.bytes);
+  await expect(pending).rejects.toBe("BAD_STREAM");
+  expect(pair.guest.streamIds()).toEqual([]);
+  pair.guest.close(); pair.provider.close();
+});
+
+test("u32 stream exhaustion returns RESYNC_REQUIRED and never wraps the id", async () => {
+  const pair = makePair({ sync: true });
+  await handshake(pair);
+  // Exercise the wire boundary without billions of OPEN messages.
+  (pair.provider as unknown as { nextProviderStream: number }).nextProviderStream = 0xffffffff;
+  const request = { app: "pocket-map", namespace: "map/demo", profile: { name: "map.raster", version: 1 } };
+  const last = await pair.guest.open(request);
+  expect(last.stream).toBe(0xffffffff);
+  pair.guest.forgetStream(last.stream);
+  pair.provider.forgetStream(last.stream);
+  await expect(pair.guest.open(request)).rejects.toBe(RELAY_ERROR.RESYNC_REQUIRED);
+  expect(pair.guest.streamIds()).toEqual([]);
+  expect(pair.provider.streamIds()).toEqual([]);
+  pair.guest.close(); pair.provider.close();
+});
+
 // =============================================================================
 // 2. OPEN allocates provider-owned, never-reused streams; per-stream seq spaces
 // =============================================================================
 
 for (const sync of [false, true]) {
-  test(`OPEN streams are allocated 1..8, never reused; seq runs per (session, stream, direction) (${sync ? "sync" : "async"})`, async () => {
+  test(`OPEN allows eight live streams with monotonic ids; seq runs per (session, stream, direction) (${sync ? "sync" : "async"})`, async () => {
     const business: unknown[] = [];
     const pair = makePair({ sync, onBusiness: (_w, f) => business.push((f as { frame: unknown }).frame) });
     await handshake(pair);
@@ -325,6 +363,21 @@ for (const sync of [false, true]) {
     }
     await expect(pair.guest.open({
       app: "pocket-map", namespace: "ns/9", profile: { name: "map.raster", version: 1 },
+    })).rejects.toBe(RELAY_ERROR.BUSY);
+    // Free one binding without ending the session. The next id is 9, not
+    // a reuse of 1, and the number of live bindings remains capped at 8.
+    pair.guest.forgetStream(1);
+    pair.provider.forgetStream(1);
+    const ninth = await pair.guest.open({
+      app: "pocket-map", namespace: "ns/9", profile: { name: "map.raster", version: 1 },
+    });
+    await pair.flush();
+    expect(ninth.stream).toBe(9);
+    expect(pair.guest.streamIds()).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(pair.provider.streamIds()).toEqual(pair.guest.streamIds());
+    expect(pair.guest.sessionId).toBe(sid);
+    await expect(pair.guest.open({
+      app: "pocket-map", namespace: "ns/10", profile: { name: "map.raster", version: 1 },
     })).rejects.toBe(RELAY_ERROR.BUSY);
 
     // Business before a known stream, and on stream 0, are refused locally.

@@ -947,7 +947,8 @@ export const RELAY_LIMITS = Object.freeze({
   /** Decoder defaults when the caller passes no limits. [R5-P07] */
   defaultMaxWireBytes: 65536,
   defaultMaxMetaBytes: 2048,
-  /** One bulk attachment and at most eight non-zero streams per session. [R5-P02] */
+  /** One bulk attachment and at most eight live non-zero streams. [R5-P02]
+   * Stream ids are monotonic u32 values, never reused within a session. */
   maxBulkAttachments: 1,
   maxStreams: 8,
   /** Heartbeat/stall/retry are existing-magnitude proposals, not recovery latency. [R5-P02] */
