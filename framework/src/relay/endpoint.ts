@@ -810,6 +810,12 @@ export class RelayEndpoint {
     b.client?.resetStream(stream);
     b.authority?.resetStream(stream);
     b.demand.delete(stream);
+    // RESET releases both directions. L1 drops the retired id's records;
+    // late credit is ignored by the sender's high-water fence. Keeping
+    // these rows until session end would turn namespace churn into a leak.
+    b.sender.forgetStream(stream);
+    b.receiver.forgetStream(stream);
+    b.creditTable.forgetStream(stream);
     b.allocations.delete(stream);
     for (const [ns, s] of b.streamsByNs) if (s === stream) b.streamsByNs.delete(ns);
     this.hooks.onStreamReset?.(stream, reason);

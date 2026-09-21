@@ -289,6 +289,7 @@ export class RelaySession {
   private readonly rxSeq = new Map<number, number>(); // stream -> last accepted
   private readonly streams = new Map<number, StreamBinding>();
   private nextProviderStream = 1;
+  private lastGuestStream = 0;
   private readonly pendingOpen = new Map<number, PendingOpen>();
   private readyResolvers: Array<{
     resolve: (n: RelayNegotiation) => void;
@@ -371,6 +372,7 @@ export class RelaySession {
     this.rxSeq.clear();
     this.streams.clear();
     this.nextProviderStream = 1;
+    this.lastGuestStream = 0;
     this.outstandingPing = undefined;
     this.pingToken = 0;
   }
@@ -670,6 +672,12 @@ export class RelaySession {
     // additionally only accepts the HELLO response there.
     if (this.negotiationValue === undefined && frame.session !== 0n) {
       this.statsValue.droppedStaleSession++;
+      return;
+    }
+    // Unknown/retired ids have no seq space. In particular, a late record
+    // after RESET must not recreate per-stream state or reset a newer id.
+    if (frame.stream !== 0 && !this.streams.has(frame.stream)) {
+      this.statsValue.droppedNotReady++;
       return;
     }
 
@@ -1013,9 +1021,10 @@ export class RelaySession {
         pending.reject(RELAY_FRAME_ERROR.BAD_METADATA); return;
       }
       const stream = frame.metadata.stream as number;
-      if (stream === 0 || stream > RELAY_LIMITS.maxStreams || this.streams.has(stream)) {
+      if (stream <= this.lastGuestStream || this.streams.size >= RELAY_LIMITS.maxStreams) {
         pending.reject("BAD_STREAM"); return;
       }
+      this.lastGuestStream = stream;
       const binding: StreamBinding = {
         app: pending.app,
         namespace: frame.metadata.namespace as string,
@@ -1068,8 +1077,13 @@ export class RelaySession {
       const code = this.options.authorizeOpen(request, this.options.transport.peer);
       if (code) { refuse(code); return; }
     }
-    if (this.nextProviderStream > RELAY_LIMITS.maxStreams) {
+    if (this.streams.size >= RELAY_LIMITS.maxStreams) {
       refuse(RELAY_ERROR.BUSY); return;
+    }
+    // maxStreams bounds live bindings, not the lifetime u32 id space.
+    // RESET frees a binding but ids remain monotonic and never wrap.
+    if (this.nextProviderStream > 0xffffffff) {
+      refuse(RELAY_ERROR.RESYNC_REQUIRED); return;
     }
     const stream = this.nextProviderStream++;
     const rxLimits = request.rxLimits ? minLimits(n.rxLimits, request.rxLimits) : n.rxLimits;
@@ -1181,6 +1195,7 @@ export class RelaySession {
     }
     if (!this.validateAgainst(frame, RELAY_OP.RESET)) return;
     const target = frame.metadata.targetStream as number;
+    if (!this.streams.has(target)) { this.statsValue.droppedNotReady++; return; }
     this.streams.delete(target);
     this.txSeq.delete(target);
     this.rxSeq.delete(target);
