@@ -94,6 +94,8 @@ interface Link {
   wire: Captured[];
   /** Per-direction "busy" switch for the fake transport. */
   busy: { guest: boolean; provider: boolean };
+  /** Number of physical trySend calls refused by the busy switch. */
+  busyReturns: { guest: number; provider: number };
   /** Sampled on every provider send: in-flight frames on stream 1. */
   providerInFlight: number[];
   settle(): Promise<void>;
@@ -109,15 +111,16 @@ function makeLink(opts: {
 } = {}): Link {
   const wire: Captured[] = [];
   const busy = { guest: false, provider: false };
+  const busyReturns = { guest: 0, provider: 0 };
   const providerInFlight: number[] = [];
   const caps = (app: string | undefined, rx: Partial<RelayRxLimits> | undefined): RelayLocalCapabilities => ({
     app, versions: [[1, 0]], profiles: [PROFILE],
     codecs: [RELAY_CODEC.NONE, RELAY_CODEC.JSON, RELAY_CODEC.R5G6B5LE, RELAY_CODEC.OPAQUE_BYTES],
     kinds: [RELAY_KIND.TILE, RELAY_KIND.TERMINAL_CELLS], rxLimits: { ...RX, ...rx },
   });
-  const link: Partial<Link> = { wire, busy, providerInFlight };
+  const link: Partial<Link> = { wire, busy, busyReturns, providerInFlight };
   const route = (from: "guest" | "provider", raw: Uint8Array): "accepted" | "busy" | "offline" => {
-    if (busy[from]) return "busy";
+    if (busy[from]) { busyReturns[from]++; return "busy"; }
     const copy = raw.slice();
     wire.push({ from, bytes: copy });
     if (from === "provider") providerInFlight.push(link.provider!.inspect()?.sender.ledgerView().inFlight(1).frames ?? 0);
@@ -483,7 +486,21 @@ test("B3 CANCEL: request.cancel rides the sideband, the provider sees cancelRequ
   expect(link.guest.protocolErrors).toBe(0);
 });
 
-test("B3 sync transport: nested delivery inside trySend keeps the handshake, a get and a subscribe correct", async () => {
+test("C13 sync transport: the guest HELLO and provider HELLO response are each sent once", async () => {
+  const link = makeLink({ sync: true });
+  const ready = link.guest.whenReady();
+  expect(link.guest.hello()).toEqual({ ok: true });
+  await link.settle();
+  await ready;
+
+  const hello = decoded(link).filter((f) => f.session === 0n && f.metadata.op === RELAY_OP.HELLO);
+  expect(hello.filter((f) => f.from === "guest" && f.type === RELAY_TYPE.REQUEST)).toHaveLength(1);
+  expect(hello.filter((f) => f.from === "provider" && f.type === RELAY_TYPE.RESPONSE)).toHaveLength(1);
+  expect(link.guest.phase).toBe("ready");
+  expect(link.provider.phase).toBe("ready");
+});
+
+test("B3 sync transport: nested delivery inside trySend keeps the handshake, a get, a subscribe and a push correct", async () => {
   const objects = new Map([[tileRef().key, { ref: tileRef("v1"), codec: RELAY_CODEC.R5G6B5LE, data: bytes(5000, 2) }]]);
   const link = makeLink({ sync: true, providerHooks: serveObjects(objects) });
   currentProvider = link.provider;
@@ -493,10 +510,21 @@ test("B3 sync transport: nested delivery inside trySend keeps the handshake, a g
   expect(result.ok).toBe(true);
   if (!result.ok || !("value" in result)) throw new Error("get failed");
   expect((result.value as RelayPublishedObject).data.length).toBe(5000);
+  const pushed: RelayPublishedObject[] = [];
   const subscribed = await new Promise<ResourceResult<{ subscription?: number }>>((resolve) => {
-    link.guest.subscribe(stream, { ns: "map/demo" }, RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject() {} }, resolve);
+    link.guest.subscribe(stream, { ns: "map/demo" }, RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject: (object) => pushed.push(object) }, resolve);
   });
   expect(subscribed).toEqual({ ok: true, value: { subscription: 1 } });
+  const pushData = bytes(5000, 3);
+  expect(link.provider.pushObject({
+    stream, subscription: 1, ref: tileRef("v2"), codec: RELAY_CODEC.R5G6B5LE, data: pushData,
+  })).toMatchObject({ ok: true });
+  expect(pushed).toHaveLength(1);
+  expect(pushed[0].ref.revision).toBe("v2");
+  expect(pushed[0].data).toEqual(pushData);
+  const synchronousFrames = decoded(link).filter((f) => f.session !== 0n);
+  expect(synchronousFrames.filter((f) => f.metadata.op === "resource.push").length).toBeGreaterThan(1);
+  expect(synchronousFrames.some((f) => f.metadata.op === RELAY_OP.CREDIT)).toBe(true);
   const g = link.guest.inspect()!;
   const p = link.provider.inspect()!;
   expect(g.sender.ledgerView().inFlight(stream)).toEqual({ frames: 0, bytes: 0 });
@@ -505,6 +533,34 @@ test("B3 sync transport: nested delivery inside trySend keeps the handshake, a g
   for (const [lane, seqs] of Object.entries(decoded(link).filter((f) => f.session !== 0n).reduce<Record<string, number[]>>((acc, f) => {
     (acc[`${f.from}:${f.stream}`] ??= []).push(f.seq); return acc;
   }, {}))) seqs.forEach((s, i) => expect(s, `${lane} at ${i}`).toBe(i + 1));
+});
+
+test("C13 busy trySend retains the head frame and later sends queued requests once in order", async () => {
+  const held: RelayIncomingRequest[] = [];
+  const link = makeLink({ sync: true, providerHooks: serveObjects(new Map(), held) });
+  currentProvider = link.provider;
+  const stream = await connect(link);
+  link.busy.guest = true;
+
+  const first = link.guest.get(stream, tileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 16 }, () => {});
+  const secondRef = { ...tileRef(), key: `${tileRef().key}-next` };
+  const second = link.guest.get(stream, secondRef, { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 16 }, () => {});
+  if (!("correlation" in first) || !("correlation" in second)) throw new Error("requests were not admitted");
+  await link.settle();
+
+  expect(link.busyReturns.guest).toBeGreaterThan(0);
+  expect(held).toHaveLength(0);
+  expect(decoded(link, "guest").filter((f) => f.stream === stream)).toHaveLength(0);
+  expect(link.guest.inspect()!.outboxFrames).toBe(1);
+
+  link.busy.guest = false;
+  link.guest.flush();
+  await link.settle();
+  const requests = decoded(link, "guest").filter((f) => f.stream === stream && f.metadata.op === RELAY_OP.RESOURCE_GET);
+  expect(requests.map((f) => f.correlation)).toEqual([first.correlation, second.correlation]);
+  expect(requests.map((f) => f.seq)).toEqual([1, 2]);
+  expect(held.map((r) => r.correlation)).toEqual([first.correlation, second.correlation]);
+  expect(link.guest.inspect()!.outboxFrames).toBe(0);
 });
 
 test("B3 busy transport: frames stamped with seq wait in the ordered outbox and leave in order once the transport drains", async () => {

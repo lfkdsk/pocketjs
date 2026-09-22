@@ -235,6 +235,7 @@ export class RelayEndpoint {
   private readonly requestReserve: number;
   private bound: Bound | null = null;
   private flushing = false;
+  private drainingOutbox = false;
   private flushAgain = false;
   private flushScheduled = false;
   private protocolErrorCount = 0;
@@ -544,14 +545,25 @@ export class RelayEndpoint {
   }
 
   private drainOutbox(): "drained" | "busy" | "offline" {
-    while (this.outbox.length > 0) {
-      const status = this.transport.trySend(this.outbox[0]);
-      if (status === "accepted") { this.outbox.shift(); continue; }
-      if (status === "busy") return "busy";
-      this.outbox.length = 0;
-      return "offline";
+    // A synchronous adapter may deliver the peer's response from inside
+    // trySend(). That response can enqueue another bootstrap frame and call
+    // flush() before trySend() returns. Leave the current head in place for
+    // busy retry, but let only its outer sender drain it; the outer loop will
+    // see every frame appended by the nested delivery.
+    if (this.drainingOutbox) return "busy";
+    this.drainingOutbox = true;
+    try {
+      while (this.outbox.length > 0) {
+        const status = this.transport.trySend(this.outbox[0]);
+        if (status === "accepted") { this.outbox.shift(); continue; }
+        if (status === "busy") return "busy";
+        this.outbox.length = 0;
+        return "offline";
+      }
+      return "drained";
+    } finally {
+      this.drainingOutbox = false;
     }
-    return "drained";
   }
 
   /** Bootstrap frames the session sends itself (HELLO, HELLO response)
