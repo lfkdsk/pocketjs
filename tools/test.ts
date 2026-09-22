@@ -23,6 +23,8 @@ interface Stage {
   readonly tests?: readonly string[];
   /** Run `tests` under --conditions=browser (wasm-host module resolution). */
   readonly browser?: boolean;
+  /** Run each test file in a separate process, in declaration order. */
+  readonly isolateFiles?: boolean;
 }
 
 const SUITE: readonly Stage[] = [
@@ -215,6 +217,9 @@ const SUITE: readonly Stage[] = [
   },
   {
     name: "Model AOT semantics and resources",
+    // Generated bundles retain framework module state when imported in one
+    // Bun test global. Keep each source file's bundle oracle independent.
+    isolateFiles: true,
     // Generated-program fuzz checks remain opt-in through `bun run test:fuzz`.
     prep: [
       ["bun", "tools/wasm.ts"],
@@ -367,18 +372,23 @@ for (const stage of selected) {
     if (p.exitCode !== 0) fail(stage.name, stage.script);
   }
   if (stage.tests) {
-    const cmd = [
-      "bun",
-      "test",
-      ...(stage.browser ? ["--conditions=browser"] : []),
-      ...stage.tests,
-    ];
-    const p = Bun.spawnSync(cmd, {
-      cwd: ROOT,
-      stdout: "inherit",
-      stderr: "inherit",
-    });
-    if (p.exitCode !== 0) fail(stage.name, cmd);
+    const batches = stage.isolateFiles
+      ? stage.tests.map((test) => [test])
+      : [stage.tests];
+    for (const tests of batches) {
+      const cmd = [
+        "bun",
+        "test",
+        ...(stage.browser ? ["--conditions=browser"] : []),
+        ...tests,
+      ];
+      const p = Bun.spawnSync(cmd, {
+        cwd: ROOT,
+        stdout: "inherit",
+        stderr: "inherit",
+      });
+      if (p.exitCode !== 0) fail(stage.name, cmd);
+    }
   }
   console.log(
     `   ${stage.name}: ok (${((Date.now() - started) / 1000).toFixed(1)}s)`,
