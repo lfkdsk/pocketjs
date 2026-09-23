@@ -666,6 +666,9 @@ export class RelayResourceClient {
     // The request chose the resource form. A peer cannot select another form
     // by substituting the kind in its response, including notModified.
     if (ref.kind !== pending.ref.kind) { this.failMalformed(frame.correlation, pending); return; }
+    if (frame.codec === RELAY_CODEC.JSON && frame.data.length && meta.value !== undefined) {
+      this.failMalformed(frame.correlation, pending); return;
+    }
 
     if (value?.notModified) {
       // §3.6: notModified is terminal and names the concrete revision; a
@@ -774,6 +777,9 @@ export class RelayResourceClient {
     const sub = this.subscriptions.get(meta.subscription as number);
     if (!sub) return; // post-unsubscribe/unknown push: consumed and dropped
     const ref = meta.resource as RelayResourceRef;
+    if (frame.codec === RELAY_CODEC.JSON && frame.data.length && meta.value !== undefined) {
+      this.failSubscription(sub.id, { code: RELAY_ERROR.INVALID }); return;
+    }
 
     if (frame.data.length) {
       if (!meta.transfer) { this.protocolErrors++; return; }

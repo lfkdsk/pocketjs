@@ -596,10 +596,14 @@ Validation order on both ends:
    `args` schema; an unknown nested key or a type mismatch rejects with
    `INVALID` before the handler runs (provider) or before a frame is sent
    (guest local refusal).
-4. A successful result validates the metadata `value` against the form's
-   `value` schema; codec 1 (`JSON`) validates the decoded assembled bytes.
-   A `{notModified:true}` marker and binary codecs without a JSON schema
-   pass this step.
+4. A successful get uses the form selected by the request's profile and
+   kind; a response that substitutes another kind ends as `INVALID`. The
+   metadata `value` validates against that form's `value` schema. Codec 1
+   (`JSON`) uses the frame layer's strict UTF-8 JSON parser, which rejects
+   duplicate keys and malformed UTF-8, before applying the value schema. A
+   codec-1 data region cannot coexist with metadata `value`. A
+   `{notModified:true}` marker and binary codecs without a JSON schema pass
+   the product-schema step.
 
 `get(stream, ref, args, complete)` and `subscribe(...)` accept
 `product:{key, value}`; the caller passes the registered key and the

@@ -160,7 +160,7 @@ test("review1307 B: codec-1 rejects duplicate keys and malformed UTF-8 on both e
     expect(produced).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
     expect(outboundResult.ok).toBe(false);
     if (outboundResult.ok) throw new Error("invalid producer JSON was accepted");
-    expect(outboundResult.error.code).toBe(RELAY_ERROR.INVALID);
+    expect((outboundResult.error as { code: string }).code).toBe(RELAY_ERROR.INVALID);
 
     let provider: RelayEndpoint | undefined;
     const inbound = pair({
@@ -183,4 +183,41 @@ test("review1307 B: codec-1 rejects duplicate keys and malformed UTF-8 on both e
     expect(inboundResult).toEqual({ ok: false, error: { code: RELAY_ERROR.INVALID } });
     expect(inbound.guest.inspect()!.client!.stats()).toMatchObject({ pending: 0, protocolErrors: 1 });
   }
+});
+
+test("review1307 C: codec-1 rejects simultaneous metadata and data values", async () => {
+  const dataValue = { lines: ["data"], cursor: 1 };
+  const metadataValue = { lines: ["metadata"], cursor: 2 };
+  const json = new TextEncoder().encode(JSON.stringify(dataValue));
+
+  let producer: RelayEndpoint | undefined;
+  let produced: unknown;
+  const outbound = pair({ providerHooks: { onGet(request) {
+    produced = producer!.replyObject(request, {
+      ref: ref(), codec: RELAY_CODEC.JSON, data: json, value: metadataValue,
+    });
+  } } });
+  producer = outbound.provider;
+  const outboundResult = await getOnce(outbound, await connect(outbound), RELAY_CODEC.JSON);
+  await outbound.settle();
+  expect(produced).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+  expect(outboundResult.ok).toBe(false);
+  if (outboundResult.ok) throw new Error("conflicting producer values were accepted");
+  expect((outboundResult.error as { code: string }).code).toBe(RELAY_ERROR.INVALID);
+
+  let provider: RelayEndpoint | undefined;
+  const inbound = pair({
+    providerHooks: { onGet(request) {
+      provider!.replyObject(request, { ref: ref(), codec: RELAY_CODEC.JSON, data: json });
+    } },
+    transform(from, frame) {
+      if (from !== "provider" || frame.type !== RELAY_TYPE.RESPONSE || !frame.data.length) return frame;
+      return { ...frame, metadata: { ...frame.metadata, value: metadataValue } };
+    },
+  });
+  provider = inbound.provider;
+  const inboundResult = await getOnce(inbound, await connect(inbound), RELAY_CODEC.JSON);
+  await inbound.settle();
+  expect(inboundResult).toEqual({ ok: false, error: { code: RELAY_ERROR.INVALID } });
+  expect(inbound.guest.inspect()!.client!.stats()).toMatchObject({ pending: 0, protocolErrors: 1 });
 });

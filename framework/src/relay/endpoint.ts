@@ -692,6 +692,9 @@ export class RelayEndpoint {
     stream: number, kind: number, codec: number, data: Uint8Array, value: unknown,
   ): string | null {
     const profile = this.session.streamInfo(stream)?.profile;
+    if (codec === RELAY_CODEC.JSON && data.length && value !== undefined) {
+      return "codec 1 data cannot carry metadata value";
+    }
     if (value !== undefined) {
       const invalid = this.resourceForms.validateValue(profile, kind, value);
       if (invalid) return invalid;
