@@ -270,16 +270,16 @@ export class RelayResourceClient {
   }
 
   /** Validate one inbound value (or assembled JSON) against the form bound
-   * to the frame's stream profile and the ref kind. Returns an INVALID
-   * reason or null. */
-  private invalidProductValue(frame: RelayResourceIncomingFrame, value: unknown, bytes?: Uint8Array): string | null {
+   * to the frame's stream profile and the caller-selected kind. A get passes
+   * its pending request kind, never the peer-controlled response kind. */
+  private invalidProductValue(
+    frame: RelayResourceIncomingFrame, kind: number, value: unknown, bytes?: Uint8Array,
+  ): string | null {
     const forms = this.opts.productForms;
     if (!forms) return null;
-    const ref = frame.metadata.resource as RelayResourceRef | undefined;
-    if (!ref || typeof ref.kind !== "number") return null;
     const profile = forms.streamProfile(frame.stream);
-    if (bytes !== undefined && frame.codec === RELAY_CODEC.JSON) return forms.validateJson(profile, ref.kind, bytes);
-    return forms.validateValue(profile, ref.kind, value);
+    if (bytes !== undefined && frame.codec === RELAY_CODEC.JSON) return forms.validateJson(profile, kind, bytes);
+    return forms.validateValue(profile, kind, value);
   }
 
   /** resource.get. A conditional fetch with ifRevision may return
@@ -663,6 +663,9 @@ export class RelayResourceClient {
     const meta = frame.metadata;
     const ref = meta.resource as RelayResourceRef;
     const value = meta.value as { notModified?: boolean } | undefined;
+    // The request chose the resource form. A peer cannot select another form
+    // by substituting the kind in its response, including notModified.
+    if (ref.kind !== pending.ref.kind) { this.failMalformed(frame.correlation, pending); return; }
 
     if (value?.notModified) {
       // §3.6: notModified is terminal and names the concrete revision; a
@@ -701,8 +704,8 @@ export class RelayResourceClient {
       // The public chunk envelope passed; the assembled object and any
       // repeated metadata value still have to satisfy the form the local
       // product installed for this kind.
-      if (this.invalidProductValue(frame, meta.value)
-          || this.invalidProductValue(frame, undefined, result.bytes)) {
+      if (this.invalidProductValue(frame, pending.ref.kind, meta.value)
+          || this.invalidProductValue(frame, pending.ref.kind, undefined, result.bytes)) {
         this.failMalformed(frame.correlation, pending);
         return;
       }
@@ -720,7 +723,9 @@ export class RelayResourceClient {
       this.terminatePending(frame.correlation, pending);
       pending.complete({ ok: false, error: { code: RELAY_ERROR.INVALID } }); return;
     }
-    if (this.invalidProductValue(frame, meta.value)) { this.failMalformed(frame.correlation, pending); return; }
+    if (this.invalidProductValue(frame, pending.ref.kind, meta.value)) {
+      this.failMalformed(frame.correlation, pending); return;
+    }
     this.terminatePending(frame.correlation, pending);
     const bytes = new Uint8Array(stringToUtf8(JSON.stringify(meta.value ?? null)));
     this.publishGet(pending, ref, RELAY_CODEC.NONE, bytes, undefined, meta.value);
@@ -787,8 +792,8 @@ export class RelayResourceClient {
       if (!result.complete) return;
       // Assembled object and repeated metadata value must satisfy the form
       // bound to this stream's profile and the push's kind.
-      if (this.invalidProductValue(frame, meta.value)
-          || this.invalidProductValue(frame, undefined, result.bytes)) {
+      if (this.invalidProductValue(frame, ref.kind, meta.value)
+          || this.invalidProductValue(frame, ref.kind, undefined, result.bytes)) {
         this.failSubscription(sub.id, { code: RELAY_ERROR.INVALID }); return;
       }
       this.publishPush(sub, result.resource, result.codec, result.bytes, result.digest,
@@ -797,7 +802,7 @@ export class RelayResourceClient {
     }
 
     if (!meta.final) return;
-    if (this.invalidProductValue(frame, meta.value)) {
+    if (this.invalidProductValue(frame, ref.kind, meta.value)) {
       this.failSubscription(sub.id, { code: RELAY_ERROR.INVALID }); return;
     }
     const data = new Uint8Array(stringToUtf8(JSON.stringify(meta.value ?? null)));

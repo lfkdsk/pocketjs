@@ -689,14 +689,14 @@ export class RelayEndpoint {
    * it is chunked or pushed: metadata `value` (any codec) and, for codec 1
    * (JSON), the data region itself. Binary codecs have no JSON schema. */
   private checkProductObject(
-    stream: number, ref: RelayResourceRef, codec: number, data: Uint8Array, value: unknown,
+    stream: number, kind: number, codec: number, data: Uint8Array, value: unknown,
   ): string | null {
     const profile = this.session.streamInfo(stream)?.profile;
     if (value !== undefined) {
-      const invalid = this.resourceForms.validateValue(profile, ref.kind, value);
+      const invalid = this.resourceForms.validateValue(profile, kind, value);
       if (invalid) return invalid;
     }
-    if (codec === RELAY_CODEC.JSON && data.length) return this.validateJsonValue(profile, ref.kind, data);
+    if (codec === RELAY_CODEC.JSON && data.length) return this.validateJsonValue(profile, kind, data);
     return null;
   }
 
@@ -715,7 +715,10 @@ export class RelayEndpoint {
       this.respond(b.authority.answerGetError(request, RELAY_ERROR.UNSUPPORTED, `codec ${object.codec} not accepted`));
       return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
     }
-    const schemaError = this.checkProductObject(request.stream, object.ref, object.codec, object.data, object.value);
+    const requested = request.metadata.resource as RelayResourceRef;
+    const schemaError = object.ref.kind !== requested.kind
+      ? "response kind differs from request kind"
+      : this.checkProductObject(request.stream, requested.kind, object.codec, object.data, object.value);
     if (schemaError) {
       this.respond(b.authority.answerGetError(request, RELAY_ERROR.INVALID, schemaError));
       return { ok: false, code: RELAY_ERROR.INVALID };
@@ -747,7 +750,7 @@ export class RelayEndpoint {
     if (!b?.authority) return { ok: false, code: RELAY_ERROR.BUSY };
     const sub = b.authority.subscriptionEntry(input.subscription);
     if (!sub || !sub.active || sub.stream !== input.stream) return { ok: false, code: RELAY_ERROR.NOT_FOUND };
-    const schemaError = this.checkProductObject(input.stream, input.ref, input.codec, input.data, input.value);
+    const schemaError = this.checkProductObject(input.stream, input.ref.kind, input.codec, input.data, input.value);
     if (schemaError) return { ok: false, code: RELAY_ERROR.INVALID };
     const plan = b.authority.chunkObject({
       type: RELAY_TYPE.PUSH, stream: input.stream, correlation: 0, subscription: input.subscription,
