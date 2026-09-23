@@ -65,11 +65,14 @@ import {
 } from "./credit.ts";
 import type { RelayDecodedFrame } from "./frame.ts";
 import { validateRelayMetadata } from "./metadata.ts";
+import { validateRelaySchema } from "./metadata-schema.ts";
 import {
   installPrivateOps, preparePrivateOp, privateDescriptors, privateOpAllows, samePrivateProfile,
   type RelayPrivateOp,
 } from "./private-op.ts";
 export type { RelayPrivateOp, RelayPrivateSchema } from "./private-op.ts";
+import { RelayResourceForms, type RelayResourceForm } from "./resource-form.ts";
+export type { RelayResourceForm } from "./resource-form.ts";
 import {
   RelayResourceAuthority,
   RelayResourceClient,
@@ -145,6 +148,10 @@ export interface RelayEndpointOptions {
   local: RelayLocalCapabilities;
   /** Installed profile-owned REQUESTs; schemas remain on this endpoint. */
   privateOps?: readonly RelayPrivateOp[];
+  /** Installed product resource forms: local args/value schemas bound to
+   * (profile, kind) and the one args key each form owns. Nothing crosses
+   * the wire. */
+  resourceForms?: readonly RelayResourceForm[];
   hooks?: RelayEndpointHooks;
   scheduler?: RelayScheduler;
   randomBytes?: RelayRandomBytes;
@@ -270,6 +277,7 @@ export class RelayEndpoint {
   private readonly outboxCap: number;
   private readonly requestReserve: number;
   private readonly privateOps: readonly RelayPrivateOp[];
+  private readonly resourceForms: RelayResourceForms;
   private bound: Bound | null = null;
   private flushing = false;
   private drainingOutbox = false;
@@ -293,6 +301,7 @@ export class RelayEndpoint {
     this.requestReserve = options.requestReserve ?? 0;
     if (options.local.opExt?.length) throw new Error("RelayEndpoint derives opExt from privateOps");
     this.privateOps = installPrivateOps(options.privateOps ?? [], options.local.profiles, options.local.rxLimits);
+    this.resourceForms = new RelayResourceForms(options.resourceForms ?? [], options.local.profiles);
     this.session = createRelaySession({
       role: options.role,
       local: { ...options.local, opExt: privateDescriptors(this.privateOps) },
@@ -533,16 +542,53 @@ export class RelayEndpoint {
     for (const [id, cancel] of b.earlyCancels) if (stream === undefined || cancel.targetStream === stream) b.earlyCancels.delete(id);
   }
 
+  private validateJsonValue(
+    profile: { name: string; version: number } | undefined, kind: number, bytes: Uint8Array,
+  ): string | null {
+    let value: unknown;
+    try {
+      value = JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+      return "resource value is not one JSON value";
+    }
+    return this.resourceForms.validateValue(profile, kind, value);
+  }
+
+  /** Validate outbound product get args against the stream form. */
+  private checkProductGet(stream: number, ref: RelayResourceRef,
+    product: { key: string; value: unknown } | undefined): string | null {
+    if (!product) return null;
+    const form = this.resourceForms.formFor(this.session.streamInfo(stream)?.profile, ref.kind);
+    if (!form?.argsKey || form.argsKey !== product.key) return `args key ${product.key} has no form`;
+    return validateRelaySchema(form.args!, product.value, `args.${product.key}`);
+  }
+
+  /** Validate outbound product subscribe args for a ref or namespace target. */
+  private checkProductSubscribe(stream: number, target: RelayResourceRef | { ns: string },
+    product: { key: string; value: unknown } | undefined): string | null {
+    if (!product) return null;
+    const profile = this.session.streamInfo(stream)?.profile;
+    const form = "kind" in target
+      ? this.resourceForms.formFor(profile, target.kind)
+      : this.resourceForms.formForKey(profile, product.key);
+    if (!form?.argsKey || form.argsKey !== product.key || form.onSubscribe !== true) {
+      return `args key ${product.key} is not registered for subscribe`;
+    }
+    return validateRelaySchema(form.args!, product.value, `args.${product.key}`);
+  }
+
   // --- L2 surface: guest ---------------------------------------------------------------
 
   get(
     stream: number,
     ref: RelayResourceRef,
-    args: { accept: number[]; maxObjectBytes: number; ifRevision?: string },
+    args: { accept: number[]; maxObjectBytes: number; ifRevision?: string; product?: { key: string; value: unknown } },
     complete: (result: ResourceResult<RelayGetOutcome>) => void,
   ): { correlation: number } | { ok: false; code: string } {
     const client = this.bound?.client;
     if (!client) return { ok: false, code: RELAY_ERROR.BUSY };
+    const invalid = this.checkProductGet(stream, ref, args.product);
+    if (invalid) return { ok: false, code: RELAY_ERROR.INVALID };
     const result = client.get(stream, ref, args, complete);
     this.flush();
     return result;
@@ -556,10 +602,12 @@ export class RelayEndpoint {
     complete: (result: ResourceResult<{ subscription?: number }>) => void,
     /** Push-channel scratch this subscriber reserves; defaults to the
      * negotiated maxObjectBytes. */
-    options?: { maxObjectBytes?: number },
+    options?: { maxObjectBytes?: number; product?: { key: string; value: unknown } },
   ): { correlation: number } | { ok: false; code: string } {
     const client = this.bound?.client;
     if (!client) return { ok: false, code: RELAY_ERROR.BUSY };
+    const invalid = this.checkProductSubscribe(stream, target, options?.product);
+    if (invalid) return { ok: false, code: RELAY_ERROR.INVALID };
     const result = client.subscribe(stream, target, delivery, handler, complete, options);
     this.flush();
     return result;
@@ -634,6 +682,21 @@ export class RelayEndpoint {
     this.respond(b.authority.answerNotModified(request, ref));
   }
 
+  /** Validate provider-produced content against the stream's form before
+   * it is chunked or pushed: metadata `value` (any codec) and, for codec 1
+   * (JSON), the data region itself. Binary codecs have no JSON schema. */
+  private checkProductObject(
+    stream: number, ref: RelayResourceRef, codec: number, data: Uint8Array, value: unknown,
+  ): string | null {
+    const profile = this.session.streamInfo(stream)?.profile;
+    if (value !== undefined) {
+      const invalid = this.resourceForms.validateValue(profile, ref.kind, value);
+      if (invalid) return invalid;
+    }
+    if (codec === RELAY_CODEC.JSON && data.length) return this.validateJsonValue(profile, ref.kind, data);
+    return null;
+  }
+
   /** Answer a resource.get with one complete object: admission against the
    * request's accept/maxObjectBytes, chunking under the negotiated limits,
    * then the chunks enter the stream's demand FIFO. A refusal is answered
@@ -648,6 +711,11 @@ export class RelayEndpoint {
     if (!args.accept.includes(object.codec)) {
       this.respond(b.authority.answerGetError(request, RELAY_ERROR.UNSUPPORTED, `codec ${object.codec} not accepted`));
       return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
+    const schemaError = this.checkProductObject(request.stream, object.ref, object.codec, object.data, object.value);
+    if (schemaError) {
+      this.respond(b.authority.answerGetError(request, RELAY_ERROR.INVALID, schemaError));
+      return { ok: false, code: RELAY_ERROR.INVALID };
     }
     const refused = b.authority.checkGet(object.data.length, args);
     if (refused) {
@@ -676,6 +744,8 @@ export class RelayEndpoint {
     if (!b?.authority) return { ok: false, code: RELAY_ERROR.BUSY };
     const sub = b.authority.subscriptionEntry(input.subscription);
     if (!sub || !sub.active || sub.stream !== input.stream) return { ok: false, code: RELAY_ERROR.NOT_FOUND };
+    const schemaError = this.checkProductObject(input.stream, input.ref, input.codec, input.data, input.value);
+    if (schemaError) return { ok: false, code: RELAY_ERROR.INVALID };
     const plan = b.authority.chunkObject({
       type: RELAY_TYPE.PUSH, stream: input.stream, correlation: 0, subscription: input.subscription,
       ref: input.ref, codec: input.codec, data: input.data, value: input.value, baseRevision: input.baseRevision,
@@ -893,10 +963,22 @@ export class RelayEndpoint {
         wire: this.wire,
         negotiated: { maxObjectBytes: limits.maxObjectBytes, codecs: negotiation.codecs },
         assembler: bound.assembler,
+        productForms: {
+          validateValue: (profile, kind, value) => this.resourceForms.validateValue(profile, kind, value),
+          validateJson: (profile, kind, bytes) => this.validateJsonValue(profile, kind, bytes),
+          streamProfile: (stream) => this.session.streamInfo(stream)?.profile,
+        },
       });
     } else {
       bound.authority = new RelayResourceAuthority({
         maxWireBytes: limits.maxWireBytes, maxMetaBytes: limits.maxMetaBytes,
+        validateLayeredRequest: (stream, op, metadata) => {
+          const profile = this.session.streamInfo(stream)?.profile;
+          return this.resourceForms.validateRequest(op, profile, metadata);
+        },
+        validGetRequest: (stream, metadata) =>
+          this.resourceForms.validateRequest(RELAY_OP.RESOURCE_GET,
+            this.session.streamInfo(stream)?.profile, metadata) === null,
       });
     }
     this.bound = bound;
@@ -1184,7 +1266,8 @@ export class RelayEndpoint {
       case RELAY_OP.RESOURCE_UNSUBSCRIBE: this.respond(authority.answerUnsubscribe(f)); return;
       case RELAY_OP.RESOURCE_RELEASE: this.respond(authority.answerRelease(f)); return;
       case RELAY_OP.RESOURCE_GET: {
-        const invalid = validateRelayMetadata(`${RELAY_OP.RESOURCE_GET}.request`, f.metadata);
+        const invalid = this.resourceForms.validateRequest(
+          RELAY_OP.RESOURCE_GET, this.session.streamInfo(f.stream)?.profile, f.metadata);
         if (invalid) { this.respond(authority.answerGetError(f, RELAY_ERROR.INVALID, invalid)); return; }
         if (this.hooks.onGet) { this.hooks.onGet(request); return; }
         this.respond(authority.answerGetError(f, RELAY_ERROR.UNSUPPORTED, "no resource source"));
