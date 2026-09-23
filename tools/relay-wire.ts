@@ -112,7 +112,7 @@ export function attachRelayProvider(options: {
   hooks?: RelayProviderHooks;
   /** Endpoint tuning: pump budgets, request reserve, timers, randomness. */
   endpoint?: Pick<RelayEndpointOptions,
-    "framesPerPump" | "bytesPerPump" | "requestReserve" | "outboxFrames"
+    "privateOps" | "framesPerPump" | "bytesPerPump" | "requestReserve" | "outboxFrames"
     | "scheduler" | "randomBytes" | "pingIntervalMs" | "stallMs" | "retryMs">;
 }): RelayProviderConnection {
   const { channel, local, hooks } = options;
@@ -268,6 +268,7 @@ export function serveRelayTcp(options: {
   port?: number;
   host?: string;
   local: RelayLocalCapabilities;
+  privateOps?: RelayEndpointOptions["privateOps"];
   authenticate: (socket: Socket) => RelayPeerContext | null | Promise<RelayPeerContext | null>;
   hooks?: RelayProviderHooks | ((peer: RelayPeerContext) => RelayProviderHooks);
   onConnection?: (connection: RelayProviderConnection) => void;
@@ -283,7 +284,7 @@ export function serveRelayTcp(options: {
       if (!peer) { socket.destroy(); return; }
       const hooks = typeof options.hooks === "function" ? options.hooks(peer) : options.hooks;
       const channel = relaySocketChannel(socket, peer);
-      const connection = attachRelayProvider({ channel, local: options.local, hooks });
+      const connection = attachRelayProvider({ channel, local: options.local, hooks, endpoint: { privateOps: options.privateOps } });
       options.onConnection?.(connection);
     })();
   });

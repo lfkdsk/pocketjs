@@ -86,7 +86,7 @@ wire encoding.
 | 1 | REQUEST | `>0` | one `op`; ids do not repeat within a session |
 | 2 | RESPONSE | echoes request | carries `status` (`ok`/`accepted`/`error`) and boolean `final`; exactly one terminal response has `final:true` |
 | 3 | PUSH | `0` | subscription or control delivery; carries `subscription` or a stream-0 control op |
-| 4 | CANCEL | original request id | sent on stream 0 with `op:"request.cancel"` and `targetStream`; the provider emits one terminal response on the original stream |
+| 4 | CANCEL | original request id | sent on stream 0 with `op:"request.cancel"` and `targetStream`; the request receiver emits one terminal response on the original stream |
 | 5 | INVALIDATE | `0` | authority content invalidation or consumer cache eviction |
 
 Control ops are metadata names, not new types: `relay.hello`, `relay.ready`,
@@ -167,7 +167,8 @@ The machine has six phases: `idle`, `hello-sent`, `hello-received`,
 
 1. The guest sends REQUEST `relay.hello` on session 0 with `seq:1`,
    `correlation:1`, a 16-byte `bootNonce` (32 hex chars), its supported
-   versions, profiles, codecs, kinds and `rxLimits`. The frame is at most
+   versions, profiles, codecs, kinds, `rxLimits` and an optional `opExt`
+   descriptor array. The frame is at most
    4096 wire bytes.
 2. The provider answers on session 0 with a random nonzero u64 `session`,
    its `peerNonce`, the echoed `bootNonce`, one exact selected `[major,
@@ -385,6 +386,10 @@ negotiated `maxPending` on both ends: the guest holds a slot until the one
 terminal is consumed, the provider until the terminal enters the send
 queue. The guest draws request ids from the session's one correlation
 space, so OPEN, PING and resource requests never share an id.
+Each direction has its own request id space. **Incoming work and outgoing
+requests use separate tables**, so a guest request and a provider request
+with the same correlation can coexist. Private requests share the outgoing
+table with resource requests and can use the input reserve.
 
 The guest surface is `hello()`, `open()`, `get()`, `subscribe()`,
 `unsubscribe()`, `release()`, `reportEvict()` and `cancel()`; the current
@@ -406,6 +411,108 @@ terminal, CANCEL, a busy transport, a seq-hole reset and a credit fault,
 with the ledgers, request tables, assembler and cache asserted on both
 ends. `tests/relay-wire.test.ts` runs a guest endpoint against
 `serveRelayTcp` over a loopback socket.
+
+## Private REQUESTs
+
+**Private ops use `x.<profile.name>.<local-name>` on a nonzero OPEN stream.**
+The complete name follows the 64-byte `op` grammar. Endpoint construction
+takes `privateOps`, an array of at most 16 local definitions. A definition
+belongs to one exact `{name, version}` entry in `local.profiles`. Duplicate
+identities, unknown registration fields and invalid budgets throw before
+HELLO. A registration has no stream field; stream 0 and the public prefixes
+`relay.*`, `resource.*`, `cache.*`, `request.*` and `operation.*` remain closed.
+
+| Field | Contract |
+| --- | --- |
+| `profile` | Exact profile name and version; a changed schema requires a changed profile version |
+| `name` | `x.` prefix, complete profile name, a dot and a local name starting with a lowercase letter |
+| `direction` | `guest-to-provider`, `provider-to-guest` or `bidirectional` |
+| `args`, `value` | Local schemas for request inputs and successful terminal results |
+| `maxWireBytes` | Positive u32, at least 48, at most local `rxLimits.maxWireBytes`; counts the complete record |
+| `maxObjectBytes` | Positive u32, at most local `rxLimits.maxObjectBytes`; counts the UTF-8 JSON bytes of `args` or `value` |
+| `recovery` | `idempotent`, `epoch` or `durable`; the sender does not replay an admitted request |
+| `recoveryOp` | Required for `durable`: an installed idempotent private receipt query in the same profile and direction |
+
+HELLO `opExt` carries the profile, name, direction, budgets, recovery and
+optional recovery query name. **Schemas do not cross the connection.** The
+provider selects the name/profile/recovery intersection, intersects the
+directions and takes the smaller budgets. A durable op enters the selection
+with its recovery query. The guest checks that every selected descriptor
+was offered and that no direction or budget was enlarged. An invalid
+descriptor or forged selection rejects HELLO as `UNSUPPORTED`. An absent
+`opExt` selects no private ops. A legacy exchange omits the field in both
+directions. A strict older peer can reject an extended HELLO; the endpoint
+does not retry with reduced capabilities.
+
+OPEN derives its op set from the HELLO selection and the bound profile,
+and caps the op budgets by its `rxLimits`. The guest checks the response
+profile and namespace against the pending OPEN. Capabilities, local
+schemas, negotiation and stream bindings are copied and frozen; mutation
+of a caller-owned object cannot change the selected contract. Reset and
+disconnect discard these stream permissions.
+
+The local schema language supports `object`, `array`, `string`, `integer`,
+`boolean` and `null`; `properties`, `required`, `additionalProperties:false`,
+`items`, `additionalItems:false`, `minItems`, `maxItems`, `minLength`,
+`maxBytes`, `minimum`, `maximum`, `pattern`, scalar `const` and scalar `enum`.
+Objects declare their properties and reject other keys. Tuples declare
+equal length bounds and forbid extra items. **Unknown keywords, references,
+cycles and schemas above the 65536-byte installation budget reject at
+construction.** The endpoint uses the existing metadata schema evaluator
+and the frame writer's integer, UTF-8 and depth rules. Product schemas
+cannot widen the shared envelope or add fields to `ResourceRef`.
+
+Both roles call `endpoint.request(stream, name, args, options?)`. It returns
+a Promise with `correlation` and `cancel(reason?)`. Awaiting it yields one
+`{ok:true, value}` or `{ok:false, error, effect?}` result. A local refusal
+has correlation 0: unknown ops or wrong directions give `UNSUPPORTED`,
+invalid args give `INVALID`, and exceeded budgets give `TOO_LARGE`.
+**P3 admits the request before it enters the send queue.** A full request
+table or credit slice returns `BUSY`; no pending request or retry list is
+created for that refusal. An admitted record waits in the ordered outbox
+when the transport is busy and retains its seq.
+
+`onRequest` receives a negotiated, schema-valid private request on either
+role. Return `true` to retain it for a reply; returning `false` or having
+no hook answers `UNSUPPORTED`. `replyValue(request, value)` creates the
+success terminal. `replyError(request, code, message, effect?)` creates an
+error terminal. `respond(...)` accepts one `accepted/final:false` response
+and one terminal for an admitted private request; it validates the op,
+stream, value schema and budgets before queueing. A rejected value leaves
+the request answerable. If an automatic error cannot fit the negotiated
+budget, the endpoint resets the stream and completes its pending calls.
+A request carries its session id so a delayed
+reply through `replyValue` or `replyError` cannot answer a new session's
+request. Private payloads use codec 0 and no data bytes; objects that need
+chunks use resources.
+
+CANCEL uses the existing sideband, correlation and `targetStream`. A
+repeat from the public API sends no second CANCEL. A CANCEL that overtakes
+a queued REQUEST is held in a table capped at `maxPending` and marks the
+request before its handler runs. The receiver can finish an in-flight
+success or send `CANCELLED` with `effect:none`, `committed` or `unknown`.
+**CANCEL releases no request slot; the terminal or stream/session teardown
+releases it.** The caller's response must match the pending op and stream;
+late terminals cannot deliver a second result.
+
+An `idempotent` definition permits the product to repeat the read after
+recovery. An `epoch` definition assigns input epoch, sequence and ACK
+validation to its local schemas and handler. A `durable` request requires
+top-level `opEpoch` (16 lowercase hex characters) and `opId` (32 lowercase
+hex characters) in `options`, a required `value.receipt` in its result
+schema and an installed `recoveryOp`. The product owns the receipt store
+and query handler. **Reset or disconnect completes an admitted epoch or
+durable request as `OUTCOME_UNKNOWN` with `effect:unknown`.** The product
+queries or reconciles the result; it does not resend a write with an
+unknown outcome. Idempotent requests end as `RESYNC_REQUIRED` on teardown.
+The private sender adds no receipt persistence or input deduplication.
+
+The types are exported from `@pocketjs/framework/relay/endpoint`. Provider
+byte channels pass definitions through `attachRelayProvider`'s
+`endpoint.privateOps`; `serveRelayTcp` takes `privateOps` at the top level.
+`tests/relay-private-op.test.ts` exercises registration, negotiation,
+bidirectional requests, local schema rejection, terminal uniqueness,
+CANCEL races, P3 saturation and session recovery.
 
 ## Resource identity
 
@@ -762,6 +869,7 @@ bun test tests/relay-wire.test.ts      # provider over a TCP loopback
 bun test tests/relay-credit.test.ts    # queues/credit/priority/CANCEL
 bun test tests/relay-resource.test.ts  # L2 get/subscribe/chunks/budget/invalidate
 bun test tests/relay-endpoint.test.ts  # composed endpoint, guest <-> provider
+bun test tests/relay-private-op.test.ts # private op negotiation and both request directions
 bun test tests/relay-frame-c.test.ts  # compiles the C layer, feeds it the vectors
 bun test tests/relay-tape.test.ts tests/relay-sim-tape.test.ts
 bun tests/contract.ts

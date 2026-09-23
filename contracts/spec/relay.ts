@@ -291,6 +291,22 @@ export const RELAY_HANDSHAKE = Object.freeze({
 
 export type RelayProtocolVersion = readonly [number, number]; // [major:u8, minor:u8]
 export interface RelayProfileEntry { name: string; version: number } // name <= 64B, version u16
+
+/** Private REQUEST capabilities live above the byte-only frame layer. */
+export type RelayPrivateOpDirection = "guest-to-provider" | "provider-to-guest" | "bidirectional";
+export type RelayPrivateOpRecovery = "idempotent" | "epoch" | "durable";
+export interface RelayPrivateOpDescriptor {
+  profile: RelayProfileEntry;
+  name: string; // x.<profile.name>.<local name>, within the 64-byte op grammar
+  direction: RelayPrivateOpDirection;
+  recovery: RelayPrivateOpRecovery;
+  maxWireBytes: number;
+  maxObjectBytes: number;
+  /** Durable writes require a registered idempotent receipt query. */
+  recoveryOp?: string;
+}
+export const RELAY_PRIVATE_OP = Object.freeze({ maxEntries: 16, maxSchemaBytes: 65536 });
+
 export interface RelayTransportDesc {
   id: string; // adapter/profile ASCII id <= 64 bytes
   /** Bulk attachment endpoint: host/port or path, plus a one-use ticket and
@@ -368,6 +384,7 @@ export interface RelayHelloRequestMetadata extends RelayFrameMetadata {
   bootNonce: string; // 32 lowercase hex chars
   app: string; // <= 64 UTF-8 bytes, must be inside adapter grants
   profiles: RelayProfileEntry[]; // <= 16 entries
+  opExt?: RelayPrivateOpDescriptor[]; // installed private REQUEST capabilities
   codecs: number[]; // u16 RELAY_CODEC values supported
   kinds: number[]; // u8 RELAY_KIND values supported
   rxLimits: RelayRxLimits;
@@ -388,6 +405,7 @@ export interface RelayHelloResponseMetadata extends RelayFrameMetadata {
   session: string; // 16 lowercase hex chars, nonzero
   selected: RelayProtocolVersion;
   profiles: RelayProfileEntry[]; // the exact selected subset
+  opExt?: RelayPrivateOpDescriptor[]; // private op intersection under selected profiles
   codecs?: number[]; // the exact negotiated codec intersection
   grants: string[]; // authorized app namespaces
   rxLimits: RelayRxLimits;
@@ -512,6 +530,24 @@ const profileEntrySchema: JsonSchema = {
   properties: { name: { type: "string", minLength: 1, maxBytes: RELAY_HANDSHAKE.profileNameMaxBytes }, version: u16 },
 };
 
+/** Only descriptors cross HELLO. Product schemas remain local. */
+export const RELAY_PRIVATE_OPS_SCHEMA: JsonSchema = {
+  type: "array", maxItems: RELAY_PRIVATE_OP.maxEntries,
+  items: {
+    type: "object", additionalProperties: false,
+    required: ["profile", "name", "direction", "recovery", "maxWireBytes", "maxObjectBytes"],
+    properties: {
+      profile: profileEntrySchema,
+      name: { type: "string", pattern: "^x\\.[a-z][a-z0-9_.-]{0,61}$", maxBytes: 64 },
+      direction: { enum: ["guest-to-provider", "provider-to-guest", "bidirectional"] },
+      recovery: { enum: ["idempotent", "epoch", "durable"] },
+      maxWireBytes: { ...u32, minimum: RELAY_FRAME.headerBytes },
+      maxObjectBytes: { ...u32, minimum: 1 },
+      recoveryOp: { type: "string", pattern: "^x\\.[a-z][a-z0-9_.-]{0,61}$", maxBytes: 64 },
+    },
+  },
+};
+
 const transportSchema: JsonSchema = {
   type: "object",
   additionalProperties: false,
@@ -595,6 +631,7 @@ export const RELAY_METADATA_SCHEMAS: Readonly<Record<string, JsonSchema>> = Obje
       bootNonce: hex32,
       app: { type: "string", minLength: 1, maxBytes: RELAY_HANDSHAKE.appMaxBytes },
       profiles: { type: "array", maxItems: RELAY_HANDSHAKE.profilesMax, items: profileEntrySchema },
+      opExt: RELAY_PRIVATE_OPS_SCHEMA,
       codecs: { type: "array", items: u16 },
       kinds: { type: "array", items: u8 },
       rxLimits: rxLimitsSchema,
@@ -619,6 +656,7 @@ export const RELAY_METADATA_SCHEMAS: Readonly<Record<string, JsonSchema>> = Obje
       session: { ...hex16, not: { const: "0000000000000000" } },
       selected: versionSchema,
       profiles: { type: "array", items: profileEntrySchema },
+      opExt: RELAY_PRIVATE_OPS_SCHEMA,
       codecs: { type: "array", items: u16 },
       kinds: { type: "array", items: u8 },
       grants: { type: "array", items: { type: "string", minLength: 1 } },
