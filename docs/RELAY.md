@@ -556,8 +556,73 @@ The L2 state machines live in `framework/src/relay/resource.ts`
 (`RelayResourceClient` on the consumer, `RelayResourceAuthority` on the
 provider) above a transport-neutral `RelayResourceWire` seam. L2 never
 assigns a session or a wire seq; it works on metadata plus an optional data
-region. Strict op metadata is checked by `framework/src/relay/metadata.ts`
-against the schemas in `contracts/spec/relay.ts`.
+region. Strict op metadata is checked by the one evaluator in
+`framework/src/relay/metadata-schema.ts`; `metadata.ts` binds the names in
+`RELAY_METADATA_SCHEMAS` to it. The product-schema dialect for private ops
+and resource forms uses the same evaluator.
+
+## Product resource forms
+
+A **resource form** binds one exact `{name, version}` profile entry and one
+central `RELAY_KIND` (1..8) to local args and value schemas. Forms add no
+field to `ResourceRef`, no new top-level metadata key and no kind or codec;
+nothing about a form is negotiated or sent. Each end installs its own copy
+and rejects content its local forms do not admit. Endpoint construction
+takes `resourceForms`; an entry has `profile`, `kind`, an optional
+`argsKey`, an `args` closed object schema, a `value` closed object schema
+and an `onSubscribe` boolean. At most 64 forms and 65536 schema bytes
+install on one endpoint; duplicate `(profile, kind)` entries, a profile
+absent from `local.profiles`, a kind outside 1..8, an unknown registration
+field and an open or dialect-invalid schema throw before HELLO.
+
+**Product request parameters occupy one object inside the existing
+`args`, at the registered `argsKey`** (e.g.
+`args:{accept:[1],maxObjectBytes:4096,term:{page:7}}`). The key matches
+`^[a-z][a-z0-9_-]{0,62}$` and cannot equal a public args key
+(`accept`, `maxObjectBytes`, `ifRevision`, `delivery`, `namespace`); one
+key name has one profile owner on an endpoint, and a namespace-scope
+subscribe (which carries no ref and hence no kind) resolves the form
+through the key. A form applies its key to `resource.get` by default and
+to `resource.subscribe` when `onSubscribe` is true.
+
+Validation order on both ends:
+
+1. Frame/envelope, session/stream, seq and credit checks.
+2. Public L2 schema, closed everywhere. The one registered key for this
+   stream's profile and (for a get or ref subscribe) the ref's kind is
+   admitted into the closed `args`; every other unknown key rejects with
+   `INVALID`.
+3. The value at the registered key validates against the form's closed
+   `args` schema; an unknown nested key or a type mismatch rejects with
+   `INVALID` before the handler runs (provider) or before a frame is sent
+   (guest local refusal).
+4. A successful result validates the metadata `value` against the form's
+   `value` schema; codec 1 (`JSON`) validates the decoded assembled bytes.
+   A `{notModified:true}` marker and binary codecs without a JSON schema
+   pass this step.
+
+`get(stream, ref, args, complete)` and `subscribe(...)` accept
+`product:{key, value}`; the caller passes the registered key and the
+endpoint merges the object into metadata `args` at that key. A local
+mismatch returns `INVALID` with correlation 0. The provider checks the
+same layered schema against the OPEN stream's selected profile, so a key
+the peer registered for a different profile rejects on this stream.
+`replyObject` and `pushObject` run the value check before chunking; a
+provider-local refusal produces no chunk, and a consumer-side mismatch
+ends the get as `INVALID` or ends the subscription through `onEnd`.
+`rendition` keeps its presentation meaning (codec, dimensions, density,
+style, font binding): parameters that select a result go in the args key,
+parameters that change the presentation go in `rendition`, and commands
+go in a private op.
+
+The types are exported from `@pocketjs/framework/relay/endpoint`. Provider
+byte channels pass definitions through `attachRelayProvider`'s
+`endpoint.resourceForms`; `serveRelayTcp` takes `resourceForms` at the top
+level. `tests/relay-resource-forms.test.ts` exercises registration, the
+args round trip for get/ref subscribe/namespace subscribe, local and peer
+rejection of unknown keys and wrong types, value validation for codec 0
+and codec 1 on both ends, push validation, the closed ResourceRef and the
+rendition regression.
 
 ## get, subscribe, release
 

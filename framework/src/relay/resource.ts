@@ -110,6 +110,24 @@ export interface RelayResourceNegotiated {
   codecs: readonly number[];
 }
 
+/** Product parameters a registered form admitted into the public args:
+ * they are merged at the one registered key, never as top-level fields. */
+export interface RelayProductArgs {
+  key: string;
+  value: unknown;
+}
+
+/** Locally installed value schemas for inbound resource content. The
+ * client looks the stream's negotiated profile up per frame. */
+export interface RelayResourceValueValidator {
+  /** Null when the value satisfies the installed form, a reason otherwise. */
+  validateValue(profile: { name: string; version: number } | undefined, kind: number, value: unknown): string | null;
+  /** Decode and validate one complete codec-1 (JSON) object. Binary codecs
+   * have no JSON schema and pass. */
+  validateJson(profile: { name: string; version: number } | undefined, kind: number, bytes: Uint8Array): string | null;
+  streamProfile(stream: number): { name: string; version: number } | undefined;
+}
+
 export interface RelayPublishedObject {
   ref: RelayResourceRef;
   codec: number;
@@ -242,6 +260,8 @@ export class RelayResourceClient {
     assembler: RelayChunkAssembler;
     /** Revision markers kept per in-flight get; default RELAY_MAX_FENCED_REVISIONS. */
     maxFencedRevisions?: number;
+    /** Installed product value schemas; absent without registered forms. */
+    productForms?: RelayResourceValueValidator;
   }) {
     this.assembler = opts.assembler;
     const markers = opts.maxFencedRevisions ?? RELAY_MAX_FENCED_REVISIONS;
@@ -249,12 +269,27 @@ export class RelayResourceClient {
     this.maxFencedRevisions = markers;
   }
 
+  /** Validate one inbound value (or assembled JSON) against the form bound
+   * to the frame's stream profile and the ref kind. Returns an INVALID
+   * reason or null. */
+  private invalidProductValue(frame: RelayResourceIncomingFrame, value: unknown, bytes?: Uint8Array): string | null {
+    const forms = this.opts.productForms;
+    if (!forms) return null;
+    const ref = frame.metadata.resource as RelayResourceRef | undefined;
+    if (!ref || typeof ref.kind !== "number") return null;
+    const profile = forms.streamProfile(frame.stream);
+    if (bytes !== undefined && frame.codec === RELAY_CODEC.JSON) return forms.validateJson(profile, ref.kind, bytes);
+    return forms.validateValue(profile, ref.kind, value);
+  }
+
   /** resource.get. A conditional fetch with ifRevision may return
-   * notModified, which still names the concrete revision. */
+   * notModified, which still names the concrete revision. `product`
+   * carries the one registered args key; the caller has already matched it
+   * to the stream's form. */
   get(
     stream: number,
     ref: RelayResourceRef,
-    args: { accept: number[]; maxObjectBytes: number; ifRevision?: string },
+    args: { accept: number[]; maxObjectBytes: number; ifRevision?: string; product?: RelayProductArgs },
     complete: PendingGet["complete"],
   ): { correlation: number } | { ok: false; code: string } {
     if (!args.accept.length
@@ -274,6 +309,7 @@ export class RelayResourceClient {
       args: { accept: [...args.accept], maxObjectBytes: args.maxObjectBytes },
     };
     if (args.ifRevision) (metadata.args as Record<string, unknown>).ifRevision = args.ifRevision;
+    if (args.product) (metadata.args as Record<string, unknown>)[args.product.key] = args.product.value;
     const correlation = this.opts.wire.request(stream, metadata);
     if (correlation === 0) return { ok: false, code: RELAY_ERROR.BUSY };
     // The capacity was pre-checked; reserve the concrete correlation in the
@@ -307,7 +343,7 @@ export class RelayResourceClient {
     delivery: string,
     handler: RelaySubscriptionHandler,
     complete: PendingControl["complete"],
-    options: { maxObjectBytes?: number } = {},
+    options: { maxObjectBytes?: number; product?: RelayProductArgs } = {},
   ): { correlation: number } | { ok: false; code: string } {
     if (delivery !== RELAY_DELIVERY.RELIABLE_DELTA && delivery !== RELAY_DELIVERY.LATEST_SNAPSHOT) {
       return { ok: false, code: RELAY_ERROR.INVALID };
@@ -325,9 +361,13 @@ export class RelayResourceClient {
     // consuming a request slot when the push channel could not be admitted
     // now. The reservation itself needs the id the terminal response carries.
     if (!this.assembler.canReserve(maxObjectBytes)) return { ok: false, code: RELAY_ERROR.BUSY };
+    const argsMeta: Record<string, unknown> = isRef
+      ? { delivery }
+      : { delivery, namespace: (target as { ns: string }).ns };
+    if (options.product) argsMeta[options.product.key] = options.product.value;
     const metadata: Record<string, unknown> = {
       op: RELAY_OP.RESOURCE_SUBSCRIBE,
-      args: isRef ? { delivery } : { delivery, namespace: (target as { ns: string }).ns },
+      args: argsMeta,
     };
     if (isRef) metadata.resource = target;
     const correlation = this.opts.wire.request(stream, metadata);
@@ -658,6 +698,14 @@ export class RelayResourceClient {
         return;
       }
       if (!result.complete) return;
+      // The public chunk envelope passed; the assembled object and any
+      // repeated metadata value still have to satisfy the form the local
+      // product installed for this kind.
+      if (this.invalidProductValue(frame, meta.value)
+          || this.invalidProductValue(frame, undefined, result.bytes)) {
+        this.failMalformed(frame.correlation, pending);
+        return;
+      }
       this.terminatePending(frame.correlation, pending);
       // Every chunk repeats the object's value (§3.7); the final chunk's copy
       // is published with the bytes, as the push path does.
@@ -666,10 +714,14 @@ export class RelayResourceClient {
     }
 
     if (!meta.final) return;
-    this.terminatePending(frame.correlation, pending);
     // Unchunked result: codec NONE carries the value in metadata (small
     // control objects); codec JSON without a data region is invalid.
-    if (frame.codec !== RELAY_CODEC.NONE) { pending.complete({ ok: false, error: { code: RELAY_ERROR.INVALID } }); return; }
+    if (frame.codec !== RELAY_CODEC.NONE) {
+      this.terminatePending(frame.correlation, pending);
+      pending.complete({ ok: false, error: { code: RELAY_ERROR.INVALID } }); return;
+    }
+    if (this.invalidProductValue(frame, meta.value)) { this.failMalformed(frame.correlation, pending); return; }
+    this.terminatePending(frame.correlation, pending);
     const bytes = new Uint8Array(stringToUtf8(JSON.stringify(meta.value ?? null)));
     this.publishGet(pending, ref, RELAY_CODEC.NONE, bytes, undefined, meta.value);
   }
@@ -733,12 +785,21 @@ export class RelayResourceClient {
       });
       if (!result.ok) { this.failSubscription(sub.id, { code: result.code }); return; }
       if (!result.complete) return;
+      // Assembled object and repeated metadata value must satisfy the form
+      // bound to this stream's profile and the push's kind.
+      if (this.invalidProductValue(frame, meta.value)
+          || this.invalidProductValue(frame, undefined, result.bytes)) {
+        this.failSubscription(sub.id, { code: RELAY_ERROR.INVALID }); return;
+      }
       this.publishPush(sub, result.resource, result.codec, result.bytes, result.digest,
         meta.value, meta.baseRevision as string | undefined);
       return;
     }
 
     if (!meta.final) return;
+    if (this.invalidProductValue(frame, meta.value)) {
+      this.failSubscription(sub.id, { code: RELAY_ERROR.INVALID }); return;
+    }
     const data = new Uint8Array(stringToUtf8(JSON.stringify(meta.value ?? null)));
     this.publishPush(sub, ref, frame.codec, data, undefined, meta.value, meta.baseRevision as string | undefined);
   }
@@ -902,10 +963,30 @@ export class RelayResourceAuthority {
   private readonly leases = new Set<number>();
   private readonly maxWireBytes: number;
   private readonly maxMetaBytes: number;
+  /** Endpoint-injected layered validators (public schema + product form).
+   * Direct authority users without them get the strict public schema only. */
+  private readonly validateLayeredRequest?: (
+    stream: number,
+    op: typeof RELAY_OP.RESOURCE_GET | typeof RELAY_OP.RESOURCE_SUBSCRIBE,
+    metadata: unknown,
+  ) => string | null;
+  /** Endpoint-injected full request check used before echoing a ref. */
+  private readonly validGetRequest?: (stream: number, metadata: unknown) => boolean;
 
-  constructor(opts: { maxWireBytes?: number; maxMetaBytes?: number } = {}) {
+  constructor(opts: {
+    maxWireBytes?: number;
+    maxMetaBytes?: number;
+    validateLayeredRequest?: (
+      stream: number,
+      op: typeof RELAY_OP.RESOURCE_GET | typeof RELAY_OP.RESOURCE_SUBSCRIBE,
+      metadata: unknown,
+    ) => string | null;
+    validGetRequest?: (stream: number, metadata: unknown) => boolean;
+  } = {}) {
     this.maxWireBytes = opts.maxWireBytes ?? RELAY_LIMITS.defaultMaxWireBytes;
     this.maxMetaBytes = opts.maxMetaBytes ?? RELAY_LIMITS.defaultMaxMetaBytes;
+    this.validateLayeredRequest = opts.validateLayeredRequest;
+    this.validGetRequest = opts.validGetRequest;
     if (!Number.isSafeInteger(this.maxWireBytes) || this.maxWireBytes < RELAY_FRAME.headerBytes
       || !Number.isSafeInteger(this.maxMetaBytes) || this.maxMetaBytes < 0) {
       throw new Error("Invalid relay authority limits");
@@ -914,7 +995,9 @@ export class RelayResourceAuthority {
 
   answerSubscribe(frame: { stream: number; correlation: number; metadata: Record<string, unknown> }):
     RelayResourceEnvelope {
-    const invalid = validateRelayMetadata(`${RELAY_OP.RESOURCE_SUBSCRIBE}.request`, frame.metadata);
+    const invalid = this.validateLayeredRequest
+      ? this.validateLayeredRequest(frame.stream, RELAY_OP.RESOURCE_SUBSCRIBE, frame.metadata)
+      : validateRelayMetadata(`${RELAY_OP.RESOURCE_SUBSCRIBE}.request`, frame.metadata);
     if (invalid) return this.error(frame, RELAY_OP.RESOURCE_SUBSCRIBE, RELAY_ERROR.INVALID, invalid);
     const args = frame.metadata.args as { delivery: string; namespace?: string };
     const ref = frame.metadata.resource as RelayResourceRef | undefined;
@@ -984,10 +1067,11 @@ export class RelayResourceAuthority {
     code: string,
     message = code,
   ): RelayResourceEnvelope {
-    const ref = frame.metadata !== undefined
-      && validateRelayMetadata(`${RELAY_OP.RESOURCE_GET}.request`, frame.metadata) === null
-      ? frame.metadata.resource as RelayResourceRef
-      : undefined;
+    const trustworthy = frame.metadata !== undefined
+      && (this.validGetRequest
+        ? this.validGetRequest(frame.stream, frame.metadata)
+        : validateRelayMetadata(`${RELAY_OP.RESOURCE_GET}.request`, frame.metadata) === null);
+    const ref = trustworthy ? frame.metadata!.resource as RelayResourceRef : undefined;
     return this.error(frame, RELAY_OP.RESOURCE_GET, code, message, ref);
   }
 
