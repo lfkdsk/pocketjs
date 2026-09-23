@@ -597,7 +597,9 @@ Validation order on both ends:
    `INVALID` before the handler runs (provider) or before a frame is sent
    (guest local refusal).
 4. A successful get uses the form selected by the request's profile and
-   kind; a response that substitutes another kind ends as `INVALID`. The
+   kind. Its response must preserve `kind`, `ns`, `key`, and `rendition`; a
+   request that names a revision fixes that revision, while a request without
+   one accepts the concrete current revision. A mismatch ends as `INVALID`. The
    metadata `value` validates against that form's `value` schema. Codec 1
    (`JSON`) uses the frame layer's strict UTF-8 JSON parser, which rejects
    duplicate keys and malformed UTF-8, before applying the value schema. A

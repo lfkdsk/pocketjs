@@ -42,6 +42,11 @@ const tileRef = (revision = "tile-v1"): RelayResourceRef => ({
   revision,
   rendition: "r5g6b5le-256-v1",
 });
+const currentTileRef = (): RelayResourceRef => {
+  const ref = tileRef();
+  delete ref.revision;
+  return ref;
+};
 
 // ---------------------------------------------------------------------------
 // SHA-256 (FIPS 180-2)
@@ -695,7 +700,7 @@ test("invalidate scope=namespace moves every matching namespace generation forwa
 
 test("the cache identity excludes revision: every revision of a key shares it", () => {
   expect(relayResourceKey(tileRef("r1"))).toBe(relayResourceKey(tileRef("r2")));
-  expect(relayResourceKey(tileRef(undefined))).toBe(relayResourceKey(tileRef("r2")));
+  expect(relayResourceKey(currentTileRef())).toBe(relayResourceKey(tileRef("r2")));
   // rendition and key still distinguish identities.
   expect(relayResourceKey(tileRef("r1")))
     .not.toBe(relayResourceKey({ ...tileRef("r1"), rendition: "r5g6b5le-128-v1" }));
@@ -706,7 +711,7 @@ test("F1: a key-scope invalidate fences an in-flight revisionless get", () => {
   const auth = new RelayResourceAuthority();
   const results: { ok: boolean; error?: { code: string } }[] = [];
   // §3.5: a get without revision requests the current revision.
-  client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+  client.get(1, currentTileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
     (r) => results.push(r as { ok: boolean; error?: { code: string } }));
   feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
   // The late response names the concrete revision (§3.5).
@@ -725,7 +730,7 @@ test("F1: a revision-scope invalidate fences only the invalidated concrete revis
   const auth = new RelayResourceAuthority();
   const results: { ok: boolean; error?: { code: string }; value?: { ref?: RelayResourceRef } }[] = [];
   // Revisionless "current version" get.
-  client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+  client.get(1, currentTileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
     (r) => results.push(r as typeof results[number]));
   // r1 is invalidated while the get is in flight.
   feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.REVISION, ref: tileRef("r1") }));
@@ -1177,7 +1182,7 @@ test("M2: a marker survives an eviction while a get that captured the older gene
   // A second get captures generation 0; a key-scope invalidate moves the
   // identity to 1; the resident entry is evicted before the response lands.
   const results: Array<ResourceResult<unknown>> = [];
-  client.get(1, tileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 8 }, (r) => results.push(r));
+  client.get(1, currentTileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 8 }, (r) => results.push(r));
   const inFlight = wire.lastRequest().correlation;
   feed(client, auth.buildInvalidate({ stream: 1, scope: RELAY_INVALIDATE_SCOPE.KEY, ref: tileRef("r1") }));
   client.reportEvict(tileRef("r1"), RELAY_EVICT_REASON.BUDGET);
@@ -1188,7 +1193,7 @@ test("M2: a marker survives an eviction while a get that captured the older gene
   expect(client.stats()).toMatchObject({ entries: 0, pending: 0, generationMarkers: 0 });
 
   // A fresh get after the prune captures the reset counter and publishes.
-  client.get(1, tileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 8 }, (r) => results.push(r));
+  client.get(1, currentTileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 8 }, (r) => results.push(r));
   deliver(wire.lastRequest().correlation, tileRef("r3"));
   expect(results[1]?.ok).toBe(true);
   expect(client.localEntry(tileRef())?.revision).toBe("r3");
@@ -1580,7 +1585,7 @@ test("G1: the identity generation is one monotonic counter moved once per invali
     })) feed(client, f, RELAY_CODEC.R5G6B5LE);
   };
   const getFor = (name: string) => {
-    const out = client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+    const out = client.get(1, currentTileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
       (r) => { results[name] = r as { ok: boolean; error?: { code: string } }; });
     if (!("correlation" in out)) throw new Error("budget");
     return out.correlation;
@@ -1624,7 +1629,7 @@ test("G2: revision markers on an in-flight get are bounded; overflow fences the 
   const { wire, client } = makeClient();
   const auth = new RelayResourceAuthority();
   const results: { ok: boolean; error?: { code: string } }[] = [];
-  client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+  client.get(1, currentTileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
     (r) => results.push(r as { ok: boolean; error?: { code: string } }));
   const correlation = wire.lastRequest().correlation;
   const N = 5000;
@@ -1647,7 +1652,7 @@ test("G2: revision markers on an in-flight get are bounded; overflow fences the 
   expect(client.stats()).toMatchObject({ pending: 0, fencedRevisions: 0 });
   // The escalation belongs to that get alone: the re-fetch lands.
   const again: { ok: boolean }[] = [];
-  client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+  client.get(1, currentTileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
     (r) => again.push(r as { ok: boolean }));
   for (const f of chunks(auth, {
     type: RELAY_TYPE.RESPONSE, stream: 1, correlation: wire.lastRequest().correlation,
@@ -1662,7 +1667,7 @@ test("G2: below the bound the fence stays exact and a repeated revision is one m
   const auth = new RelayResourceAuthority();
   const results: { ok: boolean; error?: { code: string } }[] = [];
   const start = () => {
-    const out = client.get(1, tileRef(undefined), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
+    const out = client.get(1, currentTileRef(), { accept: [RELAY_CODEC.R5G6B5LE], maxObjectBytes: 131072 },
       (r) => results.push(r as { ok: boolean; error?: { code: string } }));
     if (!("correlation" in out)) throw new Error("budget");
     return out.correlation;

@@ -76,6 +76,7 @@ export type { RelayResourceForm } from "./resource-form.ts";
 import {
   RelayResourceAuthority,
   RelayResourceClient,
+  relayGetResponseMatchesRequest,
   type RelayGetOutcome,
   type RelayResourceEnvelope,
   type RelayResourceIncomingFrame,
@@ -679,10 +680,19 @@ export class RelayEndpoint {
     return this.respond(envelope);
   }
 
-  replyNotModified(request: { stream: number; correlation: number }, ref: RelayResourceRef): void {
+  replyNotModified(
+    request: Pick<RelayIncomingRequest, "stream" | "correlation" | "metadata">,
+    ref: RelayResourceRef,
+  ): { ok: true } | { ok: false; code: string } {
     const b = this.bound;
-    if (!b?.authority) return;
-    this.respond(b.authority.answerNotModified(request, ref));
+    if (!b?.authority) return { ok: false, code: RELAY_ERROR.BUSY };
+    const requested = request.metadata.resource as RelayResourceRef;
+    if (!relayGetResponseMatchesRequest(requested, ref)) {
+      this.respond(b.authority.answerGetError(request, RELAY_ERROR.INVALID,
+        "response resource differs from request resource"));
+      return { ok: false, code: RELAY_ERROR.INVALID };
+    }
+    return this.respond(b.authority.answerNotModified(request, ref));
   }
 
   /** Validate provider-produced content against the stream's form before
@@ -719,8 +729,8 @@ export class RelayEndpoint {
       return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
     }
     const requested = request.metadata.resource as RelayResourceRef;
-    const schemaError = object.ref.kind !== requested.kind
-      ? "response kind differs from request kind"
+    const schemaError = !relayGetResponseMatchesRequest(requested, object.ref)
+      ? "response resource differs from request resource"
       : this.checkProductObject(request.stream, requested.kind, object.codec, object.data, object.value);
     if (schemaError) {
       this.respond(b.authority.answerGetError(request, RELAY_ERROR.INVALID, schemaError));

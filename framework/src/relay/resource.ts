@@ -67,6 +67,14 @@ function refMatchesKeyScope(a: RelayResourceRef, b: RelayResourceRef): boolean {
   return a.kind === b.kind && a.ns === b.ns && a.key === b.key && a.rendition === b.rendition;
 }
 
+/** Bind a successful get response to the ref the request selected. A
+ * revisionless request means "current" and accepts the concrete revision
+ * returned by the authority; a request that names a revision fixes it. */
+export function relayGetResponseMatchesRequest(request: RelayResourceRef, response: RelayResourceRef): boolean {
+  return refMatchesKeyScope(request, response)
+    && (request.revision === undefined || request.revision === response.revision);
+}
+
 /** A ref-scoped subscription fixes the resource's revision-independent
  * identity; its revision advances as pushes arrive. A namespace-scoped
  * subscription admits every resource kind and key in that namespace. */
@@ -625,6 +633,11 @@ export class RelayResourceClient {
         this.failMalformed(frame.correlation, pending);
         return;
       }
+      if (pending.kind === "get" && frame.metadata.resource
+          && !relayGetResponseMatchesRequest(pending.ref, frame.metadata.resource as RelayResourceRef)) {
+        this.failMalformed(frame.correlation, pending);
+        return;
+      }
       const error = frame.metadata.error as RelayErrorBody;
       this.terminatePending(frame.correlation, pending);
       pending.complete({ ok: false, error: { code: error.code, message: error.message } });
@@ -675,9 +688,11 @@ export class RelayResourceClient {
     const meta = frame.metadata;
     const ref = meta.resource as RelayResourceRef;
     const value = meta.value as { notModified?: boolean } | undefined;
-    // The request chose the resource form. A peer cannot select another form
-    // by substituting the kind in its response, including notModified.
-    if (ref.kind !== pending.ref.kind) { this.failMalformed(frame.correlation, pending); return; }
+    // The request fixes the ref identity and selected resource form. A
+    // revisionless request may receive the authority's concrete revision.
+    if (!relayGetResponseMatchesRequest(pending.ref, ref)) {
+      this.failMalformed(frame.correlation, pending); return;
+    }
     if (frame.codec === RELAY_CODEC.JSON && frame.data.length && meta.value !== undefined) {
       this.failMalformed(frame.correlation, pending); return;
     }

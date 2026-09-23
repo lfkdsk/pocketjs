@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import {
-  RELAY_CODEC, RELAY_DELIVERY, RELAY_ERROR, RELAY_KIND, RELAY_TYPE,
+  RELAY_CODEC, RELAY_DELIVERY, RELAY_ERROR, RELAY_KIND, RELAY_OP, RELAY_TYPE,
   type RelayProfileEntry, type RelayResourceRef, type RelayRxLimits,
 } from "../contracts/spec/relay.ts";
 import {
-  RelayEndpoint, type RelayResourceForm,
+  RelayEndpoint, type RelayEndpointHooks, type RelayIncomingRequest, type RelayResourceForm,
 } from "../framework/src/relay/endpoint.ts";
 import { decodeFrame, encodeFrame, type RelayDecodedFrame } from "../framework/src/relay/frame.ts";
 import type { RelayLocalCapabilities, RelayScheduler } from "../framework/src/relay/session.ts";
@@ -43,7 +43,10 @@ const capabilities = (): RelayLocalCapabilities => ({
   kinds: [RELAY_KIND.TERMINAL_CELLS, RELAY_KIND.FILE], rxLimits: RX,
 });
 
-function pair(transform?: (from: Role, frame: RelayDecodedFrame) => RelayDecodedFrame) {
+function pair(
+  transform?: (from: Role, frame: RelayDecodedFrame) => RelayDecodedFrame,
+  providerHooks?: RelayEndpointHooks,
+) {
   const endpoints = {} as Record<Role, RelayEndpoint>;
   const route = (from: Role, bytes: Uint8Array<ArrayBufferLike>) => {
     let copy: Uint8Array<ArrayBufferLike> = bytes.slice();
@@ -60,6 +63,7 @@ function pair(transform?: (from: Role, frame: RelayDecodedFrame) => RelayDecoded
   for (const role of ["guest", "provider"] as const) {
     endpoints[role] = new RelayEndpoint({
       role, local: capabilities(), resourceForms: [FORM],
+      hooks: role === "provider" ? providerHooks : undefined,
       transport: { peer: { id: `peer-${role}`, grants: ["example"] }, trySend: bytes => route(role, bytes) },
       scheduler: scheduler(), randomBytes: n => new Uint8Array(n).fill(role === "guest" ? 17 : 23),
     });
@@ -72,6 +76,16 @@ function pair(transform?: (from: Role, frame: RelayDecodedFrame) => RelayDecoded
     }
   };
   return { ...endpoints, settle };
+}
+
+function getOnce(link: ReturnType<typeof pair>, stream: number, ref = resourceRef()) {
+  return new Promise<ResourceResult<{ ref: RelayResourceRef }>>(resolve => {
+    const started = link.guest.get(stream, ref, {
+      accept: [RELAY_CODEC.NONE], maxObjectBytes: 4096,
+      product: { key: "term", value: { page: 1 } },
+    }, resolve as never);
+    if (!("correlation" in started)) resolve({ ok: false, error: { code: started.code } });
+  });
 }
 
 async function connect(link: ReturnType<typeof pair>): Promise<number> {
@@ -193,4 +207,83 @@ test("namespace subscription filters only namespace on provider and consumer", a
   expect(objects).toHaveLength(1);
   expect(ends).toEqual([RELAY_ERROR.INVALID]);
   expect(link.guest.client!.subscription(id)).toBeUndefined();
+});
+
+test("get responses bind ns, key, revision, and rendition on provider and consumer", async () => {
+  const mutations: Array<[string, (ref: RelayResourceRef) => RelayResourceRef]> = [
+    ["namespace", ref => ({ ...ref, ns: "term/other" })],
+    ["key", ref => ({ ...ref, key: "other" })],
+    ["revision", ref => ({ ...ref, revision: "s-other" })],
+    ["rendition", ref => ({ ...ref, rendition: "other-v1" })],
+  ];
+
+  for (const [field, mutate] of mutations) {
+    let localReply: unknown;
+    let provider: RelayEndpoint | undefined;
+    const local = pair(undefined, { onGet(request) {
+      localReply = provider!.replyObject(request, {
+        ref: mutate(resourceRef()), codec: RELAY_CODEC.NONE, data: new Uint8Array(), value: page(1),
+      });
+    } });
+    provider = local.provider;
+    const localResult = await getOnce(local, await connect(local));
+    await local.settle();
+    expect(localReply, `provider ${field}`).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+    expect(localResult.ok, `provider ${field}`).toBe(false);
+    if (localResult.ok) throw new Error(`provider accepted substituted ${field}`);
+    expect((localResult.error as { code: string }).code).toBe(RELAY_ERROR.INVALID);
+
+    let wireMutation: ((ref: RelayResourceRef) => RelayResourceRef) | undefined = mutate;
+    let peer: RelayEndpoint | undefined;
+    const inbound = pair((from, frame) => {
+      if (from !== "provider" || frame.type !== RELAY_TYPE.RESPONSE
+          || frame.metadata.op !== RELAY_OP.RESOURCE_GET
+          || frame.metadata.status !== "ok" || !wireMutation) return frame;
+      return { ...frame, metadata: { ...frame.metadata,
+        resource: wireMutation(frame.metadata.resource as RelayResourceRef),
+      } };
+    }, { onGet(request) {
+      peer!.replyObject(request, {
+        ref: resourceRef(), codec: RELAY_CODEC.NONE, data: new Uint8Array(), value: page(2),
+      });
+    } });
+    peer = inbound.provider;
+    const inboundResult = await getOnce(inbound, await connect(inbound));
+    await inbound.settle();
+    expect(inboundResult, `consumer ${field}`).toEqual({
+      ok: false, error: { code: RELAY_ERROR.INVALID },
+    });
+    expect(inbound.guest.client!.stats()).toMatchObject({ pending: 0, protocolErrors: 1 });
+    wireMutation = undefined;
+  }
+});
+
+test("get identity binding covers notModified and permits a concrete revision for current", async () => {
+  let request: RelayIncomingRequest | undefined;
+  let provider: RelayEndpoint | undefined;
+  const local = pair(undefined, { onGet(incoming) { request = incoming; } });
+  provider = local.provider;
+  const resultPromise = getOnce(local, await connect(local));
+  await local.settle();
+  expect(provider.replyNotModified(request!, { ...resourceRef(), revision: "s-other" }))
+    .toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+  await local.settle();
+  expect(await resultPromise).toEqual({ ok: false, error: { code: RELAY_ERROR.INVALID,
+    message: "response resource differs from request resource" } });
+
+  let currentProvider: RelayEndpoint | undefined;
+  const current = pair(undefined, { onGet(incoming) {
+    currentProvider!.replyObject(incoming, {
+      ref: resourceRef("s-current"), codec: RELAY_CODEC.NONE, data: new Uint8Array(), value: page(3),
+    });
+  } });
+  currentProvider = current.provider;
+  const currentRef = resourceRef();
+  delete currentRef.revision;
+  const currentResult = await getOnce(current, await connect(current), currentRef);
+  await current.settle();
+  expect(currentResult.ok).toBe(true);
+  if (currentResult.ok && "value" in currentResult) {
+    expect(currentResult.value.ref.revision).toBe("s-current");
+  }
 });
