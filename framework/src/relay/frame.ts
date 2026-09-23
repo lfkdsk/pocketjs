@@ -188,18 +188,23 @@ function encodeUtf8CodePoint(cp: number, out: number[]) {
 
 // --- strict JSON: parser -----------------------------------------------------
 
-/** Parses strict UTF-8 JSON straight off the wire. Rejects invalid UTF-8
- * (including overlong encodings and the U+D800..U+DFFF byte range),
- * duplicate object keys, NaN/Infinity, non-integer or unsafe numbers and
- * nesting past the depth cap. Root must be an object. */
-function parseMetadata(bytes: Uint8Array): Record<string, unknown> {
+/** Parse one value with the relay's strict wire JSON rules. */
+export function parseRelayJson(bytes: Uint8Array): unknown {
   const p = new Parser(bytes);
   p.ws();
   const value = p.value(0);
   p.ws();
-  if (p.pos !== bytes.length || value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw RELAY_FRAME_ERROR.BAD_METADATA;
-  }
+  if (p.pos !== bytes.length) throw RELAY_FRAME_ERROR.BAD_METADATA;
+  return value;
+}
+
+/** Parses strict UTF-8 JSON straight off the wire. Rejects invalid UTF-8
+ * (including overlong encodings and the U+D800..U+DFFF byte range),
+ * duplicate object keys, NaN/Infinity, non-integer or unsafe numbers and
+ * nesting past the depth cap. Metadata's root must be an object. */
+function parseMetadata(bytes: Uint8Array): Record<string, unknown> {
+  const value = parseRelayJson(bytes);
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw RELAY_FRAME_ERROR.BAD_METADATA;
   return value as Record<string, unknown>;
 }
 

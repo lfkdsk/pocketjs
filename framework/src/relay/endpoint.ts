@@ -63,7 +63,7 @@ import {
   type RelayRequestState,
   type RelayStreamAlloc,
 } from "./credit.ts";
-import type { RelayDecodedFrame } from "./frame.ts";
+import { parseRelayJson, type RelayDecodedFrame } from "./frame.ts";
 import { validateRelayMetadata } from "./metadata.ts";
 import { validateRelaySchema } from "./metadata-schema.ts";
 import {
@@ -545,15 +545,15 @@ export class RelayEndpoint {
   private validateJsonValue(
     profile: { name: string; version: number } | undefined, kind: number, bytes: Uint8Array,
   ): string | null {
-    // A kind without an installed value schema gets no JSON parse: codec 1
-    // content of unformed kinds stays the product binary validator's job.
-    if (!this.resourceForms.formFor(profile, kind)?.value) return null;
     let value: unknown;
     try {
-      value = JSON.parse(new TextDecoder().decode(bytes));
+      value = parseRelayJson(bytes);
     } catch {
       return "resource value is not one JSON value";
     }
+    // Codec 1 is strict JSON for every kind. An installed value schema adds
+    // product shape validation; without one, parsing is the full check.
+    if (!this.resourceForms.formFor(profile, kind)?.value) return null;
     return this.resourceForms.validateValue(profile, kind, value);
   }
 

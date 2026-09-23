@@ -10,6 +10,7 @@ import {
   RelayEndpoint, type RelayEndpointHooks, type RelayResourceForm,
 } from "../framework/src/relay/endpoint.ts";
 import { decodeFrame, encodeFrame, type RelayDecodedFrame } from "../framework/src/relay/frame.ts";
+import { sha256Hex } from "../framework/src/relay/sha256.ts";
 import type { RelayLocalCapabilities, RelayScheduler } from "../framework/src/relay/session.ts";
 import type { RelayGetOutcome } from "../framework/src/relay/resource.ts";
 import type { ResourceResult } from "../framework/src/resource-cache.ts";
@@ -136,4 +137,50 @@ test("review1307 A: response kind substitution ends the request as INVALID", asy
   await link.settle();
   expect(result).toEqual({ ok: false, error: { code: RELAY_ERROR.INVALID } });
   expect(link.guest.inspect()!.client!.stats()).toMatchObject({ pending: 0, protocolErrors: 1 });
+});
+
+test("review1307 B: codec-1 rejects duplicate keys and malformed UTF-8 on both ends", async () => {
+  const duplicate = new TextEncoder().encode('{"lines":[],"cursor":1,"cursor":2}');
+  const prefix = new TextEncoder().encode('{"lines":["');
+  const suffix = new TextEncoder().encode('"],"cursor":1}');
+  const malformed = new Uint8Array(prefix.length + 2 + suffix.length);
+  malformed.set(prefix);
+  malformed.set([0xc0, 0xaf], prefix.length);
+  malformed.set(suffix, prefix.length + 2);
+
+  for (const badBytes of [duplicate, malformed]) {
+    let producer: RelayEndpoint | undefined;
+    let produced: unknown;
+    const outbound = pair({ providerHooks: { onGet(request) {
+      produced = producer!.replyObject(request, { ref: ref(), codec: RELAY_CODEC.JSON, data: badBytes });
+    } } });
+    producer = outbound.provider;
+    const outboundResult = await getOnce(outbound, await connect(outbound), RELAY_CODEC.JSON);
+    await outbound.settle();
+    expect(produced).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+    expect(outboundResult.ok).toBe(false);
+    if (outboundResult.ok) throw new Error("invalid producer JSON was accepted");
+    expect(outboundResult.error.code).toBe(RELAY_ERROR.INVALID);
+
+    let provider: RelayEndpoint | undefined;
+    const inbound = pair({
+      providerHooks: { onGet(request) {
+        const good = new TextEncoder().encode(JSON.stringify(page));
+        provider!.replyObject(request, { ref: ref(), codec: RELAY_CODEC.JSON, data: good });
+      } },
+      transform(from, frame) {
+        if (from !== "provider" || frame.type !== RELAY_TYPE.RESPONSE || !frame.data.length) return frame;
+        return { ...frame, data: badBytes, metadata: { ...frame.metadata,
+          transfer: { ...(frame.metadata.transfer as Record<string, unknown>),
+            total: badBytes.length.toString(16).padStart(16, "0") },
+          digest: `sha256:${sha256Hex(badBytes)}`,
+        } };
+      },
+    });
+    provider = inbound.provider;
+    const inboundResult = await getOnce(inbound, await connect(inbound), RELAY_CODEC.JSON);
+    await inbound.settle();
+    expect(inboundResult).toEqual({ ok: false, error: { code: RELAY_ERROR.INVALID } });
+    expect(inbound.guest.inspect()!.client!.stats()).toMatchObject({ pending: 0, protocolErrors: 1 });
+  }
 });
