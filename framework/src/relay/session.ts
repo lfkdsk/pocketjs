@@ -36,6 +36,7 @@ import {
   RELAY_TYPE,
   type RelayMaterializeLimits,
   type RelayProfileEntry,
+  type RelayPrivateOpDescriptor,
   type RelayProtocolVersion,
   type RelayRxLimits,
   type RelayTransportDesc,
@@ -47,6 +48,10 @@ import {
   type RelayDecodedFrame,
 } from "./frame.ts";
 import { validateRelaySchema } from "./metadata-schema.ts";
+import {
+  freezeRelayCopy, intersectPrivateOps, privateOpForStream, privateSelectionOffered,
+  samePrivateProfile, validPrivateOps,
+} from "./private-op.ts";
 
 export { RELAY_FRAME_ERROR };
 
@@ -99,6 +104,7 @@ const defaultRandomBytes: RelayRandomBytes = (n) => {
 export interface RelayNegotiation {
   version: RelayProtocolVersion;
   profiles: RelayProfileEntry[];
+  opExt?: RelayPrivateOpDescriptor[];
   codecs: number[];
   kinds: number[];
   grants: string[];
@@ -147,6 +153,7 @@ export interface RelayOpenResult {
   namespace: string;
   profile: RelayProfileEntry;
   rxLimits: RelayRxLimits;
+  opExt?: RelayPrivateOpDescriptor[];
 }
 
 /** A control frame the machine wants to send on the pinned session; the
@@ -162,6 +169,8 @@ export interface RelayLocalCapabilities {
   app?: string;
   versions: RelayProtocolVersion[];
   profiles: RelayProfileEntry[];
+  /** Descriptor-only seam for bare sessions. Endpoints derive this from privateOps. */
+  opExt?: RelayPrivateOpDescriptor[];
   codecs: number[];
   kinds: number[];
   rxLimits: RelayRxLimits;
@@ -259,6 +268,9 @@ export function limitsAreUsable(l: RelayRxLimits): boolean {
 
 type PendingOpen = {
   app: string;
+  namespace: string;
+  profile: RelayProfileEntry;
+  rxLimits: RelayRxLimits;
   resolve: (result: RelayOpenResult) => void;
   reject: (code: string) => void;
 };
@@ -268,6 +280,7 @@ interface StreamBinding {
   namespace: string;
   profile: RelayProfileEntry;
   rxLimits: RelayRxLimits;
+  opExt?: RelayPrivateOpDescriptor[];
 }
 
 // --- the machine -------------------------------------------------------------
@@ -310,6 +323,7 @@ export class RelaySession {
   };
 
   constructor(private readonly options: RelaySessionOptions) {
+    this.options = { ...options, local: freezeRelayCopy(options.local) };
     this.scheduler = options.scheduler ?? defaultScheduler;
     this.random = options.randomBytes ?? defaultRandomBytes;
     this.pingIntervalMs = options.pingIntervalMs ?? RELAY_LIMITS.pingIntervalMs;
@@ -317,6 +331,9 @@ export class RelaySession {
     this.retryMs = options.retryMs ?? RELAY_LIMITS.retryMs;
     if (!limitsAreUsable(options.local.rxLimits)) {
       throw new Error("local rxLimits are not usable (positive fields, window >= one frame)");
+    }
+    if (!validPrivateOps(this.options.local.profiles, this.options.local.opExt, this.options.local.rxLimits)) {
+      throw new Error("invalid private op capabilities");
     }
   }
 
@@ -519,6 +536,7 @@ export class RelaySession {
       rxLimits: local.rxLimits,
     };
     if (local.materialize) metadata.materialize = local.materialize;
+    if (local.opExt?.length) metadata.opExt = local.opExt;
     if (local.transport) metadata.transport = local.transport;
     const schemaError = validateRelaySchema(
       RELAY_METADATA_SCHEMAS[`${RELAY_OP.HELLO}.request`] as Record<string, unknown>, metadata,
@@ -593,11 +611,15 @@ export class RelaySession {
         RELAY_METADATA_SCHEMAS[`${RELAY_OP.OPEN}.request`] as Record<string, unknown>, metadata,
       );
       if (schemaError) { reject(RELAY_FRAME_ERROR.BAD_METADATA); return; }
+      if (!this.negotiationValue.profiles.some(profile => samePrivateProfile(profile, request.profile))) {
+        reject(RELAY_ERROR.UNSUPPORTED); return;
+      }
       const correlation = this.allocateCorrelation();
       // Register before the send: a synchronous transport nests the
       // provider's OPEN response inside trySend, and it must find the
       // pending request and (after the response) the stream.
-      const pending: PendingOpen = { app: request.app, resolve, reject };
+      const pending: PendingOpen = { app: request.app, namespace: request.namespace,
+        profile: freezeRelayCopy(request.profile), rxLimits: freezeRelayCopy(metadata.rxLimits as RelayRxLimits), resolve, reject };
       this.pendingOpen.set(correlation, pending);
       const sent = this.emit({ type: RELAY_TYPE.REQUEST, stream: 0, correlation, metadata });
       if (!sent.ok) { this.pendingOpen.delete(correlation); reject(sent.code); }
@@ -804,6 +826,9 @@ export class RelaySession {
         this.teardown(`hello rejected: ${RELAY_ERROR.UNSUPPORTED} (response without kinds)`);
         return;
       }
+      if (!validPrivateOps(meta.profiles as RelayProfileEntry[], meta.opExt, meta.rxLimits as RelayRxLimits)) {
+        this.teardown(`hello rejected: ${RELAY_ERROR.UNSUPPORTED} (private ops)`); return;
+      }
       if (!this.validateAgainst(frame, `${RELAY_OP.HELLO}.response`)) return;
       if (meta.bootNonce !== this.bootNonce) { this.teardown("bootNonce mismatch"); return; }
       const local = this.options.local;
@@ -835,6 +860,10 @@ export class RelaySession {
       if (!limitsEqual(limits, meta.rxLimits as RelayRxLimits)) {
         this.teardown("rxLimits are not min(local, peer)"); return;
       }
+      const opExt = (meta.opExt ?? []) as RelayPrivateOpDescriptor[];
+      if (!privateSelectionOffered(opExt, local.opExt ?? [])) {
+        this.teardown(`hello rejected: ${RELAY_ERROR.UNSUPPORTED} (private op selection)`); return;
+      }
       const session = BigInt("0x" + meta.session as string);
       if (session === 0n) { this.teardown("zero session"); return; }
 
@@ -848,6 +877,7 @@ export class RelaySession {
         kinds,
         grants,
         rxLimits: limits,
+        ...(opExt.length ? { opExt } : {}),
         peerNonce: meta.peerNonce as string,
         ...(meta.transport ? { transport: meta.transport as RelayTransportDesc } : {}),
       };
@@ -873,7 +903,6 @@ export class RelaySession {
     if (frame.codec !== RELAY_CODEC.NONE || frame.data.length !== 0) {
       this.teardown("bootstrap frame carries data"); return;
     }
-    if (!this.validateAgainst(frame, `${RELAY_OP.HELLO}.request`)) return;
     const refuse = (code: string) => {
       this.statsValue.handshakeFailures++;
       const metadata: Record<string, unknown> = {
@@ -884,6 +913,10 @@ export class RelaySession {
       this.controlResponse(1, metadata, `${RELAY_OP.HELLO}.error`);
       this.teardown(`hello refused: ${code}`);
     };
+    if (!validPrivateOps(meta.profiles as RelayProfileEntry[], meta.opExt, meta.rxLimits as RelayRxLimits)) {
+      refuse(RELAY_ERROR.UNSUPPORTED); return;
+    }
+    if (!this.validateAgainst(frame, `${RELAY_OP.HELLO}.request`)) return;
     const peer = this.options.transport.peer;
     const app = meta.app as string;
     if (!peer.grants.includes(app)) { refuse(RELAY_ERROR.UNAUTHORIZED); return; }
@@ -902,6 +935,7 @@ export class RelaySession {
     const peerLimits = meta.rxLimits as RelayRxLimits;
     if (!limitsAreUsable(peerLimits)) { refuse(RELAY_ERROR.UNSUPPORTED); return; }
     const rxLimits = minLimits(local.rxLimits, peerLimits);
+    const opExt = intersectPrivateOps((meta.opExt ?? []) as RelayPrivateOpDescriptor[], local.opExt ?? [], profiles);
 
     let session = 0n;
     do { session = BigInt("0x" + randomHex(this.random, 8)); } while (session === 0n);
@@ -919,6 +953,7 @@ export class RelaySession {
       rxLimits,
     };
     if (meta.transport) metadata.transport = meta.transport;
+    if (opExt.length) metadata.opExt = opExt;
     // Pin the new session BEFORE the response leaves: a synchronous
     // transport delivers the guest's nested READY inside trySend below,
     // and it must find the session and phase already established.
@@ -926,12 +961,13 @@ export class RelaySession {
       version: selectedVersion, profiles, codecs,
       kinds: (meta.kinds as number[]).filter((k) => local.kinds.includes(k)),
       grants: peer.grants, rxLimits, peerNonce,
+      ...(opExt.length ? { opExt } : {}),
       ...(meta.transport ? { transport: meta.transport as RelayTransportDesc } : {}),
     };
     this.session = session;
     this.txSeq.clear();
     this.rxSeq.clear();
-    this.negotiationValue = negotiation;
+    this.negotiationValue = freezeRelayCopy(negotiation);
     this.nextCorrelation = 1;
     this.setPhase("hello-received");
     this.armStall();
@@ -978,7 +1014,7 @@ export class RelaySession {
     this.session = session;
     this.txSeq.clear();
     this.rxSeq.clear();
-    this.negotiationValue = negotiation;
+    this.negotiationValue = freezeRelayCopy(negotiation);
     this.nextCorrelation = 1;
   }
 
@@ -1020,17 +1056,24 @@ export class RelaySession {
       if (!this.validateAgainst(frame, `${RELAY_OP.OPEN}.response`)) {
         pending.reject(RELAY_FRAME_ERROR.BAD_METADATA); return;
       }
+      const profile = frame.metadata.profile as RelayProfileEntry;
+      const rxLimits = frame.metadata.rxLimits as RelayRxLimits;
+      if (frame.metadata.namespace !== pending.namespace || !samePrivateProfile(profile, pending.profile)
+          || !limitsAreUsable(rxLimits) || !limitsEqual(rxLimits, minLimits(pending.rxLimits, rxLimits))
+          || !limitsEqual(rxLimits, minLimits(this.negotiationValue!.rxLimits, rxLimits))) {
+        pending.reject(RELAY_ERROR.UNSUPPORTED);
+        this.teardown(`open rejected: ${RELAY_ERROR.UNSUPPORTED} (binding mismatch)`); return;
+      }
       const stream = frame.metadata.stream as number;
       if (stream <= this.lastGuestStream || this.streams.size >= RELAY_LIMITS.maxStreams) {
         pending.reject("BAD_STREAM"); return;
       }
       this.lastGuestStream = stream;
-      const binding: StreamBinding = {
+      const binding: StreamBinding = freezeRelayCopy({
         app: pending.app,
-        namespace: frame.metadata.namespace as string,
-        profile: frame.metadata.profile as RelayProfileEntry,
-        rxLimits: frame.metadata.rxLimits as RelayRxLimits,
-      };
+        namespace: pending.namespace, profile, rxLimits,
+        opExt: privateOpForStream(this.negotiationValue!.opExt ?? [], profile, rxLimits),
+      });
       // A frame that raced in before this stream existed may have touched
       // its seq space (handleRecord checks seq before the stream exists).
       // The binding starts a fresh per-stream seq at 1 in each direction.
@@ -1038,6 +1081,7 @@ export class RelaySession {
       this.streams.set(stream, binding);
       const opened: RelayOpenResult = {
         stream, namespace: binding.namespace, profile: binding.profile, rxLimits: binding.rxLimits,
+        ...(binding.opExt?.length ? { opExt: binding.opExt } : {}),
       };
       // The composition layer allocates the stream's window slice before
       // the caller can send on it.
@@ -1087,9 +1131,11 @@ export class RelaySession {
     }
     const stream = this.nextProviderStream++;
     const rxLimits = request.rxLimits ? minLimits(n.rxLimits, request.rxLimits) : n.rxLimits;
-    const binding: StreamBinding = {
+    if (!limitsAreUsable(rxLimits)) { refuse(RELAY_ERROR.UNSUPPORTED); return; }
+    const binding: StreamBinding = freezeRelayCopy({
       app: request.app, namespace: request.namespace, profile: request.profile, rxLimits,
-    };
+      opExt: privateOpForStream(n.opExt ?? [], request.profile, rxLimits),
+    });
     // Bind before the response leaves so a synchronous transport's nested
     // business frame on the new stream is admitted immediately. The id is
     // fresh (never reused), so drop any seq an early frame planted.
@@ -1100,7 +1146,8 @@ export class RelaySession {
       stream, namespace: request.namespace, profile: request.profile, rxLimits,
     }, `${RELAY_OP.OPEN}.response`);
     if (!sent.ok) { this.streams.delete(stream); this.teardown(`open response: ${sent.code}`); return; }
-    this.options.onStreamOpened?.({ stream, namespace: request.namespace, profile: request.profile, rxLimits });
+    this.options.onStreamOpened?.({ stream, namespace: binding.namespace, profile: binding.profile, rxLimits: binding.rxLimits,
+      ...(binding.opExt?.length ? { opExt: binding.opExt } : {}) });
   }
 
   // --- PING -------------------------------------------------------------------

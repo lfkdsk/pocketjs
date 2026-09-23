@@ -37,12 +37,15 @@
 
 import {
   RELAY_CODEC,
+  RELAY_EFFECT,
   RELAY_ERROR,
   RELAY_LIMITS,
   RELAY_OP,
+  RELAY_STATUS,
   RELAY_TYPE,
   type RelayResourceRef,
   type RelayRxLimits,
+  type RelayErrorBody,
 } from "../../../contracts/spec/relay.ts";
 import type { ResourceResult } from "../resource-cache.ts";
 import { RelayChunkAssembler } from "./assembler.ts";
@@ -62,6 +65,11 @@ import {
 } from "./credit.ts";
 import type { RelayDecodedFrame } from "./frame.ts";
 import { validateRelayMetadata } from "./metadata.ts";
+import {
+  installPrivateOps, preparePrivateOp, privateDescriptors, privateOpAllows, samePrivateProfile,
+  type RelayPrivateOp,
+} from "./private-op.ts";
+export type { RelayPrivateOp, RelayPrivateSchema } from "./private-op.ts";
 import {
   RelayResourceAuthority,
   RelayResourceClient,
@@ -89,7 +97,7 @@ import {
 
 // --- public types --------------------------------------------------------------
 
-/** A REQUEST the provider endpoint hands to the application. */
+/** A REQUEST either endpoint hands to the application. */
 export interface RelayIncomingRequest {
   stream: number;
   correlation: number;
@@ -98,6 +106,8 @@ export interface RelayIncomingRequest {
   /** View over the record's data region; copy to keep it past the call. */
   data: Uint8Array;
   codec: number;
+  /** Session fence for delayed replies, including after a reconnect. */
+  session: bigint;
   /** True once the peer sent request.cancel for this correlation. The
    * request still needs its one terminal (§3.6). */
   cancelRequested(): boolean;
@@ -118,11 +128,11 @@ export interface RelayEndpointHooks {
    * replyNotModified() or replyError(); without the hook the endpoint
    * answers UNSUPPORTED. */
   onGet?: (request: RelayIncomingRequest) => void;
-  /** Provider: a REQUEST op the endpoint does not answer itself. Return
+  /** Either role: a negotiated, schema-valid private REQUEST. Return
    * true when the application took it (and will answer through respond());
    * false answers UNSUPPORTED. */
   onRequest?: (request: RelayIncomingRequest) => boolean;
-  /** Provider: an inbound CANCEL; the request is marked, the application
+  /** Either role: an inbound CANCEL; the request is marked, the application
    * decides between the in-flight success terminal and CANCELLED/none. */
   onCancel?: (cancel: { targetStream: number; correlation: number; reason: string; request: RelayRequestState | undefined }) => void;
   /** Provider: a consumer cache.evict advisory; no ACK exists (R5 Q5). */
@@ -133,6 +143,8 @@ export interface RelayEndpointOptions {
   role: "guest" | "provider";
   transport: RelayTransportAdapter;
   local: RelayLocalCapabilities;
+  /** Installed profile-owned REQUESTs; schemas remain on this endpoint. */
+  privateOps?: readonly RelayPrivateOp[];
   hooks?: RelayEndpointHooks;
   scheduler?: RelayScheduler;
   randomBytes?: RelayRandomBytes;
@@ -152,6 +164,21 @@ export interface RelayEndpointOptions {
   outboxFrames?: number;
 }
 
+export type RelayPrivateResult =
+  | { ok: true; value: unknown }
+  | { ok: false; error: RelayErrorBody; effect?: string };
+
+/** Await the one terminal. A local refusal has correlation 0 and sends nothing. */
+export interface RelayPrivateCall extends Promise<RelayPrivateResult> {
+  readonly correlation: number;
+  cancel(reason?: string): void;
+}
+
+export interface RelayPrivateRequestOptions {
+  opEpoch?: string;
+  opId?: string;
+}
+
 /** The per-session machines, for tests and diagnostics. */
 export interface RelayEndpointInspection {
   session: bigint;
@@ -159,6 +186,9 @@ export interface RelayEndpointInspection {
   sender: RelaySender;
   receiver: RelayReceiver;
   requests: RelayRequestTable;
+  /** Separate correlation spaces for work originated on each end. */
+  outgoingRequests: RelayRequestTable;
+  incomingRequests: RelayRequestTable;
   creditTable: RelayCreditTable;
   allocations: ReadonlyMap<number, RelayStreamAlloc>;
   client?: RelayResourceClient;
@@ -182,6 +212,12 @@ interface Bound {
   allocations: Map<number, RelayStreamAlloc>;
   receiver: RelayReceiver;
   requests: RelayRequestTable;
+  outgoingRequests: RelayRequestTable;
+  incomingRequests: RelayRequestTable;
+  privatePending: Map<number, { stream: number; op: RelayPrivateOp; resolve: (result: RelayPrivateResult) => void }>;
+  privateIncoming: Map<number, { request: RelayIncomingRequest; op: RelayPrivateOp; terminalQueued: boolean; accepted: boolean }>;
+  earlyCancels: Map<number, { targetStream: number; correlation: number; reason: string }>;
+  lastIncoming: Map<number, number>;
   assembler?: RelayChunkAssembler;
   client?: RelayResourceClient;
   authority?: RelayResourceAuthority;
@@ -233,6 +269,7 @@ export class RelayEndpoint {
   private readonly outbox: Uint8Array[] = [];
   private readonly outboxCap: number;
   private readonly requestReserve: number;
+  private readonly privateOps: readonly RelayPrivateOp[];
   private bound: Bound | null = null;
   private flushing = false;
   private drainingOutbox = false;
@@ -254,9 +291,11 @@ export class RelayEndpoint {
     this.hooks = options.hooks ?? {};
     this.outboxCap = options.outboxFrames ?? 32;
     this.requestReserve = options.requestReserve ?? 0;
+    if (options.local.opExt?.length) throw new Error("RelayEndpoint derives opExt from privateOps");
+    this.privateOps = installPrivateOps(options.privateOps ?? [], options.local.profiles, options.local.rxLimits);
     this.session = createRelaySession({
       role: options.role,
-      local: options.local,
+      local: { ...options.local, opExt: privateDescriptors(this.privateOps) },
       transport: { peer: options.transport.peer, trySend: (bytes) => this.trySendDirect(bytes) },
       scheduler: options.scheduler,
       randomBytes: options.randomBytes,
@@ -292,6 +331,7 @@ export class RelayEndpoint {
     return {
       session: b.session, negotiation: b.negotiation, sender: b.sender, receiver: b.receiver,
       requests: b.requests, creditTable: b.creditTable, allocations: b.allocations,
+      outgoingRequests: b.outgoingRequests, incomingRequests: b.incomingRequests,
       client: b.client, assembler: b.assembler, authority: b.authority, demand: b.demand,
       outboxFrames: this.outbox.length,
     };
@@ -339,6 +379,158 @@ export class RelayEndpoint {
   /** Protocol teardown from this end. */
   close(): void {
     this.session.close();
+  }
+
+  // --- profile-owned REQUESTs (both roles) ---------------------------------------------
+
+  request(stream: number, name: string, args: unknown, options: RelayPrivateRequestOptions = {}): RelayPrivateCall {
+    const refused = (code: string): RelayPrivateCall => Object.assign(
+      Promise.resolve<RelayPrivateResult>({ ok: false, error: { code, message: code } }),
+      { correlation: 0, cancel: () => {} },
+    );
+    const b = this.bound;
+    const op = this.privateOp(stream, name);
+    if (!op || !privateOpAllows(op, this.role)) return refused(RELAY_ERROR.UNSUPPORTED);
+    if (!b || this.phase !== "ready" || !b.allocations.has(stream)) return refused(RELAY_ERROR.BUSY);
+    if (Object.keys(options).some(key => key !== "opEpoch" && key !== "opId")) return refused(RELAY_ERROR.INVALID);
+    const prepared = preparePrivateOp(op, { type: RELAY_TYPE.REQUEST, stream,
+      metadata: { op: name, args, ...options } }, this.session.streamInfo(stream)!.rxLimits);
+    if (!prepared.ok) return refused(prepared.code);
+    const correlation = this.session.allocateCorrelation();
+    if (!correlation) return refused(RELAY_ERROR.RESYNC_REQUIRED);
+    const slot = b.outgoingRequests.admitKnown(stream, correlation);
+    if (!slot.ok) return refused(RELAY_ERROR.BUSY);
+    const admitted = b.sender.admit({ type: RELAY_TYPE.REQUEST, stream, correlation, metadata: prepared.metadata,
+      priority: RELAY_PRIORITY.CONTROL, association: { kind: "correlation", id: correlation } });
+    if (!admitted.ok) { b.outgoingRequests.abandon(correlation); return refused(admitted.code); }
+    // Register before flush: a synchronous transport can deliver the terminal inside it.
+    const result = new Promise<RelayPrivateResult>(resolve => {
+      b.privatePending.set(correlation, { stream, op, resolve });
+    });
+    const call = Object.assign(result, { correlation, cancel: (reason = "cancel") => {
+      if (this.bound === b && b.privatePending.has(correlation)) { this.wireCancel(stream, correlation, reason); this.flush(); }
+    } });
+    this.flush();
+    return call;
+  }
+
+  /** One successful private terminal. Errors use replyError(); accepted uses respond(). */
+  replyValue(request: RelayIncomingRequest, value: unknown): { ok: true } | { ok: false; code: string } {
+    if (request.session !== this.bound?.session) return { ok: false, code: RELAY_ERROR.RESYNC_REQUIRED };
+    return this.respond({ type: RELAY_TYPE.RESPONSE, stream: request.stream, correlation: request.correlation,
+      metadata: { op: request.op, status: RELAY_STATUS.OK, final: true, value } });
+  }
+
+  private privateOp(stream: number, name: string): RelayPrivateOp | undefined {
+    if (stream === 0) return undefined;
+    const binding = this.session.streamInfo(stream);
+    const selected = binding?.opExt?.find(op => op.name === name);
+    if (!selected) return undefined;
+    const local = this.privateOps.find(op => op.name === name && samePrivateProfile(op.profile, selected.profile));
+    return local ? { ...local, ...selected } : undefined;
+  }
+
+  private privateError(request: { stream: number; correlation: number; op: string },
+    code: string, message = code, effect?: string): RelayResourceEnvelope {
+    let clipped = "", length = 0;
+    for (const char of message) {
+      length += new TextEncoder().encode(char).length;
+      if (length > RELAY_LIMITS.errorMessageMaxBytes) break;
+      clipped += char;
+    }
+    return { type: RELAY_TYPE.RESPONSE, stream: request.stream, correlation: request.correlation,
+      metadata: { op: request.op, status: RELAY_STATUS.ERROR, final: true,
+        error: { code, message: clipped || code }, ...(effect === undefined ? {} : { effect }) } };
+  }
+
+  private respondPrivate(b: Bound, envelope: RelayResourceEnvelope): { ok: true } | { ok: false; code: string } {
+    const pending = b.privateIncoming.get(envelope.correlation);
+    if (!pending || pending.request.stream !== envelope.stream || pending.request.op !== envelope.metadata.op
+        || envelope.type !== RELAY_TYPE.RESPONSE) return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    if (pending.terminalQueued || (pending.accepted && envelope.metadata.status === RELAY_STATUS.ACCEPTED)) {
+      return { ok: false, code: RELAY_P3_ERROR.ALREADY_TERMINAL };
+    }
+    const limits = this.session.streamInfo(envelope.stream)!.rxLimits;
+    const prepared = preparePrivateOp(pending.op, envelope, limits);
+    if (!prepared.ok) return prepared;
+    // Mark before enqueuing: one terminal (and at most one accepted) per admitted request.
+    if (prepared.metadata.final === true) pending.terminalQueued = true;
+    else pending.accepted = true;
+    this.enqueue(b, { ...envelope, metadata: prepared.metadata });
+    this.flush();
+    return { ok: true };
+  }
+
+  private servePrivateRequest(b: Bound, request: RelayIncomingRequest, wireBytes: number): void {
+    const op = this.privateOp(request.stream, request.op);
+    const peerRole = this.role === "guest" ? "provider" : "guest";
+    if (!op || !privateOpAllows(op, peerRole)) {
+      this.enqueue(b, this.privateError(request, RELAY_ERROR.UNSUPPORTED)); return;
+    }
+    if (wireBytes > op.maxWireBytes) { this.enqueue(b, this.privateError(request, RELAY_ERROR.TOO_LARGE)); return; }
+    const prepared = preparePrivateOp(op, { type: RELAY_TYPE.REQUEST, ...request },
+      this.session.streamInfo(request.stream)!.rxLimits);
+    if (!prepared.ok) { this.enqueue(b, this.privateError(request, prepared.code)); return; }
+    b.privateIncoming.set(request.correlation, { request, op, terminalQueued: false, accepted: false });
+    let answered: { ok: true } | { ok: false; code: string };
+    try {
+      if (this.hooks.onRequest?.(request)) return;
+      answered = this.replyError(request, RELAY_ERROR.UNSUPPORTED, "no private op handler");
+    } catch {
+      // A product handler failure may follow a side effect. Never imply it was uncommitted.
+      answered = this.replyError(request, RELAY_ERROR.OUTCOME_UNKNOWN, "private op handler failed", RELAY_EFFECT.UNKNOWN);
+    }
+    if (!answered.ok && b.privateIncoming.get(request.correlation)?.terminalQueued === false) {
+      // A small op budget can fit args but not the automatic error envelope.
+      // Reset owns the terminal outcome when no response can fit that budget.
+      this.resetStream(request.stream, `private error refused: ${answered.code}`);
+    }
+  }
+
+  private deliverPrivateResponse(b: Bound, frame: RelayDecodedFrame, wireBytes: number): void {
+    const pending = b.privatePending.get(frame.correlation);
+    if (!pending) { this.protocolError(RELAY_P3_ERROR.UNKNOWN_REQUEST, "private response without a request"); return; }
+    if (pending.stream !== frame.stream || pending.op.name !== frame.metadata.op) {
+      this.protocolError(RELAY_P3_ERROR.BAD_CORRELATION, "private response stream/op mismatch"); return;
+    }
+    const prepared = wireBytes > pending.op.maxWireBytes
+      ? { ok: false as const, code: RELAY_ERROR.TOO_LARGE }
+      : preparePrivateOp(pending.op, frame, this.session.streamInfo(frame.stream)!.rxLimits);
+    if (!prepared.ok) {
+      this.protocolError(prepared.code, "private response schema or budget");
+      if (frame.metadata.final === true) {
+        this.completePrivate(b, frame.correlation, { ok: false, error: { code: prepared.code, message: prepared.code }, effect: RELAY_EFFECT.UNKNOWN });
+      } else this.resetStream(frame.stream, "invalid private response");
+      return;
+    }
+    if (frame.metadata.final !== true) return;
+    const meta = prepared.metadata;
+    this.completePrivate(b, frame.correlation, meta.status === RELAY_STATUS.OK
+      ? { ok: true, value: meta.value }
+      : { ok: false, error: meta.error as RelayErrorBody, ...(meta.effect === undefined ? {} : { effect: meta.effect as string }) });
+  }
+
+  private completePrivate(b: Bound, correlation: number, result: RelayPrivateResult): void {
+    const pending = b.privatePending.get(correlation);
+    if (!pending) return;
+    const recorded = b.outgoingRequests.terminal(correlation, { final: true, status: result.ok ? RELAY_STATUS.OK : RELAY_STATUS.ERROR,
+      ...(!result.ok ? { errorCode: result.error.code, effect: result.effect } : {}) });
+    if (!recorded.ok) { this.protocolError(recorded.code, "private terminal"); return; }
+    const consumed = b.outgoingRequests.consumeTerminal(correlation);
+    if (!consumed.ok) { this.protocolError(consumed.code, "private terminal consumption"); return; }
+    b.privatePending.delete(correlation);
+    pending.resolve(result);
+  }
+
+  private failPrivate(b: Bound, stream?: number): void {
+    for (const [correlation, pending] of b.privatePending) {
+      if (stream !== undefined && pending.stream !== stream) continue;
+      b.privatePending.delete(correlation);
+      const code = pending.op.recovery === "idempotent" ? RELAY_ERROR.RESYNC_REQUIRED : RELAY_ERROR.OUTCOME_UNKNOWN;
+      pending.resolve({ ok: false, error: { code, message: code }, effect: RELAY_EFFECT.UNKNOWN });
+    }
+    for (const [id, pending] of b.privateIncoming) if (stream === undefined || pending.request.stream === stream) b.privateIncoming.delete(id);
+    for (const [id, cancel] of b.earlyCancels) if (stream === undefined || cancel.targetStream === stream) b.earlyCancels.delete(id);
   }
 
   // --- L2 surface: guest ---------------------------------------------------------------
@@ -400,6 +592,8 @@ export class RelayEndpoint {
   /** Withdraw interest in an in-flight get: request.cancel on the
    * sideband; the slot frees when the one terminal is consumed. */
   cancel(correlation: number, reason = "cancel"): void {
+    const pending = this.bound?.privatePending.get(correlation);
+    if (pending) { this.wireCancel(pending.stream, correlation, reason); this.flush(); return; }
     this.bound?.client?.cancel(correlation, reason);
     this.flush();
   }
@@ -408,22 +602,30 @@ export class RelayEndpoint {
 
   /** Queue one prepared envelope (a terminal, a chunk, a push, an
    * invalidate) on its stream; credit admission happens in flush(). */
-  respond(envelope: RelayResourceEnvelope): void {
+  respond(envelope: RelayResourceEnvelope): { ok: true } | { ok: false; code: string } {
     const b = this.bound;
-    if (!b) return;
+    if (!b) return { ok: false, code: RELAY_ERROR.BUSY };
+    if (String(envelope.metadata.op).startsWith("x.") || b.privateIncoming.has(envelope.correlation)) {
+      return this.respondPrivate(b, envelope);
+    }
     this.enqueue(b, envelope);
     this.flush();
+    return { ok: true };
   }
 
-  replyError(request: { stream: number; correlation: number; op: string; metadata?: Record<string, unknown> },
-    code: string, message = code, effect?: string): void {
+  replyError(request: { stream: number; correlation: number; op: string; metadata?: Record<string, unknown>; session?: bigint },
+    code: string, message = code, effect?: string): { ok: true } | { ok: false; code: string } {
     const b = this.bound;
-    if (!b?.authority) return;
+    if (request.session !== undefined && request.session !== b?.session) return { ok: false, code: RELAY_ERROR.RESYNC_REQUIRED };
+    if (b && (request.op.startsWith("x.") || b.privateIncoming.has(request.correlation))) {
+      return this.respond(this.privateError(request, code, message, effect));
+    }
+    if (!b?.authority) return { ok: false, code: RELAY_ERROR.BUSY };
     const envelope = request.op === RELAY_OP.RESOURCE_GET
       ? b.authority.answerGetError(request, code, message)
       : b.authority.answerError(request, request.op, code, message);
     if (effect !== undefined) envelope.metadata.effect = effect;
-    this.respond(envelope);
+    return this.respond(envelope);
   }
 
   replyNotModified(request: { stream: number; correlation: number }, ref: RelayResourceRef): void {
@@ -627,13 +829,16 @@ export class RelayEndpoint {
    * stream (§3.9: the provider releases its execution slot on completion). */
   private noteSentTerminal(b: Bound, env: RelayResourceEnvelope): void {
     if (env.type !== RELAY_TYPE.RESPONSE || env.metadata.final !== true) return;
-    if (!b.requests.get(env.correlation)) return;
-    const recorded = b.requests.terminal(env.correlation, {
+    if (b.incomingRequests.get(env.correlation)?.stream !== env.stream) return;
+    const recorded = b.incomingRequests.terminal(env.correlation, {
       status: String(env.metadata.status), final: true,
       errorCode: (env.metadata.error as { code?: string } | undefined)?.code,
       effect: typeof env.metadata.effect === "string" ? env.metadata.effect : undefined,
     });
-    if (recorded.ok) b.requests.consumeTerminal(env.correlation);
+    if (recorded.ok) {
+      b.incomingRequests.consumeTerminal(env.correlation);
+      b.privateIncoming.delete(env.correlation);
+    }
   }
 
   private enqueue(b: Bound, envelope: RelayResourceEnvelope): void {
@@ -672,9 +877,12 @@ export class RelayEndpoint {
     }, creditTable);
     const allocations = new Map<number, RelayStreamAlloc>([[0, control]]);
     const receiver = new RelayReceiver(session, allocations, creditTable, RELAY_LIMITS.maxStreams, 1);
+    const outgoingRequests = new RelayRequestTable(limits.maxPending);
+    const incomingRequests = new RelayRequestTable(limits.maxPending);
     const bound: Bound = {
       session, negotiation, sideband, creditTable, sender, allocations, receiver,
-      requests: new RelayRequestTable(limits.maxPending),
+      requests: this.role === "guest" ? outgoingRequests : incomingRequests,
+      outgoingRequests, incomingRequests, privatePending: new Map(), privateIncoming: new Map(), lastIncoming: new Map(), earlyCancels: new Map(),
       demand: new Map(), pendingSideband: [], streamsByNs: new Map(),
     };
     if (this.role === "guest") {
@@ -702,6 +910,11 @@ export class RelayEndpoint {
     const b = this.bound;
     if (!b) return;
     this.bound = null;
+    this.failPrivate(b);
+    for (const stream of b.allocations.keys()) {
+      b.outgoingRequests.failStream(stream);
+      b.incomingRequests.failStream(stream);
+    }
     if (b.client) {
       for (const stream of b.allocations.keys()) if (stream !== 0) b.client.resetStream(stream);
     }
@@ -793,8 +1006,25 @@ export class RelayEndpoint {
   private onPeerCancel(frame: RelayDecodedFrame): void {
     const b = this.bound;
     if (!b) return;
-    const state = b.requests.get(frame.correlation);
-    if (state) b.requests.cancel(frame.correlation);
+    const state = b.incomingRequests.get(frame.correlation);
+    if (state && state.stream !== frame.metadata.targetStream) {
+      this.protocolError(RELAY_P3_ERROR.BAD_CORRELATION, "CANCEL target stream mismatch"); return;
+    }
+    if (!state) {
+      const stream = frame.metadata.targetStream as number;
+      if (!b.allocations.has(stream) || stream === 0 || frame.correlation <= (b.lastIncoming.get(stream) ?? 0)) return;
+      const old = b.earlyCancels.get(frame.correlation);
+      if (old && old.targetStream !== stream) {
+        this.protocolError(RELAY_P3_ERROR.BAD_CORRELATION, "early CANCEL stream mismatch"); return;
+      }
+      if (!old && b.earlyCancels.size >= b.negotiation.rxLimits.maxPending) {
+        this.fatal(RELAY_ERROR.BUSY, "early CANCEL capacity exceeded"); return;
+      }
+      b.earlyCancels.set(frame.correlation, { targetStream: stream, correlation: frame.correlation,
+        reason: typeof frame.metadata.reason === "string" ? frame.metadata.reason : "" });
+      return;
+    }
+    if (state) b.incomingRequests.cancel(frame.correlation);
     this.hooks.onCancel?.({
       targetStream: frame.metadata.targetStream as number,
       correlation: frame.correlation,
@@ -818,7 +1048,10 @@ export class RelayEndpoint {
   private applyStreamReset(b: Bound, stream: number, reason: string): void {
     b.receiver.applyReset(stream, reason);
     b.sender.applyReset(stream);
-    b.requests.failStream(stream);
+    b.outgoingRequests.failStream(stream);
+    b.incomingRequests.failStream(stream);
+    this.failPrivate(b, stream);
+    b.lastIncoming.delete(stream);
     b.client?.resetStream(stream);
     b.authority?.resetStream(stream);
     b.demand.delete(stream);
@@ -849,7 +1082,7 @@ export class RelayEndpoint {
       for (const rx of batch) {
         delivered++;
         this.deliver(b, rx);
-        if (this.bound === b) {
+        if (this.bound === b && b.allocations.has(rx.stream)) {
           const released = b.receiver.release(rx.handle);
           if (!released.ok) this.protocolError(released.code, `release ${rx.handle}`);
         }
@@ -859,6 +1092,20 @@ export class RelayEndpoint {
   }
 
   private deliver(b: Bound, rx: RelayReceived): void {
+    if (rx.frame.type === RELAY_TYPE.REQUEST) {
+      this.serveRequest(b, rx.frame, rx.wireBytes);
+      const cancel = b.earlyCancels.get(rx.frame.correlation);
+      if (cancel && cancel.targetStream === rx.frame.stream) {
+        b.earlyCancels.delete(rx.frame.correlation);
+        const request = b.incomingRequests.get(rx.frame.correlation);
+        if (request) this.hooks.onCancel?.({ ...cancel, request });
+      }
+      return;
+    }
+    if (rx.frame.type === RELAY_TYPE.RESPONSE
+        && (b.privatePending.has(rx.frame.correlation) || String(rx.frame.metadata.op).startsWith("x."))) {
+      this.deliverPrivateResponse(b, rx.frame, rx.wireBytes); return;
+    }
     if (this.role === "guest") this.deliverGuest(b, rx.frame);
     else this.deliverProvider(b, rx.frame);
   }
@@ -898,7 +1145,6 @@ export class RelayEndpoint {
   }
 
   private deliverProvider(b: Bound, f: RelayDecodedFrame): void {
-    if (f.type === RELAY_TYPE.REQUEST) { this.serveRequest(b, f); return; }
     if (f.type === RELAY_TYPE.INVALIDATE) {
       if (f.metadata.op === RELAY_OP.CACHE_EVICT && validateRelayMetadata(RELAY_OP.CACHE_EVICT, f.metadata) === null) {
         this.hooks.onEvict?.(f.metadata);
@@ -910,23 +1156,29 @@ export class RelayEndpoint {
     this.protocolError(RELAY_ERROR.UNSUPPORTED, `provider received frame type ${f.type}`);
   }
 
-  private serveRequest(b: Bound, f: RelayDecodedFrame): void {
-    const authority = b.authority!;
+  private serveRequest(b: Bound, f: RelayDecodedFrame, wireBytes: number): void {
     const op = f.metadata.op as string;
-    const admitted = b.requests.admitKnown(f.stream, f.correlation);
+    if (f.correlation <= (b.lastIncoming.get(f.stream) ?? 0) || b.incomingRequests.get(f.correlation)) {
+      this.protocolError(RELAY_P3_ERROR.BAD_CORRELATION, `request id ${f.correlation} reused`); return;
+    }
+    b.lastIncoming.set(f.stream, f.correlation);
+    const admitted = b.incomingRequests.admitKnown(f.stream, f.correlation);
     if (!admitted.ok) {
-      if (b.requests.get(f.correlation)) {
-        this.protocolError(RELAY_P3_ERROR.BAD_CORRELATION, `request id ${f.correlation} reused`);
-        return;
-      }
       // The peer exceeded the negotiated maxPending: refused, not dropped.
-      this.respond(authority.answerError(f, op, RELAY_ERROR.BUSY, "request window full"));
+      const refused = b.sender.admit(this.privateError({ ...f, op }, RELAY_ERROR.BUSY, "request window full"));
+      if (!refused.ok) this.fatal(refused.code, "no capacity to refuse excess requests");
       return;
     }
+    const early = b.earlyCancels.get(f.correlation);
+    if (early?.targetStream === f.stream) b.incomingRequests.cancel(f.correlation);
     const request: RelayIncomingRequest = {
       stream: f.stream, correlation: f.correlation, op, metadata: f.metadata, data: f.data, codec: f.codec,
-      cancelRequested: () => b.requests.get(f.correlation)?.cancelRequested ?? false,
+      session: b.session,
+      cancelRequested: () => b.incomingRequests.get(f.correlation)?.cancelRequested ?? false,
     };
+    if (op.startsWith("x.")) { this.servePrivateRequest(b, request, wireBytes); return; }
+    const authority = b.authority;
+    if (!authority) { this.enqueue(b, this.privateError(request, RELAY_ERROR.UNSUPPORTED)); return; }
     switch (op) {
       case RELAY_OP.RESOURCE_SUBSCRIBE: this.respond(authority.answerSubscribe(f)); return;
       case RELAY_OP.RESOURCE_UNSUBSCRIBE: this.respond(authority.answerUnsubscribe(f)); return;
@@ -939,7 +1191,6 @@ export class RelayEndpoint {
         return;
       }
       default:
-        if (this.hooks.onRequest?.(request)) return;
         this.respond(authority.answerError(f, op, RELAY_ERROR.UNSUPPORTED, `unknown op ${op}`));
     }
   }
@@ -951,7 +1202,7 @@ export class RelayEndpoint {
     if (!b || this.session.phase !== "ready" || !b.allocations.has(stream)) return 0;
     const correlation = this.session.allocateCorrelation();
     if (correlation === 0) return 0;
-    const slot = b.requests.admitKnown(stream, correlation, this.requestReserve);
+    const slot = b.outgoingRequests.admitKnown(stream, correlation, this.requestReserve);
     if (!slot.ok) return 0;
     const admitted = b.sender.admit({
       type: RELAY_TYPE.REQUEST, stream, metadata, data,
@@ -960,7 +1211,7 @@ export class RelayEndpoint {
     });
     if (!admitted.ok) {
       // No frame left: the slot returns; the correlation stays consumed.
-      b.requests.abandon(correlation);
+      b.outgoingRequests.abandon(correlation);
       return 0;
     }
     // The client registers its pending entry after this call returns; the
@@ -984,10 +1235,13 @@ export class RelayEndpoint {
   private wireCancel(stream: number, correlation: number, reason: string): void {
     const b = this.bound;
     if (!b) return;
-    b.requests.cancel(correlation);
+    const state = b.outgoingRequests.get(correlation);
+    if (!state || state.stream !== stream || state.cancelRequested) return;
+    b.outgoingRequests.cancel(correlation);
     const sent = b.sender.cancel(stream, correlation, reason);
     if (!sent.ok && sent.code === RELAY_P3_ERROR.SIDEBAND_FULL) {
-      b.pendingSideband.push(() => b.sender.cancel(stream, correlation, reason));
+      b.pendingSideband.push(() => b.outgoingRequests.get(correlation)?.stream === stream
+        ? b.sender.cancel(stream, correlation, reason) : { ok: true });
     }
     this.scheduleFlush();
   }
