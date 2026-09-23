@@ -67,6 +67,18 @@ function refMatchesKeyScope(a: RelayResourceRef, b: RelayResourceRef): boolean {
   return a.kind === b.kind && a.ns === b.ns && a.key === b.key && a.rendition === b.rendition;
 }
 
+/** A ref-scoped subscription fixes the resource's revision-independent
+ * identity; its revision advances as pushes arrive. A namespace-scoped
+ * subscription admits every resource kind and key in that namespace. */
+function refMatchesSubscription(
+  filter: { ns: string; kind?: number; key?: string; rendition?: string },
+  ref: RelayResourceRef,
+): boolean {
+  if (filter.ns !== ref.ns) return false;
+  if (filter.kind === undefined) return true;
+  return filter.kind === ref.kind && filter.key === ref.key && filter.rendition === ref.rendition;
+}
+
 /** Session-scoped u32 allocator. Ids start at 1 and are never reused; after
  * 0xffffffff the allocator refuses instead of wrapping (§3.3/§3.6). */
 export class RelayIdAllocator {
@@ -777,6 +789,9 @@ export class RelayResourceClient {
     const sub = this.subscriptions.get(meta.subscription as number);
     if (!sub) return; // post-unsubscribe/unknown push: consumed and dropped
     const ref = meta.resource as RelayResourceRef;
+    if (frame.stream !== sub.stream || !refMatchesSubscription(sub.filter, ref)) {
+      this.failSubscription(sub.id, { code: RELAY_ERROR.INVALID }); return;
+    }
     if (frame.codec === RELAY_CODEC.JSON && frame.data.length && meta.value !== undefined) {
       this.failSubscription(sub.id, { code: RELAY_ERROR.INVALID }); return;
     }
@@ -1223,6 +1238,17 @@ export class RelayResourceAuthority {
 
   subscriptionEntry(id: number): RelayAuthoritySubscription | undefined {
     return this.subscriptions.get(id);
+  }
+
+  /** Whether a push ref is inside the filter installed for this active
+   * subscription. The revision is allowed to advance. */
+  admitsPush(id: number, stream: number, ref: RelayResourceRef): boolean {
+    const sub = this.subscriptions.get(id);
+    if (!sub || !sub.active || sub.stream !== stream) return false;
+    const filter = sub.ref
+      ? { ns: sub.ref.ns, kind: sub.ref.kind, key: sub.ref.key, rendition: sub.ref.rendition }
+      : { ns: sub.ns };
+    return refMatchesSubscription(filter, ref);
   }
   leaseCount(): number {
     return this.leases.size;

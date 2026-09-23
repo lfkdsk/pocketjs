@@ -753,6 +753,9 @@ export class RelayEndpoint {
     if (!b?.authority) return { ok: false, code: RELAY_ERROR.BUSY };
     const sub = b.authority.subscriptionEntry(input.subscription);
     if (!sub || !sub.active || sub.stream !== input.stream) return { ok: false, code: RELAY_ERROR.NOT_FOUND };
+    if (!b.authority.admitsPush(input.subscription, input.stream, input.ref)) {
+      return { ok: false, code: RELAY_ERROR.INVALID };
+    }
     const schemaError = this.checkProductObject(input.stream, input.ref.kind, input.codec, input.data, input.value);
     if (schemaError) return { ok: false, code: RELAY_ERROR.INVALID };
     const plan = b.authority.chunkObject({

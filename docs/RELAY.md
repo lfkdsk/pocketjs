@@ -652,6 +652,12 @@ rendition regression.
   `value.subscription`, a session-scoped u32 that is never reused after
   unsubscribe, and the revision named on its `resource` is the base the
   subscription holds; the request's revision is a starting hint (§3.6). A
+  ref-scoped subscription fixes `(ns, kind, key, rendition)` and permits the
+  revision to advance. A namespace-scoped subscription fixes `ns` and permits
+  every negotiated kind and key in that namespace. `pushObject()` rejects a
+  ref outside the authority's stored filter with `INVALID`; the consumer
+  performs the same stored-filter check and ends an out-of-scope subscription with
+  `INVALID` before publishing the object. A
   reliable delta carries a top-level `baseRevision` and
   applies only when the base equals the held revision; a mismatch sets
   `resyncRequired` and does not guess the base, and a delta alone never
