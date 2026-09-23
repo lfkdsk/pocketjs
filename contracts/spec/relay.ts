@@ -124,6 +124,27 @@ export const RELAY_ERROR = Object.freeze({
 export const RELAY_STATUS = Object.freeze({ OK: "ok", ACCEPTED: "accepted", ERROR: "error" } as const);
 export const RELAY_EFFECT = Object.freeze({ NONE: "none", COMMITTED: "committed", UNKNOWN: "unknown" } as const);
 
+/** Operation identities outlive a transport session. [R5-P06/P10] */
+export interface RelayOperationEpochArgs {
+  ns: string;
+  action: "query" | "advance";
+  /** Required for advance; compare against the provider's current epoch. */
+  expectedEpoch?: string;
+}
+export interface RelayOperationEpochValue { opEpoch: string }
+export interface RelayOperationStatusArgs {
+  authority: string;
+  ns: string;
+  opEpoch: string;
+  opId: string;
+}
+export type RelayOperationState = "pending" | "committed" | "rejected" | "unknown";
+export interface RelayOperationStatusValue {
+  state: RelayOperationState;
+  /** Checked against the profile's installed mutation receipt schemas. */
+  receipt?: unknown;
+}
+
 /** Management and resource op names. Encoded as metadata ASCII names; they
  * are not new frame types. [R5-P06] */
 export const RELAY_OP = Object.freeze({
@@ -302,7 +323,7 @@ export interface RelayPrivateOpDescriptor {
   recovery: RelayPrivateOpRecovery;
   maxWireBytes: number;
   maxObjectBytes: number;
-  /** Durable writes require a registered idempotent receipt query. */
+  /** Durable writes use operation.status or a registered idempotent query. */
   recoveryOp?: string;
 }
 export const RELAY_PRIVATE_OP = Object.freeze({ maxEntries: 16, maxSchemaBytes: 65536 });
@@ -543,7 +564,7 @@ export const RELAY_PRIVATE_OPS_SCHEMA: JsonSchema = {
       recovery: { enum: ["idempotent", "epoch", "durable"] },
       maxWireBytes: { ...u32, minimum: RELAY_FRAME.headerBytes },
       maxObjectBytes: { ...u32, minimum: 1 },
-      recoveryOp: { type: "string", pattern: "^x\\.[a-z][a-z0-9_.-]{0,61}$", maxBytes: 64 },
+      recoveryOp: { type: "string", pattern: "^(operation\\.status|x\\.[a-z][a-z0-9_.-]{0,61})$", maxBytes: 64 },
     },
   },
 };
@@ -621,6 +642,56 @@ function resourceErrorSchema(op: string): JsonSchema {
  * properties reject. Session-layer code applies the schema matching
  * metadata.op before acting on the message. */
 export const RELAY_METADATA_SCHEMAS: Readonly<Record<string, JsonSchema>> = Object.freeze({
+  [`${RELAY_OP.OPERATION_EPOCH}.request`]: {
+    type: "object", additionalProperties: false, required: ["op", "args"],
+    properties: {
+      op: { const: RELAY_OP.OPERATION_EPOCH },
+      args: {
+        type: "object", additionalProperties: false, required: ["ns", "action"],
+        properties: {
+          ns: { type: "string", minLength: 1, maxBytes: RELAY_RESOURCE.nsMaxBytes },
+          action: { enum: ["query", "advance"] }, expectedEpoch: hex16,
+        },
+      },
+    },
+  },
+  [`${RELAY_OP.OPERATION_EPOCH}.response`]: {
+    type: "object", additionalProperties: false, required: ["op", "status", "final", "value"],
+    properties: {
+      op: { const: RELAY_OP.OPERATION_EPOCH }, status: { const: RELAY_STATUS.OK }, final: { const: true },
+      value: { type: "object", additionalProperties: false, required: ["opEpoch"], properties: { opEpoch: hex16 } },
+    },
+  },
+  [`${RELAY_OP.OPERATION_STATUS}.request`]: {
+    type: "object", additionalProperties: false, required: ["op", "args"],
+    properties: {
+      op: { const: RELAY_OP.OPERATION_STATUS },
+      args: {
+        type: "object", additionalProperties: false, required: ["authority", "ns", "opEpoch", "opId"],
+        properties: {
+          authority: { type: "string", minLength: 1, maxBytes: 128 },
+          ns: { type: "string", minLength: 1, maxBytes: RELAY_RESOURCE.nsMaxBytes },
+          opEpoch: hex16, opId: hex32,
+        },
+      },
+    },
+  },
+  [`${RELAY_OP.OPERATION_STATUS}.response`]: {
+    type: "object", additionalProperties: false, required: ["op", "status", "final", "value"],
+    properties: {
+      op: { const: RELAY_OP.OPERATION_STATUS }, status: { const: RELAY_STATUS.OK }, final: { const: true },
+      value: {
+        type: "object", additionalProperties: false, required: ["state"],
+        properties: {
+          state: { enum: ["pending", "committed", "rejected", "unknown"] },
+          // prepareOperation applies the installed product receipt schema.
+          receipt: {},
+        },
+      },
+    },
+  },
+  [`${RELAY_OP.OPERATION_EPOCH}.error`]: controlErrorSchema(RELAY_OP.OPERATION_EPOCH),
+  [`${RELAY_OP.OPERATION_STATUS}.error`]: controlErrorSchema(RELAY_OP.OPERATION_STATUS),
   [`${RELAY_OP.HELLO}.request`]: {
     type: "object",
     additionalProperties: false,
