@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { connect as connectSocket } from "node:net";
 import { attachRelayChannel, relaySocketChannel, serveRelayTcp, type RelayProviderConnection } from "../tools/relay-wire.ts";
 import {
@@ -6,13 +6,20 @@ import {
   type RelayProfileEntry, type RelayRxLimits,
 } from "../contracts/spec/relay.ts";
 import {
-  RelayEndpoint, type RelayEndpointHooks, type RelayIncomingRequest, type RelayPrivateOp, type RelayPrivateSchema,
+  RelayEndpoint, RelayOperationAuthority, type RelayEndpointHooks, type RelayIncomingRequest, type RelayPrivateOp, type RelayPrivateSchema,
 } from "../framework/src/relay/endpoint.ts";
+import { SqliteOperationStore } from "./helpers/relay-operation-store.ts";
 import { decodeFrame, encodeFrame, type RelayDecodedFrame } from "../framework/src/relay/frame.ts";
 import type { RelayLocalCapabilities, RelayScheduler } from "../framework/src/relay/session.ts";
 
 const PROFILE = { name: "org.example.commands", version: 1 };
 const OTHER = { name: "org.example.other", version: 1 };
+const operationStores: SqliteOperationStore[] = [];
+afterEach(() => { for (const store of operationStores.splice(0)) store.db.close(); });
+const operationAuthority = (role: string) => {
+  const store = new SqliteOperationStore(); operationStores.push(store);
+  return new RelayOperationAuthority({ id: `authority-${role}`, store });
+};
 const RX: RelayRxLimits = {
   maxWireBytes: 4096, maxMetaBytes: 2048, windowFrames: 8, windowBytes: 32768,
   maxPending: 8, maxObjectBytes: 131072, maxAssemblies: 2, maxScratchBytes: 262144,
@@ -71,6 +78,7 @@ function pair(options: {
     endpoints[role] = new RelayEndpoint({ role,
       local: capabilities(role === "guest" ? options.guestCaps : options.providerCaps),
       privateOps: (role === "guest" ? options.guestOps : options.providerOps) ?? [op()],
+      operations: operationAuthority(role),
       transport: { peer: { id: `peer-${role}`, grants: ["example"] }, trySend: bytes => route(role, bytes) },
       hooks: role === "guest" ? options.guestHooks : options.providerHooks,
       scheduler: scheduler(), randomBytes: n => new Uint8Array(n).fill(randomSeed++),
@@ -544,15 +552,16 @@ test("private durable registration requires a receipt query and validates write 
   await link.settle();
   expect(p.requests[0].metadata).toMatchObject({ opEpoch: "0".repeat(15) + "1", opId: "a".repeat(32) });
   expect(link.provider.replyValue(p.requests[0], { ack: 1 })).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
-  link.provider.replyValue(p.requests[0], { receipt: "committed-1" }); await link.settle();
-  expect(await call).toEqual({ ok: true, value: { receipt: "committed-1" } });
+  p.requests[0].operation!.commit({ receipt: "committed-1" }, () => {}); await link.settle();
+  expect(await call).toEqual({ ok: true, value: { receipt: "committed-1" }, effect: RELAY_EFFECT.COMMITTED });
 });
 
 test("private reset and disconnect settle once, fence old callbacks and never replay epoch commands", async () => {
   for (const recovery of ["idempotent", "epoch"] as const) {
     const definition = op({ recovery }), p = heldRequests();
     const link = pair({ guestOps: [definition], providerOps: [definition], providerHooks: p.hooks });
-    let stream = await connect(link), call = link.guest.request(stream, definition.name, { n: 1 }); await link.settle();
+    const ids = recovery === "epoch" ? { opEpoch: "0000000000000001", opId: "a".repeat(32) } : {};
+    let stream = await connect(link), call = link.guest.request(stream, definition.name, { n: 1 }, ids); await link.settle();
     let completions = 0; void call.then(() => completions++);
     link.guest.resetStream(stream, "reset"); await link.settle();
     expect(await call).toMatchObject({ ok: false, error: { code: recovery === "idempotent" ? RELAY_ERROR.RESYNC_REQUIRED : RELAY_ERROR.OUTCOME_UNKNOWN }, effect: "unknown" });
@@ -560,7 +569,7 @@ test("private reset and disconnect settle once, fence old callbacks and never re
     link.guest.handleDisconnect("drop"); link.provider.handleDisconnect("drop");
     stream = await connect(link);
     expect(link.frames("guest").filter(frame => frame.type === RELAY_TYPE.REQUEST && frame.stream !== 0)).toHaveLength(1);
-    call = link.guest.request(stream, definition.name, { n: 2 }); await link.settle();
+    call = link.guest.request(stream, definition.name, { n: 2 }, recovery === "epoch" ? { ...ids, opId: "b".repeat(32) } : {}); await link.settle();
     link.guest.handleDisconnect("drop again"); link.provider.handleDisconnect("drop again");
     expect((await call).ok).toBe(false);
   }
@@ -672,9 +681,10 @@ test("private handler exceptions return OUTCOME_UNKNOWN once after an admitted c
 
 test("private automatic errors that exceed the op budget reset instead of stranding the caller", async () => {
   for (const handler of [undefined, () => { throw new Error("product failure"); }]) {
-    const definition = op({ maxWireBytes: 128, recovery: "epoch" });
+    const definition = op({ maxWireBytes: 180, recovery: "epoch" });
     const link = pair({ guestOps: [definition], providerOps: [definition], providerHooks: { onRequest: handler } });
-    const stream = await connect(link), call = link.guest.request(stream, definition.name, { n: 1 });
+    const stream = await connect(link), call = link.guest.request(stream, definition.name, { n: 1 },
+      { opEpoch: "0000000000000001", opId: "a".repeat(32) });
     const results: unknown[] = [];
     void call.then(result => results.push(result));
     await link.settle();
@@ -750,7 +760,7 @@ test("private durable disconnect is OUTCOME_UNKNOWN and reconnect sends no mutat
     value: closed({ receipt: { type: "string" } }) });
   const p = heldRequests(), link = pair({ guestOps: [query, write], providerOps: [query, write], providerHooks: p.hooks });
   const stream = await connect(link);
-  const call = link.guest.request(stream, write.name, { n: 1 }, { opId: "a".repeat(32), opEpoch: "1".repeat(16) });
+  const call = link.guest.request(stream, write.name, { n: 1 }, { opId: "a".repeat(32), opEpoch: "0000000000000001" });
   await link.settle(); link.guest.handleDisconnect("unknown write"); link.provider.handleDisconnect("unknown write");
   expect(await call).toEqual({ ...failure(RELAY_ERROR.OUTCOME_UNKNOWN), effect: RELAY_EFFECT.UNKNOWN });
   await connect(link);

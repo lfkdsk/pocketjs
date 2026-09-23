@@ -1,6 +1,6 @@
 /** Profile-owned REQUEST definitions. Schemas never cross the transport. */
 import {
-  RELAY_CODEC, RELAY_EFFECT, RELAY_ERROR, RELAY_LIMITS, RELAY_PRIVATE_OP,
+  RELAY_CODEC, RELAY_EFFECT, RELAY_ERROR, RELAY_LIMITS, RELAY_OP, RELAY_PRIVATE_OP,
   RELAY_PRIVATE_OPS_SCHEMA, RELAY_STATUS, RELAY_TYPE,
   type RelayPrivateOpDescriptor, type RelayPrivateOpDirection, type RelayProfileEntry, type RelayRxLimits,
 } from "../../../contracts/spec/relay.ts";
@@ -43,7 +43,7 @@ export function freezeRelayCopy<T>(value: T): T {
 }
 
 const hasRecoveryQuery = (op: RelayPrivateOpDescriptor, entries: readonly RelayPrivateOpDescriptor[]): boolean =>
-  op.recovery !== "durable" || entries.some(query => query.name === op.recoveryOp
+  op.recovery !== "durable" || op.recoveryOp === RELAY_OP.OPERATION_STATUS || entries.some(query => query.name === op.recoveryOp
     && samePrivateProfile(query.profile, op.profile) && query.recovery === "idempotent"
     && (directionMask(query.direction) & directionMask(op.direction)) === directionMask(op.direction));
 
@@ -148,7 +148,7 @@ function envelopeSchema(op: RelayPrivateOp | undefined, input: RelayFrameBodyInp
   if (input.type === RELAY_TYPE.REQUEST) {
     properties.args = op!.args;
     required.push("args");
-    if (op!.recovery === "durable") {
+    if (op!.recovery !== "idempotent") {
       properties.opEpoch = hex16; properties.opId = hex32;
       required.push("opEpoch", "opId");
     }
@@ -161,6 +161,9 @@ function envelopeSchema(op: RelayPrivateOp | undefined, input: RelayFrameBodyInp
       properties.error = errorSchema; required.push("error");
       properties.effect = { enum: Object.values(RELAY_EFFECT) };
       if ((input.metadata.error as { code?: string } | undefined)?.code === RELAY_ERROR.CANCELLED) required.push("effect");
+    }
+    if (op && op.recovery !== "idempotent" && input.metadata.status !== RELAY_STATUS.ACCEPTED) {
+      properties.effect = { enum: Object.values(RELAY_EFFECT) }; required.push("effect");
     }
   }
   return { type: "object", additionalProperties: false, required, properties };
@@ -183,6 +186,13 @@ export function preparePrivateOp(
   const metadata = JSON.parse(new TextDecoder().decode(prepared.body.meta)) as Record<string, unknown>;
   const invalid = validateRelaySchema(envelopeSchema(op, { ...input, metadata }), metadata);
   if (invalid) return { ok: false, code: RELAY_ERROR.INVALID };
+  if (input.type === RELAY_TYPE.RESPONSE && op?.recovery !== "idempotent" && op) {
+    if ((metadata.status === RELAY_STATUS.OK && metadata.effect !== RELAY_EFFECT.COMMITTED)
+        || ((metadata.error as { code?: string } | undefined)?.code === RELAY_ERROR.CANCELLED && metadata.effect !== RELAY_EFFECT.NONE)
+        || (metadata.status === RELAY_STATUS.ERROR && metadata.effect === RELAY_EFFECT.COMMITTED)) {
+      return { ok: false, code: RELAY_ERROR.INVALID };
+    }
+  }
   const value = input.type === RELAY_TYPE.REQUEST ? metadata.args : metadata.value;
   if (value !== undefined && new TextEncoder().encode(JSON.stringify(value)).length
       > Math.min(op!.maxObjectBytes, limits.maxObjectBytes)) return { ok: false, code: RELAY_ERROR.TOO_LARGE };

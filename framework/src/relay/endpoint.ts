@@ -46,6 +46,10 @@ import {
   type RelayResourceRef,
   type RelayRxLimits,
   type RelayErrorBody,
+  type RelayOperationEpochArgs,
+  type RelayOperationEpochValue,
+  type RelayOperationStatusArgs,
+  type RelayOperationStatusValue,
 } from "../../../contracts/spec/relay.ts";
 import type { ResourceResult } from "../resource-cache.ts";
 import { RelayChunkAssembler } from "./assembler.ts";
@@ -73,6 +77,12 @@ import {
 export type { RelayPrivateOp, RelayPrivateSchema } from "./private-op.ts";
 import { RelayResourceForms, type RelayResourceForm } from "./resource-form.ts";
 export type { RelayResourceForm } from "./resource-form.ts";
+import {
+  RelayMemoryOperationStore, RelayOperationAuthority, isOperationOp, prepareOperation,
+  type RelayOperationIdentity, type RelayOperationOp,
+} from "./operation.ts";
+export { RelayMemoryOperationStore, RelayOperationAuthority, RelayOperationStoreError } from "./operation.ts";
+export type { RelayOperationStore, RelayOperationScope, RelayOperationNamespace, RelayOperationIdentity } from "./operation.ts";
 import {
   RelayResourceAuthority,
   RelayResourceClient,
@@ -116,6 +126,19 @@ export interface RelayIncomingRequest {
   /** True once the peer sent request.cancel for this correlation. The
    * request still needs its one terminal (§3.6). */
   cancelRequested(): boolean;
+  /** Present on epoch/durable mutations. Commit through this handle so
+   * cancellation and the receipt share the side effect's transaction. */
+  operation?: RelayIncomingOperation;
+}
+
+export interface RelayIncomingOperation {
+  readonly identity: Readonly<RelayOperationIdentity>;
+  /** Validate the result before applying the effect. The storage driver
+   * must transact both; a thrown/async callback cannot count as a commit. */
+  commit(value: unknown, apply: () => void): { ok: true } | { ok: false; code: string };
+  /** Resolve an unknown outcome from external evidence; never runs an effect. */
+  reconcile(result: { state: "committed"; value: unknown } | { state: "rejected"; code: string; message?: string }):
+    { ok: true } | { ok: false; code: string };
 }
 
 export interface RelayEndpointHooks {
@@ -154,6 +177,9 @@ export interface RelayEndpointOptions {
    * (profile, kind) and the one args key each form owns. Nothing crosses
    * the wire. */
   resourceForms?: readonly RelayResourceForm[];
+  /** Reuse across authenticated connections. Incoming durable definitions
+   * require a durable transaction store. The default supports input epochs. */
+  operations?: RelayOperationAuthority;
   hooks?: RelayEndpointHooks;
   scheduler?: RelayScheduler;
   randomBytes?: RelayRandomBytes;
@@ -173,12 +199,12 @@ export interface RelayEndpointOptions {
   outboxFrames?: number;
 }
 
-export type RelayPrivateResult =
-  | { ok: true; value: unknown }
+export type RelayPrivateResult<T = unknown> =
+  | { ok: true; value: T; effect?: string }
   | { ok: false; error: RelayErrorBody; effect?: string };
 
 /** Await the one terminal. A local refusal has correlation 0 and sends nothing. */
-export interface RelayPrivateCall extends Promise<RelayPrivateResult> {
+export interface RelayPrivateCall<T = unknown> extends Promise<RelayPrivateResult<T>> {
   readonly correlation: number;
   cancel(reason?: string): void;
 }
@@ -224,7 +250,9 @@ interface Bound {
   outgoingRequests: RelayRequestTable;
   incomingRequests: RelayRequestTable;
   privatePending: Map<number, { stream: number; op: RelayPrivateOp; resolve: (result: RelayPrivateResult) => void }>;
-  privateIncoming: Map<number, { request: RelayIncomingRequest; op: RelayPrivateOp; terminalQueued: boolean; accepted: boolean }>;
+  operationPending: Map<number, { stream: number; op: RelayOperationOp; resolve: (result: RelayPrivateResult) => void }>;
+  privateIncoming: Map<number, { request: RelayIncomingRequest; op: RelayPrivateOp; terminalQueued: boolean; accepted: boolean;
+    identity?: RelayOperationIdentity; owner?: boolean; detach?: () => void }>;
   earlyCancels: Map<number, { targetStream: number; correlation: number; reason: string }>;
   lastIncoming: Map<number, number>;
   assembler?: RelayChunkAssembler;
@@ -280,6 +308,7 @@ export class RelayEndpoint {
   private readonly requestReserve: number;
   private readonly privateOps: readonly RelayPrivateOp[];
   private readonly resourceForms: RelayResourceForms;
+  private readonly operations: RelayOperationAuthority;
   private bound: Bound | null = null;
   private flushing = false;
   private drainingOutbox = false;
@@ -304,6 +333,14 @@ export class RelayEndpoint {
     if (options.local.opExt?.length) throw new Error("RelayEndpoint derives opExt from privateOps");
     this.privateOps = installPrivateOps(options.privateOps ?? [], options.local.profiles, options.local.rxLimits);
     this.resourceForms = new RelayResourceForms(options.resourceForms ?? [], options.local.profiles);
+    const inputEpoch = !options.operations && options.randomBytes
+      ? Array.from(options.randomBytes(8), byte => byte.toString(16).padStart(2, "0")).join("") : undefined;
+    this.operations = options.operations ?? new RelayOperationAuthority({ id: "session-input",
+      store: new RelayMemoryOperationStore(64, inputEpoch) });
+    const peerRole = this.role === "guest" ? "provider" : "guest";
+    if (!this.operations.durable && this.privateOps.some(op => op.recovery === "durable" && privateOpAllows(op, peerRole))) {
+      throw new Error("incoming durable ops require a durable operation store");
+    }
     this.session = createRelaySession({
       role: options.role,
       local: { ...options.local, opExt: privateDescriptors(this.privateOps) },
@@ -395,6 +432,10 @@ export class RelayEndpoint {
   // --- profile-owned REQUESTs (both roles) ---------------------------------------------
 
   request(stream: number, name: string, args: unknown, options: RelayPrivateRequestOptions = {}): RelayPrivateCall {
+    if (isOperationOp(name)) {
+      if (Object.keys(options).length) return this.refuseOperation(RELAY_ERROR.INVALID);
+      return this.requestOperation(stream, name, args);
+    }
     const refused = (code: string): RelayPrivateCall => Object.assign(
       Promise.resolve<RelayPrivateResult>({ ok: false, error: { code, message: code } }),
       { correlation: 0, cancel: () => {} },
@@ -425,11 +466,56 @@ export class RelayEndpoint {
     return call;
   }
 
-  /** One successful private terminal. Errors use replyError(); accepted uses respond(). */
+  operationEpoch(stream: number, args: RelayOperationEpochArgs): RelayPrivateCall<RelayOperationEpochValue> {
+    return this.requestOperation(stream, RELAY_OP.OPERATION_EPOCH, args) as RelayPrivateCall<RelayOperationEpochValue>;
+  }
+
+  operationStatus(stream: number, args: RelayOperationStatusArgs): RelayPrivateCall<RelayOperationStatusValue> {
+    return this.requestOperation(stream, RELAY_OP.OPERATION_STATUS, args) as RelayPrivateCall<RelayOperationStatusValue>;
+  }
+
+  private refuseOperation(code: string): RelayPrivateCall {
+    return Object.assign(Promise.resolve<RelayPrivateResult>({ ok: false, error: { code, message: code } }),
+      { correlation: 0, cancel: () => {} });
+  }
+
+  private streamOps(stream: number): RelayPrivateOp[] {
+    return (this.session.streamInfo(stream)?.opExt ?? []).map(op => this.privateOp(stream, op.name)!).filter(Boolean);
+  }
+
+  private requestOperation(stream: number, op: RelayOperationOp, args: unknown): RelayPrivateCall {
+    const b = this.bound, binding = this.session.streamInfo(stream);
+    if (!binding || stream === 0) return this.refuseOperation(RELAY_ERROR.UNSUPPORTED);
+    const definitions = this.streamOps(stream);
+    if (!definitions.some(op => op.recovery !== "idempotent" && privateOpAllows(op, this.role))) {
+      return this.refuseOperation(RELAY_ERROR.UNSUPPORTED);
+    }
+    if (!b || this.phase !== "ready" || !b.allocations.has(stream)) return this.refuseOperation(RELAY_ERROR.BUSY);
+    const prepared = prepareOperation(op, { type: RELAY_TYPE.REQUEST, stream, metadata: { op, args } }, binding.rxLimits, definitions);
+    if (!prepared.ok) return this.refuseOperation(prepared.code);
+    if ((prepared.metadata.args as { ns: string }).ns !== binding.namespace) return this.refuseOperation(RELAY_ERROR.UNAUTHORIZED);
+    const correlation = this.session.allocateCorrelation();
+    if (!correlation) return this.refuseOperation(RELAY_ERROR.RESYNC_REQUIRED);
+    if (!b.outgoingRequests.admitKnown(stream, correlation).ok) return this.refuseOperation(RELAY_ERROR.BUSY);
+    const admitted = b.sender.admit({ type: RELAY_TYPE.REQUEST, stream, correlation, metadata: prepared.metadata,
+      priority: RELAY_PRIORITY.CONTROL, association: { kind: "correlation", id: correlation } });
+    if (!admitted.ok) { b.outgoingRequests.abandon(correlation); return this.refuseOperation(admitted.code); }
+    const result = new Promise<RelayPrivateResult>(resolve => b.operationPending.set(correlation, { stream, op, resolve }));
+    const call = Object.assign(result, { correlation, cancel: (reason = "cancel") => {
+      if (this.bound === b && b.operationPending.has(correlation)) { this.wireCancel(stream, correlation, reason); this.flush(); }
+    } });
+    this.flush();
+    return call;
+  }
+
+  /** One successful idempotent terminal. Mutations commit through their
+   * operation handle. Errors use replyError(); accepted uses respond(). */
   replyValue(request: RelayIncomingRequest, value: unknown): { ok: true } | { ok: false; code: string } {
     if (request.session !== this.bound?.session) return { ok: false, code: RELAY_ERROR.RESYNC_REQUIRED };
+    const mutation = this.bound?.privateIncoming.get(request.correlation)?.op.recovery !== "idempotent"
+      && this.bound?.privateIncoming.has(request.correlation);
     return this.respond({ type: RELAY_TYPE.RESPONSE, stream: request.stream, correlation: request.correlation,
-      metadata: { op: request.op, status: RELAY_STATUS.OK, final: true, value } });
+      metadata: { op: request.op, status: RELAY_STATUS.OK, final: true, value, ...(mutation ? { effect: RELAY_EFFECT.COMMITTED } : {}) } });
   }
 
   private privateOp(stream: number, name: string): RelayPrivateOp | undefined {
@@ -464,6 +550,12 @@ export class RelayEndpoint {
     const limits = this.session.streamInfo(envelope.stream)!.rxLimits;
     const prepared = preparePrivateOp(pending.op, envelope, limits);
     if (!prepared.ok) return prepared;
+    if (pending.identity && prepared.metadata.final === true) {
+      const stored = this.operations.finish(pending.identity, prepared.metadata);
+      if (!stored.ok) return stored;
+      // Store listeners publish to every correlation observing this operation.
+      return { ok: true };
+    }
     // Mark before enqueuing: one terminal (and at most one accepted) per admitted request.
     if (prepared.metadata.final === true) pending.terminalQueued = true;
     else pending.accepted = true;
@@ -478,15 +570,47 @@ export class RelayEndpoint {
     if (!op || !privateOpAllows(op, peerRole)) {
       this.enqueue(b, this.privateError(request, RELAY_ERROR.UNSUPPORTED)); return;
     }
-    if (wireBytes > op.maxWireBytes) { this.enqueue(b, this.privateError(request, RELAY_ERROR.TOO_LARGE)); return; }
+    const noEffect = op.recovery === "idempotent" ? undefined : RELAY_EFFECT.NONE;
+    if (wireBytes > op.maxWireBytes) { this.enqueue(b, this.privateError(request, RELAY_ERROR.TOO_LARGE, undefined, noEffect)); return; }
     const prepared = preparePrivateOp(op, { type: RELAY_TYPE.REQUEST, ...request },
       this.session.streamInfo(request.stream)!.rxLimits);
-    if (!prepared.ok) { this.enqueue(b, this.privateError(request, prepared.code)); return; }
+    if (!prepared.ok) { this.enqueue(b, this.privateError(request, prepared.code, undefined, noEffect)); return; }
     b.privateIncoming.set(request.correlation, { request, op, terminalQueued: false, accepted: false });
+    if (op.recovery !== "idempotent") {
+      const began = this.operations.begin(this.peer.id, this.session.streamInfo(request.stream)!.namespace, op,
+        prepared.metadata.opEpoch as string, prepared.metadata.opId as string, prepared.metadata.args);
+      if (!began.ok) {
+        const refused = this.replyError(request, began.code, began.code,
+          began.code === RELAY_ERROR.OUTCOME_UNKNOWN ? RELAY_EFFECT.UNKNOWN : RELAY_EFFECT.NONE);
+        if (!refused.ok) this.resetStream(request.stream, `operation admission refused: ${refused.code}`);
+        return;
+      }
+      const pending = b.privateIncoming.get(request.correlation)!;
+      pending.identity = began.value.identity;
+      pending.owner = began.value.fresh;
+      const observed = this.operations.observing(began.value.identity);
+      request.operation = this.operationHandle(op, began.value.identity, this.session.streamInfo(request.stream)!.rxLimits);
+      pending.detach = this.operations.watch(began.value.identity, terminal => this.publishOperation(b, request, terminal));
+      if (began.value.record.terminal) { this.publishOperation(b, request, began.value.record.terminal); return; }
+      if (request.cancelRequested()) { this.cancelOperation(b, request.correlation); return; }
+      if (!began.value.fresh) {
+        if (!observed) {
+          // Another authority process or its journal owns this pending work.
+          // No local completion callback exists; finish this observer with
+          // unknown so it can query, without altering the operation record.
+          this.publishOperation(b, request, this.privateError(request, RELAY_ERROR.OUTCOME_UNKNOWN,
+            "query pending operation", RELAY_EFFECT.UNKNOWN).metadata);
+          return;
+        }
+        this.respondPrivate(b, { type: RELAY_TYPE.RESPONSE, stream: request.stream, correlation: request.correlation,
+          metadata: { op: op.name, status: RELAY_STATUS.ACCEPTED, final: false } });
+        return;
+      }
+    }
     let answered: { ok: true } | { ok: false; code: string };
     try {
       if (this.hooks.onRequest?.(request)) return;
-      answered = this.replyError(request, RELAY_ERROR.UNSUPPORTED, "no private op handler");
+      answered = this.replyError(request, RELAY_ERROR.UNSUPPORTED, "no private op handler", noEffect);
     } catch {
       // A product handler failure may follow a side effect. Never imply it was uncommitted.
       answered = this.replyError(request, RELAY_ERROR.OUTCOME_UNKNOWN, "private op handler failed", RELAY_EFFECT.UNKNOWN);
@@ -496,6 +620,48 @@ export class RelayEndpoint {
       // Reset owns the terminal outcome when no response can fit that budget.
       this.resetStream(request.stream, `private error refused: ${answered.code}`);
     }
+  }
+
+  private operationHandle(op: RelayPrivateOp, identity: RelayOperationIdentity, limits: RelayRxLimits): RelayIncomingOperation {
+    const finish = (metadata: Record<string, unknown>, apply?: () => void, reconcile = false): { ok: true } | { ok: false; code: string } => {
+      const prepared = preparePrivateOp(op, { type: RELAY_TYPE.RESPONSE, stream: 1, metadata }, limits);
+      if (!prepared.ok) return prepared;
+      const stored = this.operations.finish(identity, prepared.metadata, { apply, reconcile });
+      if (!stored.ok) return stored;
+      if (stored.value.effect === RELAY_EFFECT.UNKNOWN) return { ok: false, code: RELAY_ERROR.OUTCOME_UNKNOWN };
+      if (metadata.status === RELAY_STATUS.OK && stored.value.status !== RELAY_STATUS.OK) {
+        return { ok: false, code: (stored.value.error as { code: string }).code };
+      }
+      if (reconcile && metadata.effect !== stored.value.effect) return { ok: false, code: RELAY_ERROR.STALE_BASE };
+      return { ok: true };
+    };
+    return Object.freeze({ identity,
+      commit: (value: unknown, apply: () => void) => finish(
+        { op: op.name, status: RELAY_STATUS.OK, final: true, effect: RELAY_EFFECT.COMMITTED, value }, apply),
+      reconcile: (result: { state: "committed"; value: unknown } | { state: "rejected"; code: string; message?: string }) =>
+        result.state === "committed"
+          ? finish({ op: op.name, status: RELAY_STATUS.OK, final: true, effect: RELAY_EFFECT.COMMITTED, value: result.value }, undefined, true)
+          : finish(this.privateError({ stream: 1, correlation: 1, op: op.name }, result.code, result.message, RELAY_EFFECT.NONE).metadata, undefined, true),
+    });
+  }
+
+  private publishOperation(b: Bound, request: RelayIncomingRequest, metadata: Record<string, unknown>): void {
+    const pending = b.privateIncoming.get(request.correlation);
+    if (this.bound !== b || !pending || pending.request !== request || pending.terminalQueued) return;
+    const prepared = preparePrivateOp(pending.op, { type: RELAY_TYPE.RESPONSE, stream: request.stream, metadata },
+      this.session.streamInfo(request.stream)!.rxLimits);
+    if (!prepared.ok) { this.resetStream(request.stream, `operation terminal refused: ${prepared.code}`); return; }
+    pending.terminalQueued = true; pending.detach?.();
+    this.enqueue(b, { type: RELAY_TYPE.RESPONSE, stream: request.stream, correlation: request.correlation, metadata: prepared.metadata });
+    this.flush();
+  }
+
+  private cancelOperation(b: Bound, correlation: number): void {
+    const pending = b.privateIncoming.get(correlation);
+    if (!pending?.identity || pending.terminalQueued) return;
+    const cancelled = this.operations.finish(pending.identity,
+      this.privateError(pending.request, RELAY_ERROR.CANCELLED, "cancelled before commit", RELAY_EFFECT.NONE).metadata);
+    if (!cancelled.ok) this.resetStream(pending.request.stream, `operation cancel refused: ${cancelled.code}`);
   }
 
   private deliverPrivateResponse(b: Bound, frame: RelayDecodedFrame, wireBytes: number): void {
@@ -517,7 +683,7 @@ export class RelayEndpoint {
     if (frame.metadata.final !== true) return;
     const meta = prepared.metadata;
     this.completePrivate(b, frame.correlation, meta.status === RELAY_STATUS.OK
-      ? { ok: true, value: meta.value }
+      ? { ok: true, value: meta.value, ...(meta.effect === undefined ? {} : { effect: meta.effect as string }) }
       : { ok: false, error: meta.error as RelayErrorBody, ...(meta.effect === undefined ? {} : { effect: meta.effect as string }) });
   }
 
@@ -540,7 +706,16 @@ export class RelayEndpoint {
       const code = pending.op.recovery === "idempotent" ? RELAY_ERROR.RESYNC_REQUIRED : RELAY_ERROR.OUTCOME_UNKNOWN;
       pending.resolve({ ok: false, error: { code, message: code }, effect: RELAY_EFFECT.UNKNOWN });
     }
-    for (const [id, pending] of b.privateIncoming) if (stream === undefined || pending.request.stream === stream) b.privateIncoming.delete(id);
+    for (const [correlation, pending] of b.operationPending) {
+      if (stream !== undefined && pending.stream !== stream) continue;
+      b.operationPending.delete(correlation);
+      pending.resolve({ ok: false, error: { code: RELAY_ERROR.RESYNC_REQUIRED, message: RELAY_ERROR.RESYNC_REQUIRED } });
+    }
+    for (const [id, pending] of b.privateIncoming) if (stream === undefined || pending.request.stream === stream) {
+      pending.detach?.(); b.privateIncoming.delete(id);
+      if (pending.identity && pending.owner && !pending.terminalQueued) this.operations.finish(pending.identity,
+        this.privateError(pending.request, RELAY_ERROR.OUTCOME_UNKNOWN, "session ended", RELAY_EFFECT.UNKNOWN).metadata);
+    }
     for (const [id, cancel] of b.earlyCancels) if (stream === undefined || cancel.targetStream === stream) b.earlyCancels.delete(id);
   }
 
@@ -659,7 +834,7 @@ export class RelayEndpoint {
   /** Withdraw interest in an in-flight get: request.cancel on the
    * sideband; the slot frees when the one terminal is consumed. */
   cancel(correlation: number, reason = "cancel"): void {
-    const pending = this.bound?.privatePending.get(correlation);
+    const pending = this.bound?.privatePending.get(correlation) ?? this.bound?.operationPending.get(correlation);
     if (pending) { this.wireCancel(pending.stream, correlation, reason); this.flush(); return; }
     this.bound?.client?.cancel(correlation, reason);
     this.flush();
@@ -967,6 +1142,7 @@ export class RelayEndpoint {
     });
     if (recorded.ok) {
       b.incomingRequests.consumeTerminal(env.correlation);
+      b.privateIncoming.get(env.correlation)?.detach?.();
       b.privateIncoming.delete(env.correlation);
     }
   }
@@ -1012,7 +1188,8 @@ export class RelayEndpoint {
     const bound: Bound = {
       session, negotiation, sideband, creditTable, sender, allocations, receiver,
       requests: this.role === "guest" ? outgoingRequests : incomingRequests,
-      outgoingRequests, incomingRequests, privatePending: new Map(), privateIncoming: new Map(), lastIncoming: new Map(), earlyCancels: new Map(),
+      outgoingRequests, incomingRequests, privatePending: new Map(), operationPending: new Map(),
+      privateIncoming: new Map(), lastIncoming: new Map(), earlyCancels: new Map(),
       demand: new Map(), pendingSideband: [], streamsByNs: new Map(),
     };
     if (this.role === "guest") {
@@ -1167,6 +1344,7 @@ export class RelayEndpoint {
       return;
     }
     if (state) b.incomingRequests.cancel(frame.correlation);
+    this.cancelOperation(b, frame.correlation);
     this.hooks.onCancel?.({
       targetStream: frame.metadata.targetStream as number,
       correlation: frame.correlation,
@@ -1243,6 +1421,10 @@ export class RelayEndpoint {
         if (request) this.hooks.onCancel?.({ ...cancel, request });
       }
       return;
+    }
+    if (rx.frame.type === RELAY_TYPE.RESPONSE
+        && (b.operationPending.has(rx.frame.correlation) || isOperationOp(String(rx.frame.metadata.op)))) {
+      this.deliverOperationResponse(b, rx.frame); return;
     }
     if (rx.frame.type === RELAY_TYPE.RESPONSE
         && (b.privatePending.has(rx.frame.correlation) || String(rx.frame.metadata.op).startsWith("x."))) {
@@ -1324,6 +1506,7 @@ export class RelayEndpoint {
       cancelRequested: () => b.incomingRequests.get(f.correlation)?.cancelRequested ?? false,
     };
     if (op.startsWith("x.")) { this.servePrivateRequest(b, request, wireBytes); return; }
+    if (isOperationOp(op)) { this.serveOperationRequest(b, request, op); return; }
     const authority = b.authority;
     if (!authority) { this.enqueue(b, this.privateError(request, RELAY_ERROR.UNSUPPORTED)); return; }
     const ref = f.metadata.resource as RelayResourceRef | undefined;
@@ -1348,6 +1531,43 @@ export class RelayEndpoint {
       default:
         this.respond(authority.answerError(f, op, RELAY_ERROR.UNSUPPORTED, `unknown op ${op}`));
     }
+  }
+
+  private serveOperationRequest(b: Bound, request: RelayIncomingRequest, op: RelayOperationOp): void {
+    const binding = this.session.streamInfo(request.stream)!;
+    const definitions = this.streamOps(request.stream);
+    const peerRole = this.role === "guest" ? "provider" : "guest";
+    const prepared = prepareOperation(op, { type: RELAY_TYPE.REQUEST, ...request }, binding.rxLimits, definitions);
+    let response: Record<string, unknown>;
+    const args = prepared.ok ? prepared.metadata.args as RelayOperationEpochArgs & RelayOperationStatusArgs : undefined;
+    let error = prepared.ok ? undefined : prepared.code;
+    if (!error && !definitions.some(op => op.recovery !== "idempotent" && privateOpAllows(op, peerRole))) error = RELAY_ERROR.UNSUPPORTED;
+    if (!error && args!.ns !== binding.namespace) error = RELAY_ERROR.UNAUTHORIZED;
+    if (error) response = this.privateError(request, error).metadata;
+    else {
+      const result = op === RELAY_OP.OPERATION_EPOCH
+        ? this.operations.epoch(this.peer.id, args!)
+        : this.operations.status(this.peer.id, args!, binding.profile);
+      response = result.ok ? { op, status: RELAY_STATUS.OK, final: true, value: result.value } : this.privateError(request, result.code).metadata;
+    }
+    const terminal = prepareOperation(op, { type: RELAY_TYPE.RESPONSE, stream: request.stream, metadata: response }, binding.rxLimits, definitions);
+    if (!terminal.ok) { this.resetStream(request.stream, `operation response refused: ${terminal.code}`); return; }
+    this.enqueue(b, { type: RELAY_TYPE.RESPONSE, stream: request.stream, correlation: request.correlation, metadata: terminal.metadata });
+  }
+
+  private deliverOperationResponse(b: Bound, frame: RelayDecodedFrame): void {
+    const pending = b.operationPending.get(frame.correlation);
+    if (!pending) { this.protocolError(RELAY_P3_ERROR.UNKNOWN_REQUEST, "operation response without a request"); return; }
+    if (pending.stream !== frame.stream || pending.op !== frame.metadata.op) {
+      this.protocolError(RELAY_P3_ERROR.BAD_CORRELATION, "operation response stream/op mismatch"); return;
+    }
+    const prepared = prepareOperation(pending.op, frame, this.session.streamInfo(frame.stream)!.rxLimits, this.streamOps(frame.stream));
+    if (!prepared.ok) { this.protocolError(prepared.code, "operation response schema"); this.resetStream(frame.stream, "invalid operation response"); return; }
+    const meta = prepared.metadata;
+    const recorded = b.outgoingRequests.terminal(frame.correlation, { final: true, status: meta.status as string });
+    if (!recorded.ok) { this.protocolError(recorded.code, "operation terminal"); return; }
+    b.outgoingRequests.consumeTerminal(frame.correlation); b.operationPending.delete(frame.correlation);
+    pending.resolve(meta.status === RELAY_STATUS.OK ? { ok: true, value: meta.value } : { ok: false, error: meta.error as RelayErrorBody });
   }
 
   // --- L2 wire seam (guest) ------------------------------------------------------------
