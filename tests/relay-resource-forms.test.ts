@@ -356,6 +356,126 @@ test("public ResourceRef and args still reject arbitrary properties on the peer 
 // Value validation
 // ---------------------------------------------------------------------------
 
+test("required form rejects notModified-shaped codec-1 GET content", async () => {
+  const marker = stringToUtf8(JSON.stringify({ notModified: true }));
+  let provider: RelayEndpoint | undefined;
+  let produced: unknown;
+  const link = pair({
+    providerHooks: {
+      onGet(request) {
+        produced = provider!.replyObject(request, {
+          ref: ref(), codec: RELAY_CODEC.JSON, data: marker,
+        });
+      },
+    },
+  });
+  provider = link.provider;
+  const result = await getOnce(link, await connect(link), ref(), {
+    accept: [RELAY_CODEC.JSON], maxObjectBytes: 4096,
+  });
+  await link.settle();
+
+  expect(produced).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+  expect(result).toEqual({ ok: false, error: { code: RELAY_ERROR.INVALID,
+    message: "missing lines" } });
+  expect(link.frames("provider").filter(frame => frame.type === RELAY_TYPE.RESPONSE
+    && frame.metadata.op === RELAY_OP.RESOURCE_GET
+    && frame.metadata.status === RELAY_STATUS.OK)).toEqual([]);
+
+  let peer: RelayEndpoint | undefined;
+  let injected: unknown;
+  const inbound = pair({
+    guestForms: formsWithPresence("required"), providerForms: [],
+    providerHooks: {
+      onGet(request) {
+        injected = peer!.replyObject(request, {
+          ref: ref(), codec: RELAY_CODEC.JSON, data: marker,
+        });
+      },
+    },
+  });
+  peer = inbound.provider;
+  const inboundResult = await getOnce(inbound, await connect(inbound), ref(), {
+    accept: [RELAY_CODEC.JSON], maxObjectBytes: 4096,
+  });
+  await inbound.settle();
+  expect(injected).toEqual({ ok: true, frames: 1 });
+  expect(inboundResult).toEqual({ ok: false, error: { code: RELAY_ERROR.INVALID } });
+  expect(inbound.guest.client!.stats()).toMatchObject({ pending: 0, protocolErrors: 1 });
+});
+
+for (const [label, codec, data, value] of [
+  ["codec-0 metadata", RELAY_CODEC.NONE, new Uint8Array(0), { notModified: true }],
+  ["codec-1 JSON data", RELAY_CODEC.JSON, stringToUtf8(JSON.stringify({ notModified: true })), undefined],
+] as const) {
+  test("required form rejects notModified-shaped push " + label, async () => {
+    const objects: unknown[] = [];
+    const ends: string[] = [];
+    const link = pair();
+    currentProvider = link.provider;
+    const stream = await connect(link);
+    const complete = await new Promise<ResourceResult<{ subscription?: number }>>((resolve) => {
+      link.guest.subscribe(stream, { ns: "term/session-1" }, RELAY_DELIVERY.LATEST_SNAPSHOT,
+        { onObject: object => objects.push(object), onEnd: error => ends.push(error?.code ?? "") }, resolve);
+    });
+    await link.settle();
+    const id = (complete as { ok: true; value: { subscription: number } }).value.subscription;
+    const before = link.frames("provider").filter(frame => frame.type === RELAY_TYPE.PUSH).length;
+
+    expect(link.provider.pushObject({
+      stream, subscription: id, ref: ref("s-43"), codec, data, value,
+    })).toEqual({ ok: false, code: RELAY_ERROR.INVALID });
+    await link.settle();
+    expect(objects).toEqual([]);
+    expect(ends).toEqual([]);
+    expect(link.frames("provider").filter(frame => frame.type === RELAY_TYPE.PUSH).length).toBe(before);
+
+    const inboundObjects: unknown[] = [];
+    const inboundEnds: string[] = [];
+    const inbound = pair({ guestForms: formsWithPresence("required"), providerForms: [] });
+    currentProvider = inbound.provider;
+    const inboundStream = await connect(inbound);
+    const inboundComplete = await new Promise<ResourceResult<{ subscription?: number }>>((resolve) => {
+      inbound.guest.subscribe(inboundStream, { ns: "term/session-1" }, RELAY_DELIVERY.LATEST_SNAPSHOT,
+        { onObject: object => inboundObjects.push(object),
+          onEnd: error => inboundEnds.push(error?.code ?? "") }, resolve);
+    });
+    await inbound.settle();
+    const inboundId = (inboundComplete as { ok: true; value: { subscription: number } }).value.subscription;
+    expect(inbound.provider.pushObject({
+      stream: inboundStream, subscription: inboundId, ref: ref("s-44"), codec, data, value,
+    })).toEqual({ ok: true, frames: 1 });
+    await inbound.settle();
+    expect(inboundObjects).toEqual([]);
+    expect(inboundEnds).toEqual([RELAY_ERROR.INVALID]);
+  });
+}
+
+test("required form preserves a legal conditional GET notModified response", async () => {
+  let provider: RelayEndpoint | undefined;
+  let produced: unknown;
+  const link = pair({
+    providerHooks: {
+      onGet(request) {
+        produced = provider!.replyNotModified(request, ref());
+      },
+    },
+  });
+  provider = link.provider;
+  const stream = await connect(link);
+  const result = await new Promise<ResourceResult<unknown>>((resolve) => {
+    const started = link.guest.get(stream, ref(), {
+      accept: [RELAY_CODEC.JSON], maxObjectBytes: 4096, ifRevision: "s-42",
+      product: { key: "term", value: { page: 1 } },
+    }, resolve);
+    if (!("correlation" in started)) resolve({ ok: false, error: { code: started.code } });
+  });
+  await link.settle();
+
+  expect(produced).toEqual({ ok: true });
+  expect(result).toEqual({ ok: true, value: { notModified: true, revision: "s-42" } });
+});
+
 test("provider rejects present codec-0 values outside required and optional schemas", async () => {
   for (const valuePresence of ["required", "optional"] as const) {
     const link = pair({ providerForms: formsWithPresence(valuePresence) });

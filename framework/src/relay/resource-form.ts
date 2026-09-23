@@ -185,13 +185,8 @@ export class RelayResourceForms {
 
   /** Validate one successful resource value against the form bound to
    * `profile` and `kind`. A required form rejects an absent content carrier;
-   * an optional form accepts absence but validates every present value. A
-   * notModified marker is a separate public result and passes here. */
+   * an optional form accepts absence but validates every present value. */
   validateValue(profile: RelayProfileEntry | undefined, kind: number, value: unknown): string | null {
-    if (value !== undefined && value !== null
-        && typeof value === "object" && (value as { notModified?: unknown }).notModified === true) {
-      return null;
-    }
     const form = this.formFor(profile, kind);
     if (!form?.value) return null;
     if (value === undefined) {
