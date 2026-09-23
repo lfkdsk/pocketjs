@@ -545,6 +545,9 @@ export class RelayEndpoint {
   private validateJsonValue(
     profile: { name: string; version: number } | undefined, kind: number, bytes: Uint8Array,
   ): string | null {
+    // A kind without an installed value schema gets no JSON parse: codec 1
+    // content of unformed kinds stays the product binary validator's job.
+    if (!this.resourceForms.formFor(profile, kind)?.value) return null;
     let value: unknown;
     try {
       value = JSON.parse(new TextDecoder().decode(bytes));
@@ -570,7 +573,7 @@ export class RelayEndpoint {
     const profile = this.session.streamInfo(stream)?.profile;
     const form = "kind" in target
       ? this.resourceForms.formFor(profile, target.kind)
-      : this.resourceForms.formForKey(profile, product.key);
+      : this.resourceForms.subscribeFormForKey(profile, product.key);
     if (!form?.argsKey || form.argsKey !== product.key || form.onSubscribe !== true) {
       return `args key ${product.key} is not registered for subscribe`;
     }
