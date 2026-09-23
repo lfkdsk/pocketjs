@@ -305,7 +305,11 @@ export class RelayResourceClient {
     const forms = this.opts.productForms;
     if (!forms) return null;
     const profile = forms.streamProfile(frame.stream);
-    if (bytes !== undefined && frame.codec === RELAY_CODEC.JSON) return forms.validateJson(profile, kind, bytes);
+    if (bytes !== undefined) {
+      // Data is the content carrier. Codec 1 has a JSON schema in this layer;
+      // other binary codecs use their product validator outside this layer.
+      return frame.codec === RELAY_CODEC.JSON ? forms.validateJson(profile, kind, bytes) : null;
+    }
     return forms.validateValue(profile, kind, value);
   }
 
@@ -772,7 +776,7 @@ export class RelayResourceClient {
       // The public chunk envelope passed; the assembled object and any
       // repeated metadata value still have to satisfy the form the local
       // product installed for this kind.
-      if (this.invalidProductValue(frame, pending.ref.kind, meta.value)
+      if ((meta.value !== undefined && this.invalidProductValue(frame, pending.ref.kind, meta.value))
           || this.invalidProductValue(frame, pending.ref.kind, undefined, result.bytes)) {
         this.failMalformed(frame.correlation, pending);
         return;
@@ -869,7 +873,7 @@ export class RelayResourceClient {
       if (!result.complete) return;
       // Assembled object and repeated metadata value must satisfy the form
       // bound to this stream's profile and the push's kind.
-      if (this.invalidProductValue(frame, ref.kind, meta.value)
+      if ((meta.value !== undefined && this.invalidProductValue(frame, ref.kind, meta.value))
           || this.invalidProductValue(frame, ref.kind, undefined, result.bytes)) {
         this.failSubscription(sub.id, { code: RELAY_ERROR.INVALID }); return;
       }

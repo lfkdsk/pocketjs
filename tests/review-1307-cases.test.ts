@@ -29,6 +29,7 @@ const form: RelayResourceForm = {
     lines: { type: "array", items: { type: "string" } },
     cursor: { type: "integer", minimum: 0 },
   }),
+  valuePresence: "required",
   onSubscribe: true,
 };
 const ref = (): RelayResourceRef => ({

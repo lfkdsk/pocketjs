@@ -33,8 +33,10 @@ export interface RelayResourceForm {
   argsKey?: string;
   /** Closed schema for the product object carried at `args[argsKey]`. */
   args?: RelayProductSchema;
-  /** Closed schema for a successful metadata `value` object (codec 0). */
+  /** Closed schema for successful codec-0 metadata or codec-1 JSON content. */
   value?: RelayProductSchema;
+  /** A form with `value` must declare whether the content carrier may be absent. */
+  valuePresence?: "required" | "optional";
   /** When true the argsKey applies to resource.subscribe as well as get. */
   onSubscribe?: boolean;
 }
@@ -58,7 +60,7 @@ export class RelayResourceForms {
     const subscribeKeyOwners = new Set<string>();
     for (const form of definitions) {
       for (const key of Object.keys(form)) {
-        if (!["profile", "kind", "argsKey", "args", "value", "onSubscribe"].includes(key)) {
+        if (!["profile", "kind", "argsKey", "args", "value", "valuePresence", "onSubscribe"].includes(key)) {
           throw new Error(`unknown resource form field ${key}`);
         }
       }
@@ -101,8 +103,13 @@ export class RelayResourceForms {
         throw new Error("resource form args/onSubscribe require argsKey");
       }
       if (form.value !== undefined) {
+        if (form.valuePresence !== "required" && form.valuePresence !== "optional") {
+          throw new Error("resource form valuePresence must be required or optional when value is set");
+        }
         if (form.value.type !== "object") throw new Error("resource form value schema must be an object");
         checkRelayProductSchema(form.value);
+      } else if (form.valuePresence !== undefined) {
+        throw new Error("resource form valuePresence requires value");
       }
       const identity = JSON.stringify([profile.name, profile.version, form.kind]);
       if (seenIdentities.has(identity)) throw new Error("duplicate resource form for profile and kind");
@@ -177,17 +184,19 @@ export class RelayResourceForms {
   }
 
   /** Validate one successful resource value against the form bound to
-   * `profile` and `kind`. A form without a value schema, a notModified
-   * marker and an absent value all pass; binary codecs the product did not
-   * give a JSON schema for pass as well (the product binary validator is
-   * outside this layer). */
+   * `profile` and `kind`. A required form rejects an absent content carrier;
+   * an optional form accepts absence but validates every present value. A
+   * notModified marker is a separate public result and passes here. */
   validateValue(profile: RelayProfileEntry | undefined, kind: number, value: unknown): string | null {
     if (value !== undefined && value !== null
         && typeof value === "object" && (value as { notModified?: unknown }).notModified === true) {
       return null;
     }
     const form = this.formFor(profile, kind);
-    if (!form?.value || value === undefined) return null;
+    if (!form?.value) return null;
+    if (value === undefined) {
+      return form.valuePresence === "required" ? "resource value is required by the installed form" : null;
+    }
     return validateRelaySchema(form.value, value);
   }
 }

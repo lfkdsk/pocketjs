@@ -570,10 +570,12 @@ nothing about a form is negotiated or sent. Each end installs its own copy
 and rejects content its local forms do not admit. Endpoint construction
 takes `resourceForms`; an entry has `profile`, `kind`, an optional
 `argsKey`, an `args` closed object schema, a `value` closed object schema
-and an `onSubscribe` boolean. At most 64 forms and 65536 schema bytes
-install on one endpoint; duplicate `(profile, kind)` entries, a profile
-absent from `local.profiles`, a kind outside 1..8, an unknown registration
-field and an open or dialect-invalid schema throw before HELLO.
+with `valuePresence` set to `required` or `optional`, and an `onSubscribe`
+boolean. **A form with `value` must declare `valuePresence`; the presence
+field without a value schema is invalid.** At most 64 forms and 65536 schema bytes
+install on one endpoint; duplicate `(profile, kind)` entries, a profile absent
+from `local.profiles`, a kind outside 1..8, an unknown registration field and
+an open or dialect-invalid schema throw before HELLO.
 
 **Product request parameters occupy one object inside the existing
 `args`, at the registered `argsKey`** (e.g.
@@ -606,12 +608,15 @@ Validation order on both ends:
    kind. Its response must preserve `kind`, `ns`, `key`, and `rendition`; a
    request that names a revision fixes that revision, while a request without
    one accepts the concrete current revision. A mismatch ends as `INVALID`. The
-   metadata `value` validates against that form's `value` schema. Codec 1
-   (`JSON`) uses the frame layer's strict UTF-8 JSON parser, which rejects
-   duplicate keys and malformed UTF-8, before applying the value schema. A
-   codec-1 data region cannot coexist with metadata `value`. A
-   `{notModified:true}` marker and binary codecs without a JSON schema pass
-   the product-schema step.
+   `valuePresence` applies to the selected content carrier: codec 0 uses
+   metadata `value`, and codec 1 uses the JSON data region. `required` rejects
+   an absent carrier; `optional` accepts absence. Every present value validates
+   against the form's `value` schema. Codec 1 uses the frame layer's strict
+   UTF-8 JSON parser, which rejects duplicate keys and malformed UTF-8, before
+   applying the schema. A codec-1 data region cannot coexist with metadata
+   `value`. The public `{notModified:true}` result bypasses product presence
+   because it carries no resource content. Binary codecs without a JSON schema
+   pass the product-schema step.
 
 `get(stream, ref, args, complete)` and `subscribe(...)` accept
 `product:{key, value}`; the caller passes the registered key and the

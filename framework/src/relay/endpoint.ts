@@ -731,7 +731,11 @@ export class RelayEndpoint {
       if (invalid) return invalid;
     }
     if (codec === RELAY_CODEC.JSON && data.length) return this.validateJsonValue(profile, kind, data);
-    return null;
+    // Codec 0 carries product content in metadata. A zero-byte codec-1 input
+    // also has no content; chunking represents that absence as codec 0.
+    return data.length === 0 && value === undefined
+      ? this.resourceForms.validateValue(profile, kind, undefined)
+      : null;
   }
 
   /** Answer a resource.get with one complete object: admission against the
