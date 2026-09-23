@@ -431,7 +431,7 @@ HELLO. A registration has no stream field; stream 0 and the public prefixes
 | `maxWireBytes` | Positive u32, at least 48, at most local `rxLimits.maxWireBytes`; counts the complete record |
 | `maxObjectBytes` | Positive u32, at most local `rxLimits.maxObjectBytes`; counts the UTF-8 JSON bytes of `args` or `value` |
 | `recovery` | `idempotent`, `epoch` or `durable`; the sender does not replay an admitted request |
-| `recoveryOp` | Required for `durable`: an installed idempotent private receipt query in the same profile and direction |
+| `recoveryOp` | Required for `durable`: `operation.status` or an installed idempotent private receipt query in the same profile and direction |
 
 HELLO `opExt` carries the profile, name, direction, budgets, recovery and
 optional recovery query name. **Schemas do not cross the connection.** The
@@ -464,7 +464,7 @@ cannot widen the shared envelope or add fields to `ResourceRef`.
 
 Both roles call `endpoint.request(stream, name, args, options?)`. It returns
 a Promise with `correlation` and `cancel(reason?)`. Awaiting it yields one
-`{ok:true, value}` or `{ok:false, error, effect?}` result. A local refusal
+`{ok:true, value, effect?}` or `{ok:false, error, effect?}` result. A local refusal
 has correlation 0: unknown ops or wrong directions give `UNSUPPORTED`,
 invalid args give `INVALID`, and exceeded budgets give `TOO_LARGE`.
 **P3 admits the request before it enters the send queue.** A full request
@@ -490,22 +490,28 @@ CANCEL uses the existing sideband, correlation and `targetStream`. A
 repeat from the public API sends no second CANCEL. A CANCEL that overtakes
 a queued REQUEST is held in a table capped at `maxPending` and marks the
 request before its handler runs. The receiver can finish an in-flight
-success or send `CANCELLED` with `effect:none`, `committed` or `unknown`.
+success or send `CANCELLED` with `effect:none`. A mutation with a recorded
+commit returns its success and `effect:committed`; an uncertain mutation
+returns `OUTCOME_UNKNOWN` with `effect:unknown`.
 **CANCEL releases no request slot; the terminal or stream/session teardown
 releases it.** The caller's response must match the pending op and stream;
 late terminals cannot deliver a second result.
 
 An `idempotent` definition permits the product to repeat the read after
-recovery. An `epoch` definition assigns input epoch, sequence and ACK
-validation to its local schemas and handler. A `durable` request requires
-top-level `opEpoch` (16 lowercase hex characters) and `opId` (32 lowercase
-hex characters) in `options`, a required `value.receipt` in its result
-schema and an installed `recoveryOp`. The product owns the receipt store
-and query handler. **Reset or disconnect completes an admitted epoch or
-durable request as `OUTCOME_UNKNOWN` with `effect:unknown`.** The product
-queries or reconciles the result; it does not resend a write with an
-unknown outcome. Idempotent requests end as `RESYNC_REQUIRED` on teardown.
-The private sender adds no receipt persistence or input deduplication.
+recovery. Both `epoch` and `durable` requests require top-level `opEpoch`
+(16 lowercase hex characters) and `opId` (32 lowercase hex characters) in
+`options`. **The same epoch and ID identify one operation across requests
+and connections.** Changed arguments, op names or profile versions under
+that identity return `INVALID`. Object key order does not change argument
+identity; array order does. Input sequence gaps, target validation and ACK
+contents belong to the product schema and handler.
+
+A `durable` definition requires `value.receipt` in its result schema and
+a `recoveryOp`. **Reset or disconnect completes an admitted epoch or
+durable request as `OUTCOME_UNKNOWN` with `effect:unknown`.** The sender
+does not replay it. The caller queries or reconciles the original operation.
+Idempotent requests end as `RESYNC_REQUIRED` on teardown. Mutation terminals
+carry `effect:none`, `committed` or `unknown`; a success carries `committed`.
 
 The types are exported from `@pocketjs/framework/relay/endpoint`. Provider
 byte channels pass definitions through `attachRelayProvider`'s
@@ -513,6 +519,90 @@ byte channels pass definitions through `attachRelayProvider`'s
 `tests/relay-private-op.test.ts` exercises registration, negotiation,
 bidirectional requests, local schema rejection, terminal uniqueness,
 CANCEL races, P3 saturation and session recovery.
+
+## Operation epochs and receipts
+
+`operation.epoch` and `operation.status` use REQUEST/RESPONSE on an OPEN
+business stream. Both endpoints must have selected a mutation in that
+profile and request direction; absence returns `UNSUPPORTED`. They use
+codec 0, no data bytes, and the stream's request slots, credit and metadata
+budgets. They cannot register arbitrary names under `operation.*`.
+
+| Call | Arguments | Successful value |
+| --- | --- | --- |
+| `endpoint.operationEpoch(stream, args)` | `ns`, `action:query\|advance`, `expectedEpoch` required for advance | `{opEpoch}` |
+| `endpoint.operationStatus(stream, args)` | `authority`, `ns`, `opEpoch`, `opId` | `{state:pending\|committed\|rejected\|unknown, receipt?}` |
+
+`endpoint.request(stream, RELAY_OP.OPERATION_EPOCH, args)` and the status
+equivalent use the same implementation. Namespace must equal the OPEN
+binding. The authority compares `args.authority` with its configured ID;
+the writer comes from the authenticated adapter's `peer.id`. **An operation
+is keyed by authority, writer, namespace, epoch and opId.** A receipt query
+cannot read another writer's result or another profile version. The caller
+retains the authority ID across reconnects and obtains it from the product's
+authenticated authority binding. A receipt is checked against the selected
+profile's local mutation receipt schemas. Unknown fields reject at every
+public envelope level; product receipt fields remain in that local schema.
+
+**Advance compares and updates the persisted epoch in one transaction.**
+A matching `expectedEpoch` advances by one after all records are committed
+or rejected, then retires that generation's records. A mismatch returns the
+current epoch. Repeating an advance with its original expectation cannot
+advance twice. Pending and unknown records return `BUSY`; the maximum u64
+epoch returns `RESYNC_REQUIRED` and cannot wrap. An operation under a
+retired or future epoch returns `STALE_BASE` and cannot execute. A status
+query for a retired receipt returns `unknown`, which does not authorize
+resubmission in a new epoch.
+
+The provider creates `RelayOperationAuthority({id, store, maxOperations?,
+maxRecordBytes?})` outside the connection handler and passes it as
+`RelayEndpointOptions.operations`, `attachRelayProvider`'s
+`endpoint.operations`, or `serveRelayTcp`'s `operations`. Defaults are
+**64 records per writer/namespace and 65536 bytes per record**, including
+the normalized argument fingerprint and terminal. The store bounds its
+writer/namespace rows. Capacity exhaustion returns `BUSY`. Current receipts
+and rejection records have no TTL eviction; epoch retirement reclaims them.
+
+`RelayOperationStore.transact(scope, update)` serializes updates for that
+scope and persists the returned state before returning the value. Incoming
+durable definitions require a store with `durable:true`; endpoint
+construction rejects a volatile store. **The store must commit the receipt
+and side effect in the same transaction or a recoverable journal.** The
+driver recovers its journal before serving requests. The shared runtime
+does not supply a filesystem database or claim that a network frame makes
+an external filesystem/OS action transactional. Tests use SQLite with
+receipts and effect counters in one transaction.
+
+For input, `RelayMemoryOperationStore` holds at most 64 writer/namespace
+rows by default. Reusing it preserves the input epoch across connections.
+A new instance assigns a random input epoch; it cannot claim continuity
+with lost input state. It does not satisfy a durable definition.
+
+`onRequest` receives `request.operation` for a mutation. Call
+`request.operation.commit(value, apply)` to validate the result, check its
+operation state, run a synchronous effect callback inside the storage
+transaction and record the terminal. A second commit or duplicate REQUEST
+returns the original receipt without running the callback. Direct
+`replyValue` cannot create an unrecorded mutation commit.
+`replyError(..., effect:none)` records a rejection; `effect:unknown`
+records uncertainty and exposes it to the caller. A callback exception
+produces unknown and fences another execution.
+
+**CANCEL before commit records `CANCELLED/none` and fences the commit
+callback.** CANCEL after commit returns the recorded success with
+`effect:committed`, even when its response has not reached the caller.
+CANCEL on an unknown operation preserves unknown. Disconnecting an
+observer of a duplicate request leaves the original execution active.
+
+After external reconciliation, the retained operation handle accepts
+`reconcile({state:committed, value})` or
+`reconcile({state:rejected, code, message?})`. This records evidence without
+running an effect. The handle remains bound to its original operation
+across sessions; terminal receipts cannot be changed by reconciliation.
+When pending work belongs to another authority process, a duplicate request
+gets `OUTCOME_UNKNOWN`; `operation.status` reports that stored pending state
+until its owner or recovery journal settles it. No path replays an unknown
+mutation. `tests/relay-operation.test.ts` covers these transitions.
 
 ## Resource identity
 

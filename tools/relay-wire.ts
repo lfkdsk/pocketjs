@@ -112,7 +112,7 @@ export function attachRelayProvider(options: {
   hooks?: RelayProviderHooks;
   /** Endpoint tuning: pump budgets, request reserve, timers, randomness. */
   endpoint?: Pick<RelayEndpointOptions,
-    "privateOps" | "resourceForms" | "framesPerPump" | "bytesPerPump" | "requestReserve" | "outboxFrames"
+    "privateOps" | "resourceForms" | "operations" | "framesPerPump" | "bytesPerPump" | "requestReserve" | "outboxFrames"
     | "scheduler" | "randomBytes" | "pingIntervalMs" | "stallMs" | "retryMs">;
 }): RelayProviderConnection {
   const { channel, local, hooks } = options;
@@ -270,6 +270,7 @@ export function serveRelayTcp(options: {
   local: RelayLocalCapabilities;
   privateOps?: RelayEndpointOptions["privateOps"];
   resourceForms?: RelayEndpointOptions["resourceForms"];
+  operations?: RelayEndpointOptions["operations"];
   authenticate: (socket: Socket) => RelayPeerContext | null | Promise<RelayPeerContext | null>;
   hooks?: RelayProviderHooks | ((peer: RelayPeerContext) => RelayProviderHooks);
   onConnection?: (connection: RelayProviderConnection) => void;
@@ -286,7 +287,7 @@ export function serveRelayTcp(options: {
       const hooks = typeof options.hooks === "function" ? options.hooks(peer) : options.hooks;
       const channel = relaySocketChannel(socket, peer);
       const connection = attachRelayProvider({ channel, local: options.local, hooks,
-        endpoint: { privateOps: options.privateOps, resourceForms: options.resourceForms } });
+        endpoint: { privateOps: options.privateOps, resourceForms: options.resourceForms, operations: options.operations } });
       options.onConnection?.(connection);
     })();
   });
