@@ -75,6 +75,11 @@ export function relayGetResponseMatchesRequest(request: RelayResourceRef, respon
     && (request.revision === undefined || request.revision === response.revision);
 }
 
+/** A resource kind is usable only when HELLO selected it. */
+export function relayKindNegotiated(kinds: readonly number[], kind: number): boolean {
+  return kinds.includes(kind);
+}
+
 /** A ref-scoped subscription fixes the resource's revision-independent
  * identity; its revision advances as pushes arrive. A namespace-scoped
  * subscription admits every resource kind and key in that namespace. */
@@ -128,6 +133,8 @@ export interface RelayResourceNegotiated {
   /** rxLimits.maxObjectBytes: largest assembled object this receiver reserves. */
   maxObjectBytes: number;
   codecs: readonly number[];
+  /** RELAY_KIND values selected by HELLO mutual intersection. */
+  kinds: readonly number[];
 }
 
 /** Product parameters a registered form admitted into the public args:
@@ -312,6 +319,9 @@ export class RelayResourceClient {
     args: { accept: number[]; maxObjectBytes: number; ifRevision?: string; product?: RelayProductArgs },
     complete: PendingGet["complete"],
   ): { correlation: number } | { ok: false; code: string } {
+    if (!relayKindNegotiated(this.opts.negotiated.kinds, ref.kind)) {
+      return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
     if (!args.accept.length
       || !args.accept.every((c) => Number.isInteger(c) && c >= 0 && c <= 0xffff && this.opts.negotiated.codecs.includes(c))) {
       return { ok: false, code: RELAY_ERROR.INVALID };
@@ -377,6 +387,9 @@ export class RelayResourceClient {
     if (!Number.isSafeInteger(maxObjectBytes) || maxObjectBytes <= 0
       || maxObjectBytes > this.opts.negotiated.maxObjectBytes) return { ok: false, code: RELAY_ERROR.INVALID };
     const isRef = "kind" in target;
+    if (isRef && !relayKindNegotiated(this.opts.negotiated.kinds, (target as RelayResourceRef).kind)) {
+      return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
     // Reserve-then-accept (§3.7), as the get path: refuse (BUSY) before
     // consuming a request slot when the push channel could not be admitted
     // now. The reservation itself needs the id the terminal response carries.
@@ -467,6 +480,9 @@ export class RelayResourceClient {
     lease: number,
     complete: PendingControl["complete"] = () => {},
   ): { correlation: number } | { ok: false; code: string } {
+    if (!relayKindNegotiated(this.opts.negotiated.kinds, ref.kind)) {
+      return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
     if (!Number.isInteger(lease) || lease === 0) return { ok: false, code: RELAY_ERROR.INVALID };
     const correlation = this.opts.wire.request(stream, {
       op: RELAY_OP.RESOURCE_RELEASE, resource: ref, args: { lease },
@@ -482,6 +498,7 @@ export class RelayResourceClient {
    * accepts the frame. */
   reportEvict(ref: RelayResourceRef, reason: string): void {
     if (reason !== RELAY_EVICT_REASON.BUDGET && reason !== RELAY_EVICT_REASON.VIEW_CLOSE) return;
+    if (!relayKindNegotiated(this.opts.negotiated.kinds, ref.kind)) return;
     const key = relayResourceKey(ref);
     this.entries.delete(key);
     this.pruneGeneration(key);
@@ -508,6 +525,10 @@ export class RelayResourceClient {
     if (validateRelayMetadata(RELAY_OP.RESOURCE_INVALIDATE, meta)) { this.protocolErrors++; return; }
     const args = meta.args as { scope: string; namespace?: string; reason?: string };
     const ref = meta.resource as RelayResourceRef | undefined;
+    if (ref && !relayKindNegotiated(this.opts.negotiated.kinds, ref.kind)) {
+      this.protocolErrors++;
+      return;
+    }
     const ns = ref?.ns ?? args.namespace!;
 
     const revisionScope = args.scope === RELAY_INVALIDATE_SCOPE.REVISION;
@@ -633,6 +654,11 @@ export class RelayResourceClient {
         this.failMalformed(frame.correlation, pending);
         return;
       }
+      if (frame.metadata.resource
+          && !relayKindNegotiated(this.opts.negotiated.kinds, (frame.metadata.resource as RelayResourceRef).kind)) {
+        this.failPending(frame.correlation, pending, RELAY_ERROR.UNSUPPORTED);
+        return;
+      }
       if (pending.kind === "get" && frame.metadata.resource
           && !relayGetResponseMatchesRequest(pending.ref, frame.metadata.resource as RelayResourceRef)) {
         this.failMalformed(frame.correlation, pending);
@@ -655,6 +681,11 @@ export class RelayResourceClient {
       this.failMalformed(frame.correlation, pending);
       return;
     }
+    if (frame.metadata.resource
+        && !relayKindNegotiated(this.opts.negotiated.kinds, (frame.metadata.resource as RelayResourceRef).kind)) {
+      this.failPending(frame.correlation, pending, RELAY_ERROR.UNSUPPORTED);
+      return;
+    }
 
     if (pending.kind === "get") {
       this.deliverGet(frame, pending);
@@ -671,9 +702,13 @@ export class RelayResourceClient {
   /** End a request whose response was malformed: count the protocol error,
    * release the pending slot and reservation, and complete it as INVALID. */
   private failMalformed(correlation: number, pending: Pending): void {
+    this.failPending(correlation, pending, RELAY_ERROR.INVALID);
+  }
+
+  private failPending(correlation: number, pending: Pending, code: string): void {
     this.protocolErrors++;
     this.terminatePending(correlation, pending);
-    pending.complete({ ok: false, error: { code: RELAY_ERROR.INVALID } });
+    pending.complete({ ok: false, error: { code } });
   }
 
   private terminatePending(correlation: number, pending: Pending): void {
@@ -687,6 +722,9 @@ export class RelayResourceClient {
   private deliverGet(frame: RelayResourceIncomingFrame, pending: PendingGet): void {
     const meta = frame.metadata;
     const ref = meta.resource as RelayResourceRef;
+    if (!relayKindNegotiated(this.opts.negotiated.kinds, ref.kind)) {
+      this.failPending(frame.correlation, pending, RELAY_ERROR.UNSUPPORTED); return;
+    }
     const value = meta.value as { notModified?: boolean } | undefined;
     // The request fixes the ref identity and selected resource form. A
     // revisionless request may receive the authority's concrete revision.
@@ -804,6 +842,9 @@ export class RelayResourceClient {
     const sub = this.subscriptions.get(meta.subscription as number);
     if (!sub) return; // post-unsubscribe/unknown push: consumed and dropped
     const ref = meta.resource as RelayResourceRef;
+    if (!relayKindNegotiated(this.opts.negotiated.kinds, ref.kind)) {
+      this.failSubscription(sub.id, { code: RELAY_ERROR.UNSUPPORTED }); return;
+    }
     if (frame.stream !== sub.stream || !refMatchesSubscription(sub.filter, ref)) {
       this.failSubscription(sub.id, { code: RELAY_ERROR.INVALID }); return;
     }

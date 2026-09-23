@@ -77,6 +77,7 @@ import {
   RelayResourceAuthority,
   RelayResourceClient,
   relayGetResponseMatchesRequest,
+  relayKindNegotiated,
   type RelayGetOutcome,
   type RelayResourceEnvelope,
   type RelayResourceIncomingFrame,
@@ -589,8 +590,12 @@ export class RelayEndpoint {
     args: { accept: number[]; maxObjectBytes: number; ifRevision?: string; product?: { key: string; value: unknown } },
     complete: (result: ResourceResult<RelayGetOutcome>) => void,
   ): { correlation: number } | { ok: false; code: string } {
-    const client = this.bound?.client;
+    const bound = this.bound;
+    const client = bound?.client;
     if (!client) return { ok: false, code: RELAY_ERROR.BUSY };
+    if (!relayKindNegotiated(bound.negotiation.kinds, ref.kind)) {
+      return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
     const invalid = this.checkProductGet(stream, ref, args.product);
     if (invalid) return { ok: false, code: RELAY_ERROR.INVALID };
     const result = client.get(stream, ref, args, complete);
@@ -608,8 +613,12 @@ export class RelayEndpoint {
      * negotiated maxObjectBytes. */
     options?: { maxObjectBytes?: number; product?: { key: string; value: unknown } },
   ): { correlation: number } | { ok: false; code: string } {
-    const client = this.bound?.client;
+    const bound = this.bound;
+    const client = bound?.client;
     if (!client) return { ok: false, code: RELAY_ERROR.BUSY };
+    if ("kind" in target && !relayKindNegotiated(bound.negotiation.kinds, target.kind)) {
+      return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
     const invalid = this.checkProductSubscribe(stream, target, options?.product);
     if (invalid) return { ok: false, code: RELAY_ERROR.INVALID };
     const result = client.subscribe(stream, target, delivery, handler, complete, options);
@@ -629,15 +638,21 @@ export class RelayEndpoint {
   release(stream: number, ref: RelayResourceRef, lease: number,
     complete?: (result: ResourceResult<{ subscription?: number }>) => void):
     { correlation: number } | { ok: false; code: string } {
-    const client = this.bound?.client;
+    const bound = this.bound;
+    const client = bound?.client;
     if (!client) return { ok: false, code: RELAY_ERROR.BUSY };
+    if (!relayKindNegotiated(bound.negotiation.kinds, ref.kind)) {
+      return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
     const result = client.release(stream, ref, lease, complete);
     this.flush();
     return result;
   }
 
   reportEvict(ref: RelayResourceRef, reason: string): void {
-    this.bound?.client?.reportEvict(ref, reason);
+    const bound = this.bound;
+    if (!bound || !relayKindNegotiated(bound.negotiation.kinds, ref.kind)) return;
+    bound.client?.reportEvict(ref, reason);
     this.flush();
   }
 
@@ -687,6 +702,12 @@ export class RelayEndpoint {
     const b = this.bound;
     if (!b?.authority) return { ok: false, code: RELAY_ERROR.BUSY };
     const requested = request.metadata.resource as RelayResourceRef;
+    if (!relayKindNegotiated(b.negotiation.kinds, requested.kind)
+        || !relayKindNegotiated(b.negotiation.kinds, ref.kind)) {
+      this.respond(b.authority.answerGetError(request, RELAY_ERROR.UNSUPPORTED,
+        "resource kind was not negotiated"));
+      return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
     if (!relayGetResponseMatchesRequest(requested, ref)) {
       this.respond(b.authority.answerGetError(request, RELAY_ERROR.INVALID,
         "response resource differs from request resource"));
@@ -724,11 +745,17 @@ export class RelayEndpoint {
     const b = this.bound;
     if (!b?.authority) return { ok: false, code: RELAY_ERROR.BUSY };
     const args = request.metadata.args as { accept: number[]; maxObjectBytes: number };
+    const requested = request.metadata.resource as RelayResourceRef;
+    if (!relayKindNegotiated(b.negotiation.kinds, requested.kind)
+        || !relayKindNegotiated(b.negotiation.kinds, object.ref.kind)) {
+      this.respond(b.authority.answerGetError(request, RELAY_ERROR.UNSUPPORTED,
+        "resource kind was not negotiated"));
+      return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
     if (!args.accept.includes(object.codec)) {
       this.respond(b.authority.answerGetError(request, RELAY_ERROR.UNSUPPORTED, `codec ${object.codec} not accepted`));
       return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
     }
-    const requested = request.metadata.resource as RelayResourceRef;
     const schemaError = !relayGetResponseMatchesRequest(requested, object.ref)
       ? "response resource differs from request resource"
       : this.checkProductObject(request.stream, requested.kind, object.codec, object.data, object.value);
@@ -763,6 +790,9 @@ export class RelayEndpoint {
     if (!b?.authority) return { ok: false, code: RELAY_ERROR.BUSY };
     const sub = b.authority.subscriptionEntry(input.subscription);
     if (!sub || !sub.active || sub.stream !== input.stream) return { ok: false, code: RELAY_ERROR.NOT_FOUND };
+    if (!relayKindNegotiated(b.negotiation.kinds, input.ref.kind)) {
+      return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
     if (!b.authority.admitsPush(input.subscription, input.stream, input.ref)) {
       return { ok: false, code: RELAY_ERROR.INVALID };
     }
@@ -779,10 +809,14 @@ export class RelayEndpoint {
   }
 
   /** Authority invalidation on the stream bound to the namespace. */
-  invalidate(input: Parameters<RelayResourceAuthority["buildInvalidate"]>[0]): void {
+  invalidate(input: Parameters<RelayResourceAuthority["buildInvalidate"]>[0]):
+    { ok: true } | { ok: false; code: string } {
     const b = this.bound;
-    if (!b?.authority) return;
-    this.respond(b.authority.buildInvalidate(input));
+    if (!b?.authority) return { ok: false, code: RELAY_ERROR.BUSY };
+    if ("ref" in input && !relayKindNegotiated(b.negotiation.kinds, input.ref.kind)) {
+      return { ok: false, code: RELAY_ERROR.UNSUPPORTED };
+    }
+    return this.respond(b.authority.buildInvalidate(input));
   }
 
   /** relay.reset from this end: the peer's and this end's requests and
@@ -983,7 +1017,7 @@ export class RelayEndpoint {
       });
       bound.client = new RelayResourceClient({
         wire: this.wire,
-        negotiated: { maxObjectBytes: limits.maxObjectBytes, codecs: negotiation.codecs },
+        negotiated: { maxObjectBytes: limits.maxObjectBytes, codecs: negotiation.codecs, kinds: negotiation.kinds },
         assembler: bound.assembler,
         productForms: {
           validateValue: (profile, kind, value) => this.resourceForms.validateValue(profile, kind, value),
@@ -1251,6 +1285,11 @@ export class RelayEndpoint {
   private deliverProvider(b: Bound, f: RelayDecodedFrame): void {
     if (f.type === RELAY_TYPE.INVALIDATE) {
       if (f.metadata.op === RELAY_OP.CACHE_EVICT && validateRelayMetadata(RELAY_OP.CACHE_EVICT, f.metadata) === null) {
+        const ref = f.metadata.resource as RelayResourceRef;
+        if (!relayKindNegotiated(b.negotiation.kinds, ref.kind)) {
+          this.protocolError(RELAY_ERROR.UNSUPPORTED, `kind ${ref.kind} was not negotiated`);
+          return;
+        }
         this.hooks.onEvict?.(f.metadata);
       } else {
         this.protocolError(RELAY_ERROR.INVALID, `invalidate op ${String(f.metadata.op)} from a consumer`);
@@ -1283,6 +1322,13 @@ export class RelayEndpoint {
     if (op.startsWith("x.")) { this.servePrivateRequest(b, request, wireBytes); return; }
     const authority = b.authority;
     if (!authority) { this.enqueue(b, this.privateError(request, RELAY_ERROR.UNSUPPORTED)); return; }
+    const ref = f.metadata.resource as RelayResourceRef | undefined;
+    if (typeof ref?.kind === "number" && !relayKindNegotiated(b.negotiation.kinds, ref.kind)) {
+      this.respond(op === RELAY_OP.RESOURCE_GET
+        ? authority.answerGetError(f, RELAY_ERROR.UNSUPPORTED, `kind ${ref.kind} was not negotiated`)
+        : authority.answerError(f, op, RELAY_ERROR.UNSUPPORTED, `kind ${ref.kind} was not negotiated`, ref));
+      return;
+    }
     switch (op) {
       case RELAY_OP.RESOURCE_SUBSCRIBE: this.respond(authority.answerSubscribe(f)); return;
       case RELAY_OP.RESOURCE_UNSUBSCRIBE: this.respond(authority.answerUnsubscribe(f)); return;

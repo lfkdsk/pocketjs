@@ -588,15 +588,21 @@ to `resource.subscribe` when `onSubscribe` is true.
 Validation order on both ends:
 
 1. Frame/envelope, session/stream, seq and credit checks.
-2. Public L2 schema, closed everywhere. The one registered key for this
+2. Every ref-bearing resource path admits only a kind selected in the HELLO
+   intersection. A local get, ref subscribe, release, push, or cache advisory
+   rejects or drops an unselected kind; the authority returns `UNSUPPORTED`
+   before a request handler runs; the consumer ends an injected push with
+   `UNSUPPORTED`. Namespace subscribe has no kind, so each push applies the
+   check to its concrete ref.
+3. Public L2 schema, closed everywhere. The one registered key for this
    stream's profile and (for a get or ref subscribe) the ref's kind is
    admitted into the closed `args`; every other unknown key rejects with
    `INVALID`.
-3. The value at the registered key validates against the form's closed
+4. The value at the registered key validates against the form's closed
    `args` schema; an unknown nested key or a type mismatch rejects with
    `INVALID` before the handler runs (provider) or before a frame is sent
    (guest local refusal).
-4. A successful get uses the form selected by the request's profile and
+5. A successful get uses the form selected by the request's profile and
    kind. Its response must preserve `kind`, `ns`, `key`, and `rendition`; a
    request that names a revision fixes that revision, while a request without
    one accepts the concrete current revision. A mismatch ends as `INVALID`. The

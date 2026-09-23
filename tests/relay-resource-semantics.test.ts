@@ -37,15 +37,16 @@ const scheduler = (): RelayScheduler => {
   let id = 0;
   return { now: () => 0, setTimeout: () => ++id, clearTimeout: () => {} };
 };
-const capabilities = (): RelayLocalCapabilities => ({
+const capabilities = (kinds: number[] = [RELAY_KIND.TERMINAL_CELLS, RELAY_KIND.FILE]): RelayLocalCapabilities => ({
   app: "example", versions: [[1, 0]], profiles: [PROFILE],
   codecs: [RELAY_CODEC.NONE, RELAY_CODEC.JSON],
-  kinds: [RELAY_KIND.TERMINAL_CELLS, RELAY_KIND.FILE], rxLimits: RX,
+  kinds, rxLimits: RX,
 });
 
 function pair(
   transform?: (from: Role, frame: RelayDecodedFrame) => RelayDecodedFrame,
   providerHooks?: RelayEndpointHooks,
+  kinds: { guest?: number[]; provider?: number[] } = {},
 ) {
   const endpoints = {} as Record<Role, RelayEndpoint>;
   const route = (from: Role, bytes: Uint8Array<ArrayBufferLike>) => {
@@ -62,7 +63,7 @@ function pair(
   };
   for (const role of ["guest", "provider"] as const) {
     endpoints[role] = new RelayEndpoint({
-      role, local: capabilities(), resourceForms: [FORM],
+      role, local: capabilities(role === "guest" ? kinds.guest : kinds.provider), resourceForms: [FORM],
       hooks: role === "provider" ? providerHooks : undefined,
       transport: { peer: { id: `peer-${role}`, grants: ["example"] }, trySend: bytes => route(role, bytes) },
       scheduler: scheduler(), randomBytes: n => new Uint8Array(n).fill(role === "guest" ? 17 : 23),
@@ -286,4 +287,148 @@ test("get identity binding covers notModified and permits a concrete revision fo
   if (currentResult.ok && "value" in currentResult) {
     expect(currentResult.value.ref.revision).toBe("s-current");
   }
+});
+
+test("unnegotiated kinds are refused for local get and ref subscribe before sending", async () => {
+  const link = pair(undefined, undefined, {
+    guest: [RELAY_KIND.TERMINAL_CELLS, RELAY_KIND.FILE], provider: [RELAY_KIND.FILE],
+  });
+  const stream = await connect(link);
+  let getCompleted = false;
+  expect(link.guest.get(stream, resourceRef(), {
+    accept: [RELAY_CODEC.NONE], maxObjectBytes: 4096,
+    product: { key: "term", value: { page: 1 } },
+  }, () => { getCompleted = true; })).toEqual({ ok: false, code: RELAY_ERROR.UNSUPPORTED });
+  let subscribeCompleted = false;
+  expect(link.guest.subscribe(stream, resourceRef(), RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject() {} },
+    () => { subscribeCompleted = true; }, { product: { key: "term", value: { page: 1 } } }))
+    .toEqual({ ok: false, code: RELAY_ERROR.UNSUPPORTED });
+  await link.settle();
+  expect(getCompleted).toBe(false);
+  expect(subscribeCompleted).toBe(false);
+  expect(link.guest.inspect()!.outgoingRequests.active).toBe(0);
+});
+
+test("provider rejects unnegotiated get and subscribe kinds before handlers or subscriptions", async () => {
+  for (const op of [RELAY_OP.RESOURCE_GET, RELAY_OP.RESOURCE_SUBSCRIBE] as const) {
+    let handlerRan = false;
+    let provider: RelayEndpoint | undefined;
+    const link = pair((from, frame) => {
+      if (from !== "guest" || frame.type !== RELAY_TYPE.REQUEST || frame.metadata.op !== op) return frame;
+      return { ...frame, metadata: { ...frame.metadata,
+        resource: { ...(frame.metadata.resource as RelayResourceRef), kind: RELAY_KIND.TERMINAL_CELLS },
+      } };
+    }, { onGet(request) {
+      handlerRan = true;
+      provider!.replyObject(request, {
+        ref: resourceRef(), codec: RELAY_CODEC.NONE, data: new Uint8Array(), value: page(1),
+      });
+    } }, {
+      guest: [RELAY_KIND.TERMINAL_CELLS, RELAY_KIND.FILE], provider: [RELAY_KIND.FILE],
+    });
+    provider = link.provider;
+    const stream = await connect(link);
+    const fileRef: RelayResourceRef = {
+      kind: RELAY_KIND.FILE, ns: "term/session-1", key: "font", revision: "f-1", rendition: "font3",
+    };
+    const result = await new Promise<ResourceResult<unknown>>(resolve => {
+      const started = op === RELAY_OP.RESOURCE_GET
+        ? link.guest.get(stream, fileRef, { accept: [RELAY_CODEC.NONE], maxObjectBytes: 4096 }, resolve as never)
+        : link.guest.subscribe(stream, fileRef, RELAY_DELIVERY.LATEST_SNAPSHOT, { onObject() {} }, resolve as never);
+      if (!("correlation" in started)) resolve({ ok: false, error: { code: started.code } });
+    });
+    await link.settle();
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error(`${op} admitted an unnegotiated kind`);
+    expect((result.error as { code: string }).code).toBe(RELAY_ERROR.UNSUPPORTED);
+    expect(handlerRan).toBe(false);
+    expect(link.provider.authority!.subscriptionsOn(stream)).toEqual([]);
+  }
+});
+
+test("push enforces negotiated kind at provider and consumer for namespace subscriptions", async () => {
+  let inject = false;
+  const link = pair((from, frame) => {
+    if (from !== "provider" || frame.type !== RELAY_TYPE.PUSH || !inject) return frame;
+    return { ...frame, metadata: { ...frame.metadata, resource: {
+      ...(frame.metadata.resource as RelayResourceRef), kind: RELAY_KIND.TERMINAL_CELLS,
+    } } };
+  }, undefined, {
+    guest: [RELAY_KIND.TERMINAL_CELLS, RELAY_KIND.FILE], provider: [RELAY_KIND.FILE],
+  });
+  const objects: unknown[] = [];
+  const ends: string[] = [];
+  const stream = await connect(link);
+  const id = await subscribe(link, stream, { ns: "term/session-1" }, objects, ends);
+  expect(link.provider.pushObject({
+    stream, subscription: id, ref: resourceRef(), codec: RELAY_CODEC.NONE,
+    data: new Uint8Array(), value: page(1),
+  })).toEqual({ ok: false, code: RELAY_ERROR.UNSUPPORTED });
+  expect(link.guest.client!.subscription(id)).toBeDefined();
+
+  inject = true;
+  const fileRef: RelayResourceRef = {
+    kind: RELAY_KIND.FILE, ns: "term/session-1", key: "font", revision: "f-1", rendition: "font3",
+  };
+  expect(link.provider.pushObject({
+    stream, subscription: id, ref: fileRef, codec: RELAY_CODEC.NONE,
+    data: new Uint8Array(), value: { slot: 19 },
+  })).toEqual({ ok: true, frames: 1 });
+  await link.settle();
+  expect(objects).toEqual([]);
+  expect(ends).toEqual([RELAY_ERROR.UNSUPPORTED]);
+  expect(link.guest.client!.subscription(id)).toBeUndefined();
+});
+
+test("negotiated kind admission covers release, evict, and invalidate paths", async () => {
+  let mutateGuestRef = false;
+  let mutateProviderRef = false;
+  let evictions = 0;
+  const link = pair((from, frame) => {
+    if (from === "guest" && mutateGuestRef && frame.metadata.resource) {
+      return { ...frame, metadata: { ...frame.metadata, resource: {
+        ...(frame.metadata.resource as RelayResourceRef), kind: RELAY_KIND.TERMINAL_CELLS,
+      } } };
+    }
+    if (from === "provider" && mutateProviderRef && frame.type === RELAY_TYPE.INVALIDATE
+        && frame.metadata.resource) {
+      return { ...frame, metadata: { ...frame.metadata, resource: {
+        ...(frame.metadata.resource as RelayResourceRef), kind: RELAY_KIND.TERMINAL_CELLS,
+      } } };
+    }
+    return frame;
+  }, { onEvict() { evictions++; } }, {
+    guest: [RELAY_KIND.TERMINAL_CELLS, RELAY_KIND.FILE], provider: [RELAY_KIND.FILE],
+  });
+  const stream = await connect(link);
+  const fileRef: RelayResourceRef = {
+    kind: RELAY_KIND.FILE, ns: "term/session-1", key: "font", revision: "f-1", rendition: "font3",
+  };
+  const lease = link.provider.authority!.allocateLease();
+  expect(link.guest.release(stream, resourceRef(), lease)).toEqual({ ok: false, code: RELAY_ERROR.UNSUPPORTED });
+  expect(link.provider.invalidate({ stream, scope: "key", ref: resourceRef() }))
+    .toEqual({ ok: false, code: RELAY_ERROR.UNSUPPORTED });
+  link.guest.reportEvict(resourceRef(), "budget");
+  await link.settle();
+  expect(evictions).toBe(0);
+
+  mutateGuestRef = true;
+  const releaseResult = await new Promise<ResourceResult<unknown>>(resolve => {
+    const started = link.guest.release(stream, fileRef, lease, resolve as never);
+    if (!("correlation" in started)) resolve({ ok: false, error: { code: started.code } });
+  });
+  await link.settle();
+  expect(releaseResult.ok).toBe(false);
+  if (releaseResult.ok) throw new Error("release admitted an unnegotiated kind");
+  expect((releaseResult.error as { code: string }).code).toBe(RELAY_ERROR.UNSUPPORTED);
+  link.guest.reportEvict(fileRef, "budget");
+  await link.settle();
+  expect(evictions).toBe(0);
+
+  mutateGuestRef = false;
+  mutateProviderRef = true;
+  const before = link.guest.client!.stats().protocolErrors;
+  expect(link.provider.invalidate({ stream, scope: "key", ref: fileRef })).toEqual({ ok: true });
+  await link.settle();
+  expect(link.guest.client!.stats().protocolErrors).toBe(before + 1);
 });

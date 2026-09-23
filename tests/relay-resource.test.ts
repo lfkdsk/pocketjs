@@ -336,6 +336,7 @@ function makeClient(opts: { maxObjectBytes?: number; maxAssemblies?: number; max
     negotiated: {
       maxObjectBytes: opts.maxObjectBytes ?? 131072,
       codecs: opts.codecs ?? [RELAY_CODEC.NONE, RELAY_CODEC.JSON, RELAY_CODEC.R5G6B5LE, RELAY_CODEC.OPAQUE_BYTES],
+      kinds: Object.values(RELAY_KIND),
     },
     assembler,
   });
