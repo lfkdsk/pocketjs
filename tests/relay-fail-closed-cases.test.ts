@@ -1,5 +1,5 @@
-// Regression cases imported from Fleet review 1307. Each case now asserts
-// the required fail-closed behavior instead of the reviewed vulnerability.
+// Fail-closed regression cases from the resource-form review rounds. Each
+// case asserts the required refusal instead of the vulnerability it found.
 
 import { expect, test } from "bun:test";
 import {
@@ -102,7 +102,7 @@ function getOnce(link: ReturnType<typeof pair>, stream: number, accept: number =
   });
 }
 
-test("review1307 A: response kind substitution ends the request as INVALID", async () => {
+test("fail-closed A: response kind substitution ends the request as INVALID", async () => {
   let localProvider: RelayEndpoint | undefined;
   let localReply: unknown;
   const local = pair({ providerHooks: { onGet(request) {
@@ -140,7 +140,7 @@ test("review1307 A: response kind substitution ends the request as INVALID", asy
   expect(link.guest.inspect()!.client!.stats()).toMatchObject({ pending: 0, protocolErrors: 1 });
 });
 
-test("review1307 B: codec-1 rejects duplicate keys and malformed UTF-8 on both ends", async () => {
+test("fail-closed B: codec-1 rejects duplicate keys and malformed UTF-8 on both ends", async () => {
   const duplicate = new TextEncoder().encode('{"lines":[],"cursor":1,"cursor":2}');
   const prefix = new TextEncoder().encode('{"lines":["');
   const suffix = new TextEncoder().encode('"],"cursor":1}');
@@ -186,7 +186,7 @@ test("review1307 B: codec-1 rejects duplicate keys and malformed UTF-8 on both e
   }
 });
 
-test("review1307 C: codec-1 rejects simultaneous metadata and data values", async () => {
+test("fail-closed C: codec-1 rejects simultaneous metadata and data values", async () => {
   const dataValue = { lines: ["data"], cursor: 1 };
   const metadataValue = { lines: ["metadata"], cursor: 2 };
   const json = new TextEncoder().encode(JSON.stringify(dataValue));
