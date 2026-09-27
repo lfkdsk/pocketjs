@@ -41,6 +41,7 @@ import {
   missCounters,
   registerSprite,
   registerTexture,
+  rebindSprite,
   release,
   render,
   resetRendererState,
@@ -850,6 +851,30 @@ describe("setProperty dispatch table [R]", () => {
     expect(host.of("setSprite")).toEqual([
       ["setSprite", fromManifest.id, 41, 8, 4, 3],
     ]);
+  });
+
+  test("rebindSprite re-emits the current binding (F3/1173 restore re-pin)", () => {
+    registerSprite("walker-right", { handle: 7, frames: 4, cols: 4, step: 2 });
+    const node = createElement("image");
+    setProp(node, "sprite", "walker-right", undefined);
+    expect(host.of("setSprite")).toEqual([
+      ["setSprite", node.id, 7, 4, 4, 2],
+    ]);
+
+    // The core advances its auto-play clock regardless of JS; rebinding
+    // must re-emit the SAME atlas/frame params so the core resets its
+    // sprite_start origin, without changing the node's sprite key.
+    host.clear();
+    rebindSprite(node);
+    expect(host.of("setSprite")).toEqual([
+      ["setSprite", node.id, 7, 4, 4, 2],
+    ]);
+
+    // A plain image with no sprite bound emits nothing.
+    host.clear();
+    const plain = createElement("image");
+    rebindSprite(plain);
+    expect(host.of("setSprite")).toEqual([]);
   });
 
   test("classList / bool: / prop: / unknown props are loud errors", () => {

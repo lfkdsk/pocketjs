@@ -198,6 +198,10 @@ export interface SimWorld {
   frame: (buttons: number, analog?: number, touches?: readonly number[], axes?: readonly AxisDelta[], motion?: MotionState | null) => void;
   tick: () => void;
   render: () => Uint8Array;
+  /** Mirror a desktop window resize (hosts/desktop/src/main.rs Input::Resize):
+   *  resize the core viewport, then invoke the guest hook the framework
+   *  installs on mount. */
+  resizeViewport: (width: number, height: number) => void;
   ticksPerFrame: number;
   hz: number;
   effects: EffectEvent[];
@@ -277,6 +281,14 @@ export async function bootWorld(
     frame,
     tick: wasm.tick,
     render: () => wasm.renderScaled(renderScale),
+    resizeViewport: (width: number, height: number) => {
+      // Same order as hosts/desktop/src/main.rs: core first, guest hook
+      // after, so the guest reads the new size from hostViewport().
+      wasm.resizeViewport(width, height);
+      const resize = (globalThis as { __pocketResizeViewport?: (w: number, h: number) => void })
+        .__pocketResizeViewport;
+      resize?.(width, height);
+    },
     ticksPerFrame: TICKS_PER_SECOND / hz,
     hz,
     effects,
