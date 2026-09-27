@@ -25,7 +25,7 @@
 
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { createWasmUi } from "../web/wasm-ops.js";
 import { normalizeHz, TICKS_PER_SECOND } from "../../framework/src/clock.ts";
 import { createTouchHitFacts, __packTouch } from "../../framework/src/touch.ts";
@@ -223,6 +223,10 @@ export interface SimViewportOptions {
  * `extraGlobals` land before eval too (e.g. a __pocketEffectDriver override —
  * tools/flake-lab.ts injects a wall-clock driver this way).
  */
+/** Boot an app bundle on the wasm core. `app` is a PocketJS app name
+ *  (dist/<app>.js, built on demand) or, for an external project that built
+ *  with `tools/build.ts --outdir`, an absolute bundle path without the
+ *  extension (<path>.js and an optional <path>.pak; never built here). */
 export async function bootWorld(
   app: string,
   hz: number,
@@ -231,7 +235,14 @@ export async function bootWorld(
   viewport: SimViewportOptions = {},
 ): Promise<SimWorld> {
   ensureBuilt(WASM_PATH, [process.execPath, "tools/wasm.ts"]);
-  ensureBuilt(DIST + app + ".js", [process.execPath, "tools/build.ts", app]);
+  const external = isAbsolute(app);
+  const bundle = external ? app : DIST + app;
+  if (external) {
+    if (!existsSync(bundle + ".js")) throw new Error(`sim: missing ${bundle}.js (build it with tools/build.ts --outdir)`);
+  } else {
+    ensureBuilt(bundle + ".js", [process.execPath, "tools/build.ts", app]);
+  }
+  const appName = external ? basename(app) : app;
   if (!wasmBytes) wasmBytes = await Bun.file(WASM_PATH).arrayBuffer();
   const wasm = await createWasmUi(wasmBytes, viewport);
   const renderScale = viewport.renderScale ?? 1;
@@ -243,15 +254,15 @@ export async function bootWorld(
   // Host-flavored op extensions (the launcher runner adds appTable/appLaunch/
   // appShot here) — installed before eval like every other contract slot.
   mutateOps?.(wasm.ops as unknown as Record<string, unknown>);
-  g.__pak = existsSync(DIST + app + ".pak")
-    ? await Bun.file(DIST + app + ".pak").arrayBuffer()
+  g.__pak = existsSync(bundle + ".pak")
+    ? await Bun.file(bundle + ".pak").arrayBuffer()
     : undefined;
   g.frame = undefined;
   g.offload = undefined; // isolated capability namespace; only test providers grant it
   g.audio = undefined; // audio module namespace: absent unless extraGlobals mounts one
   g.db = undefined; // db module namespace: absent unless extraGlobals mounts one
   g.fs = undefined; // fs module namespace: absent unless extraGlobals mounts one
-  g.__pocketApp = app;
+  g.__pocketApp = appName;
   g.__simHz = hz;
   g.__pocketEffectTrace = (e: EffectEvent) => effects.push(e);
   g.__pocketEffectDriver = undefined; // no host override unless extraGlobals injects one
@@ -260,7 +271,7 @@ export async function bootWorld(
     recv: () => (inbox.length ? inbox.shift() : null),
   };
   if (extraGlobals) Object.assign(g, extraGlobals);
-  const src = await Bun.file(DIST + app + ".js").text();
+  const src = await Bun.file(bundle + ".js").text();
   (0, eval)(src);
   const appFrame = g.frame as
     | ((buttons: number, analog?: number, touches?: readonly number[], hits?: readonly number[], touchSurfaces?: readonly number[], rightAnalog?: number, axes?: readonly AxisDelta[]) => void)
