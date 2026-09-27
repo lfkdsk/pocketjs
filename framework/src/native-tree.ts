@@ -657,6 +657,17 @@ function setSpriteSrc(node: NodeMirror, value: unknown): void {
   ops.setSprite(node.id, meta.handle, meta.frames, meta.cols, spriteStep(node, meta.step));
 }
 
+/** Re-emit the node's current sprite binding, resetting the core's
+ *  auto-play origin (`sprite_start`) to the current frame. The core clock
+ *  `frame - sprite_start` is host state outside a saved session: after a
+ *  deterministic restore a walker saved at a tile boundary must restart its
+ *  atlas cycle at cell 0, or the restored worldline renders shifted frames.
+ *  No-op on a node with no sprite bound (a plain image or idle stance). */
+export function rebindSprite(node: NodeMirror): void {
+  const key = node.domAttrs?.sprite;
+  if (typeof key === "string") setSpriteSrc(node, key);
+}
+
 function setCompositorBinding(node: NodeMirror): void {
   const ops = getOps();
   const bind = ops.setCompositorSurface;
