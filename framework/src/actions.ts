@@ -55,6 +55,12 @@ export interface ActionsHandle {
   /** The bound intents, for a touch presentation's tiles. */
   entries: Accessor<readonly ActionEntry[]>;
   run(intent: ActionIntent): void;
+  /** Reseed this handle's press-edge history after a state restore (a
+   *  save load): buttons in `held` are treated as already down, so a
+   *  button still held across the load cannot synthesize a fresh press on
+   *  the next frame. Pending hold timers clear too. Without an argument
+   *  the whole history resets, so the next frame reads every button up. */
+  resetEdges(held?: number): void;
 }
 
 /** The buttons modality's binding: intent -> BTN mask and shell glyph. */
@@ -156,6 +162,10 @@ export function useActions(actions: ActionMap | Accessor<ActionMap>, options: Us
     run(intent) {
       const spec = map()[intent];
       if (live(spec)) spec.run?.();
+    },
+    resetEdges(mask = 0) {
+      previous = mask >>> 0;
+      held.clear();
     },
   };
 }

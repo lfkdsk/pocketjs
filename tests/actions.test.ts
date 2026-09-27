@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { createRoot } from "solid-js";
 import { BTN } from "../contracts/spec/spec.ts";
 import { ACTION_BUTTONS, ACTION_INTENTS, useActions } from "../framework/src/actions.ts";
+import { resetFrameHooks, runFrameHooks } from "../framework/src/frame.ts";
 
 describe("useActions", () => {
   test("binds every intent to one face button", () => {
@@ -56,6 +57,32 @@ describe("useActions", () => {
       actions.run("action");
       actions.run("back");
       expect(fired).toBe(1);
+      dispose();
+    });
+  });
+
+  test("resetEdges(held) treats a still-held button across a save load as not a new press (F2/1173)", () => {
+    resetFrameHooks();
+    createRoot((dispose) => {
+      let confirms = 0;
+      const actions = useActions({ confirm: { label: "ok", run: () => confirms++ } });
+      runFrameHooks(0);
+      runFrameHooks(BTN.CIRCLE); // press edge: fires
+      expect(confirms).toBe(1);
+      runFrameHooks(BTN.CIRCLE); // held: no new edge
+      expect(confirms).toBe(1);
+      // A save is taken while CIRCLE is still held, then restored: seed the
+      // tracker with the saved held mask.
+      actions.resetEdges(BTN.CIRCLE);
+      runFrameHooks(BTN.CIRCLE); // still held after load: must not fire
+      expect(confirms).toBe(1);
+      runFrameHooks(0); // release
+      runFrameHooks(BTN.CIRCLE); // a genuine new press fires
+      expect(confirms).toBe(2);
+      // No-arg reset makes the next frame see every button as a fresh edge.
+      actions.resetEdges();
+      runFrameHooks(BTN.CIRCLE);
+      expect(confirms).toBe(3);
       dispose();
     });
   });
