@@ -26,6 +26,7 @@ import {
   type NodeMirror,
 } from "./renderer-vue-vapor.ts";
 import { setOverlayRoot } from "./overlay.ts";
+import { destroyNodeTree } from "./native-tree.ts";
 import { mountAuxiliarySurface, unmountAuxiliarySurface } from "./display.ts";
 import { registerStyles, resolveStyle } from "./styles.ts";
 import { handleFrame, setAuxiliaryHitRoot, setHitRoot, setInputRoot, withDeferredPress, type DeferredPress } from "./input.ts";
@@ -267,7 +268,7 @@ export function render(code: VaporRenderRoot, opts: RenderOptions = {}): () => v
     overlayLayer = null;
     for (const child of rootMirror.children.splice(0)) {
       child.parent = null;
-      host.ops.destroyNode(child.id);
+      destroyNodeTree(child, host.ops);
     }
     unmountAuxiliarySurface(host.ops);
     runSweep();
