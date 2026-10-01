@@ -1939,3 +1939,78 @@ test("Text resource swaps one complete value and unsubscribes from superseded ba
   expect(host.of("setText").some(c => c[2] === "Error")).toBe(true);
   dispose(); expect(second.listeners.size).toBe(0);
 });
+
+test("streamed images share handles and evict only after their last binding is released", () => {
+  const loads: string[] = [], freed: number[] = [];
+  host.ops.loadImageTexture = key => { loads.push(key); return key === "missing" ? -1 : loads.length - 1; };
+  host.ops.imageTextureBytes = () => 1536 * 1024;
+  host.ops.freeTexture = handle => { freed.push(handle); };
+  const a = createElement("image"), b = createElement("image"), c = createElement("image");
+  setProp(a, "src", "shared", undefined);
+  setProp(b, "src", "shared", undefined);
+  setProp(c, "src", "other", undefined);
+  expect(loads).toEqual(["shared", "other"]);
+  expect(freed).toEqual([]);
+  expect(() => setProp(a, "src", "missing", "shared")).toThrow(/unknown image/);
+  setProp(a, "src", "", "missing");
+  expect(freed).toEqual([]);
+  setProp(b, "src", "", "shared");
+  expect(freed).toEqual([0]);
+  registerSprite("atlas", { handle: 99, frames: 2, cols: 2, step: 1 });
+  setProp(a, "src", "third", "");
+  setProp(c, "sprite", "atlas", undefined);
+  expect(freed).toEqual([0, 1]);
+});
+
+test("streamed image ownership requires load, size and release capabilities", () => {
+  const loads: string[] = [], freed: number[] = [];
+  host.ops.loadImageTexture = key => { loads.push(key); return 7; };
+  const image = createElement("image");
+  expect(() => setProp(image, "src", "partial", undefined)).toThrow(/unknown image/);
+  expect(loads).toEqual([]);
+
+  host.ops.imageTextureBytes = () => Number.NaN;
+  host.ops.freeTexture = handle => { freed.push(handle); };
+  expect(() => setProp(image, "src", "invalid-size", "partial")).toThrow(/non-negative safe integer/);
+  expect(loads).toEqual(["invalid-size"]);
+  expect(freed).toEqual([7]);
+});
+
+test("public disposal releases streamed image leases before recursive native destroy", () => {
+  const freed: number[] = [];
+  let next = 0;
+  host.ops.loadImageTexture = () => next++;
+  host.ops.imageTextureBytes = () => 1536 * 1024;
+  host.ops.freeTexture = handle => { freed.push(handle); };
+  const dispose = publicRender(() => {
+    const image = createElement("image");
+    setProp(image, "src", "mounted", undefined);
+    return image;
+  }, { ops: host.ops, styles: {} });
+  const appLayer = rootMirror.children[0];
+  const mountedImage = appLayer.children[0];
+  (appLayer.children as unknown[])[0] = { nodes: [[mountedImage]] };
+  dispose();
+
+  const replacement = createElement("image");
+  setProp(replacement, "src", "replacement", undefined);
+  expect(freed).toEqual([0]);
+});
+
+test("a failed streamed image allocation evicts unused entries and retries once", () => {
+  const loads: string[] = [], freed: number[] = [];
+  let retried = false;
+  host.ops.loadImageTexture = key => {
+    loads.push(key);
+    if (key === "second" && !retried) { retried = true; return -1; }
+    return key === "first" ? 10 : 11;
+  };
+  host.ops.imageTextureBytes = () => 512 * 1024;
+  host.ops.freeTexture = handle => { freed.push(handle); };
+  const image = createElement("image");
+  setProp(image, "src", "first", undefined);
+  setProp(image, "src", "", "first");
+  setProp(image, "src", "second", "");
+  expect(loads).toEqual(["first", "second", "second"]);
+  expect(freed).toEqual([10]);
+});

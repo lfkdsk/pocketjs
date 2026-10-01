@@ -23,8 +23,20 @@ export function createNodeRef(): NodeSlot {
   });
   return slot;
 }
-export function clearNodeReferences(node: NodeMirror): void {
-  for (const child of node.children) clearNodeReferences(child);
+function clearNodeReferenceTree(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const child of value) clearNodeReferenceTree(child);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  const candidate = value as { id?: unknown; children?: unknown; nodes?: unknown };
+  clearNodeReferenceTree(candidate.children);
+  clearNodeReferenceTree(candidate.nodes);
+  if (typeof candidate.id !== "number") return;
+  const node = value as NodeMirror;
   for (const slot of references.get(node) ?? []) slot.current = null;
   references.delete(node);
+}
+export function clearNodeReferences(node: NodeMirror): void {
+  clearNodeReferenceTree(node);
 }

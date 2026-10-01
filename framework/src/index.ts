@@ -39,6 +39,7 @@ import {
   type NodeMirror,
 } from "./renderer.ts";
 import { setOverlayRoot } from "./overlay.ts";
+import { destroyNodeTree } from "./native-tree.ts";
 import { mountAuxiliarySurface, unmountAuxiliarySurface } from "./display.ts";
 import { registerStyles, resolveStyle } from "./styles.ts";
 import { handleFrame, setAuxiliaryHitRoot, setHitRoot, setInputRoot, withDeferredPress, type DeferredPress } from "./input.ts";
@@ -316,7 +317,7 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
     overlayLayer = null;
     for (const child of rootMirror.children.splice(0)) {
       child.parent = null;
-      host.ops.destroyNode(child.id); // recursive native destroy
+      destroyNodeTree(child, host.ops); // recursive native destroy
     }
     unmountAuxiliarySurface(host.ops);
     runSweep(); // anything already detached this frame is garbage too

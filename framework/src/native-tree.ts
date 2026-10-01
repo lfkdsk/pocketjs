@@ -331,6 +331,10 @@ export function registerTexture(key: string, handle: number): void {
 }
 
 export function resetTextures(): void {
+  for (const entry of streamImages.values()) entry.free(entry.handle);
+  streamImages.clear();
+  nodeImages.clear();
+  streamImageBytes = 0;
   textures.clear();
 }
 
@@ -412,8 +416,7 @@ export function runSweep(): void {
       keep.push(node);
       continue;
     }
-    clearNodeReferences(node);
-    ops.destroyNode(node.id);
+    destroyNodeTree(node, ops);
   }
   sweepSet.clear();
   for (let i = 0; i < keep.length; i++) sweepSet.add(keep[i]);
@@ -618,17 +621,124 @@ function setClass(node: NodeMirror, value: unknown): void {
   ops.setStyle(node.id, styleId);
 }
 
+interface StreamImage {
+  handle: number;
+  refs: number;
+  bytes: number;
+  free: (handle: number) => void;
+}
+const streamImages = new Map<string, StreamImage>();
+const nodeImages = new Map<number, string>();
+let streamImageBytes = 0;
+const STREAM_IMAGE_BUDGET = 2 * 1024 * 1024;
+function freeStreamImage(entry: StreamImage): void {
+  entry.free(entry.handle);
+  streamImageBytes -= entry.bytes;
+}
+function releaseImage(node: NodeMirror): void {
+  const key = nodeImages.get(node.id);
+  if (key !== undefined) {
+    const entry = streamImages.get(key);
+    if (entry) {
+      entry.refs--;
+      if (entry.refs === 0) {
+        // An image's most recent use ends when its final binding is released.
+        streamImages.delete(key);
+        streamImages.set(key, entry);
+      }
+    }
+    nodeImages.delete(node.id);
+  }
+}
+function releaseImageTree(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const child of value) releaseImageTree(child);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  const candidate = value as { id?: unknown; children?: unknown; nodes?: unknown };
+  if (typeof candidate.id === "number") releaseImage(value as NodeMirror);
+  // Vue Vapor fragment wrappers carry nested mirror nodes in `nodes` rather
+  // than `children`. Walk both shapes without following NodeMirror.parent.
+  releaseImageTree(candidate.children);
+  releaseImageTree(candidate.nodes);
+}
+function evictUnusedImages(all = false): number {
+  let freed = 0;
+  for (const [key, entry] of streamImages) {
+    if (entry.refs !== 0) continue;
+    freeStreamImage(entry);
+    streamImages.delete(key);
+    freed++;
+    if (!all && streamImageBytes <= STREAM_IMAGE_BUDGET) break;
+  }
+  return freed;
+}
+function trimImages(): void {
+  if (streamImageBytes > STREAM_IMAGE_BUDGET) evictUnusedImages();
+}
 function setSrc(node: NodeMirror, value: unknown): void {
   const ops = getOps();
+  if (typeof value === "string" && nodeImages.get(node.id) === value) return;
   if (value == null || value === "") {
     ops.setImage(node.id, -1);
+    releaseImage(node);
+    trimImages();
     return;
   }
   if (typeof value !== "string") {
     throw new Error("PocketJS: src must be a string key");
   }
-  const handle = resolveTexture(value);
-  if (handle !== undefined) ops.setImage(node.id, handle);
+  let handle = textures.get(value);
+  const canStream = ops.loadImageTexture && ops.imageTextureBytes && ops.freeTexture;
+  if (handle === undefined && canStream) {
+    let entry = streamImages.get(value);
+    if (!entry) {
+      let loaded = ops.loadImageTexture!(value);
+      // A failed allocation can be caused by unused decoded textures that
+      // still occupy the fixed native arena. Reclaim them and retry once.
+      if (loaded < 0 && evictUnusedImages(true) > 0) loaded = ops.loadImageTexture!(value);
+      if (loaded >= 0) {
+        const bytes = ops.imageTextureBytes!(loaded);
+        if (!Number.isSafeInteger(bytes) || bytes < 0) {
+          ops.freeTexture!(loaded);
+          throw new Error("PocketJS: imageTextureBytes() must return a non-negative safe integer");
+        }
+        entry = { handle: loaded, refs: 0, bytes, free: handle => ops.freeTexture!(handle) };
+        streamImages.set(value, entry);
+        streamImageBytes += entry.bytes;
+      }
+    }
+    if (entry) {
+      releaseImage(node);
+      entry.refs++;
+      nodeImages.set(node.id, value);
+      handle = entry.handle;
+      // Move each hit to the end: evict least-recently-used unbound images.
+      streamImages.delete(value);
+      streamImages.set(value, entry);
+    }
+  }
+  if (handle === undefined) {
+    if (getHost().strict) {
+      throw new Error(
+        `PocketJS: unknown image src "${value}" - no texture registered under that key`,
+      );
+    }
+    missCounters.unknownTexture++;
+    return;
+  }
+  if (textures.has(value)) releaseImage(node);
+  ops.setImage(node.id, handle);
+  trimImages();
+}
+
+/** Release framework-owned resources before a host recursively destroys a mirror subtree. */
+export function destroyNodeTree(node: NodeMirror, ops = getOps()): void {
+  releaseImageTree(node);
+  trimImages();
+  clearNodeReferences(node);
+  ops.destroyNode(node.id);
 }
 
 /** `sprite` prop → bind an animated sprite atlas. Auto-play is native; JS never
@@ -645,6 +755,8 @@ function setSpriteSrc(node: NodeMirror, value: unknown): void {
   const ops = getOps();
   if (value == null || value === "") {
     ops.setSprite(node.id, -1, 0, 0, 0);
+    releaseImage(node);
+    trimImages();
     return;
   }
   if (typeof value !== "string") {
@@ -661,6 +773,8 @@ function setSpriteSrc(node: NodeMirror, value: unknown): void {
     return;
   }
   ops.setSprite(node.id, meta.handle, meta.frames, meta.cols, spriteStep(node, meta.step));
+  releaseImage(node);
+  trimImages();
 }
 
 /** Re-emit the node's current sprite binding, resetting the core's
