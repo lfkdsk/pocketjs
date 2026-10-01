@@ -398,22 +398,7 @@ fn strip_texels(psm: u32) -> i32 {
     }
 }
 
-/// Sprites one TEX_QUAD becomes: 1 unless the quad maps texels 1:1 in the
-/// positive direction on whole-texel bounds and is wider than one strip.
-fn strip_count(texels: (f32, f32, f32, f32), w: i32, h: i32, strip: i32) -> usize {
-    let (u0, v0, u1, v1) = texels;
-    let whole = |t: f32| t == (t as i32) as f32;
-    if w <= strip
-        || u0 < 0.0
-        || !(whole(u0) && whole(u1) && whole(v0) && whole(v1))
-        || u1 as i32 - u0 as i32 != w
-        || v1 as i32 - v0 as i32 != h
-    {
-        return 1;
-    }
-    let (a, b) = (u0 as i32, u1 as i32);
-    ((b + strip - 1) / strip - a / strip) as usize
-}
+use crate::tex_strips::strip_count;
 
 /// Render one frame's DrawList into the open display list.
 pub unsafe fn render(ui: &Ui, words: &[u32]) {
@@ -715,16 +700,17 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                             s += 1;
                             continue;
                         }
-                        // 1:1 texel mapping: cut at absolute multiples of the
+                        // Integer texel mapping: cut at absolute multiples of the
                         // strip width so every strip stays inside one
                         // texture-cache-sized column of the source.
                         let u0 = tu0 as i32;
                         let u1 = tu1 as i32;
+                        let scale = qw / (u1 - u0);
                         let mut a = u0;
                         while a < u1 {
                             let b = ((a / strip + 1) * strip).min(u1);
-                            let x0 = qx as i32 + (a - u0);
-                            let x1 = qx as i32 + (b - u0);
+                            let x0 = qx as i32 + (a - u0) * scale;
+                            let x1 = qx as i32 + (b - u0) * scale;
                             *verts.add(s * 2) = vert(a as f32, tv0, x0, qy as i32);
                             *verts.add(s * 2 + 1) = vert(b as f32, tv1, x1, qy as i32 + qh);
                             s += 1;
