@@ -19,7 +19,7 @@
 //                  and the settled final screen is byte-equal across rates.
 
 import { describe, expect, test } from "bun:test";
-import { runScenario, treeHasText, type Trace } from "../hosts/sim/sim.ts";
+import { bootWorld, fnv1a, runScenario, treeHasText, type Trace } from "../hosts/sim/sim.ts";
 import { BTN } from "../contracts/spec/spec.ts";
 
 // The user journey, in virtual seconds (one script drives every rate; the
@@ -101,5 +101,79 @@ describe("the journey actually happened", () => {
     expect(treeHasText(t60.tree, "TOTAL $0.00")).toBe(true);
     expect(treeHasText(t60.tree, "OAT LATTE")).toBe(true);
     expect(treeHasText(t2.tree, "ORDERS PLACED 1")).toBe(true);
+  });
+});
+
+describe("sim world lifecycle", () => {
+  test("a newer overlapping boot supersedes the older request", async () => {
+    const baseline = await bootWorld("cafe-main", 60);
+    baseline.frame(0);
+    baseline.tick();
+    const expected = fnv1a(baseline.render());
+    const [older, newer] = await Promise.allSettled([
+      bootWorld("cafe-main", 60),
+      bootWorld("cafe-main", 60),
+    ]);
+
+    expect(older.status).toBe("rejected");
+    if (older.status === "rejected") {
+      expect(String(older.reason)).toContain("superseded by a newer boot");
+    }
+    expect(newer.status).toBe("fulfilled");
+    if (newer.status === "fulfilled") {
+      newer.value.frame(0);
+      newer.value.tick();
+      expect(newer.value.render().byteLength).toBe(480 * 272 * 4);
+      expect(fnv1a(newer.value.render())).toBe(expected);
+    }
+  });
+
+  test("a replaced world cannot drive or resize the active world", async () => {
+    let olderOps: Record<string, unknown> | undefined;
+    const older = await bootWorld(
+      "cafe-main",
+      60,
+      undefined,
+      (ops) => { olderOps = ops; },
+      { width: 720, height: 480 },
+    );
+    let activeOps: Record<string, unknown> | undefined;
+    const active = await bootWorld(
+      "cafe-main",
+      60,
+      undefined,
+      (ops) => { activeOps = ops; },
+      { width: 480, height: 272 },
+    );
+
+    expect(() => older.frame(0)).toThrow("superseded by a newer boot");
+    expect(() => older.tick()).toThrow("superseded by a newer boot");
+    expect(() => older.render()).toThrow("superseded by a newer boot");
+    expect(() => older.resizeViewport(600, 400)).toThrow("superseded by a newer boot");
+    expect(() => older.getTree()).toThrow("superseded by a newer boot");
+    expect(olderOps?.__viewport).toEqual({ w: 720, h: 480 });
+    expect(activeOps?.__viewport).toEqual({ w: 480, h: 272 });
+    expect(active.render().byteLength).toBe(480 * 272 * 4);
+    active.resizeViewport(600, 400);
+    expect(activeOps?.__viewport).toEqual({ w: 600, h: 400 });
+    expect(active.render().byteLength).toBe(600 * 400 * 4);
+  });
+
+  test("a fresh boot clears capabilities and custom globals from its predecessor", async () => {
+    const marker = {};
+    const globals = globalThis as Record<string, unknown>;
+    await bootWorld("cafe-main", 60, {
+      net: marker,
+      media: marker,
+      __simLifecycleProbe: marker,
+    });
+    expect(globals.net).toBe(marker);
+    expect(globals.media).toBe(marker);
+    expect(globals.__simLifecycleProbe).toBe(marker);
+
+    await bootWorld("cafe-main", 60);
+    expect(globals.net).toBeUndefined();
+    expect(globals.media).toBeUndefined();
+    expect(globals.__simLifecycleProbe).toBeUndefined();
   });
 });

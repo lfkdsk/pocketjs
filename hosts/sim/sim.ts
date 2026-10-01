@@ -191,12 +191,64 @@ function ensureBuilt(path: string, cmd: string[]): void {
 }
 
 let wasmBytes: ArrayBuffer | null = null;
+let nextWorldId = 0;
+let activeWorldId = 0;
+let injectedGlobalRestore = new Map<PropertyKey, PropertyDescriptor | undefined>();
+
+const SIM_GLOBAL_SLOTS = [
+  "ui",
+  "__pak",
+  "frame",
+  "offload",
+  "audio",
+  "db",
+  "fs",
+  "net",
+  "media",
+  "__pocketApp",
+  "__simHz",
+  "__pocketEffectTrace",
+  "__pocketEffectDriver",
+  "__pocketDevtoolsTransport",
+  "__pocketDevtools",
+  "__pocketDocument",
+  "__pocketResizeViewport",
+] as const;
+
+/** Restore caller-owned globals shadowed by the preceding world's extras. */
+function restoreInjectedGlobals(g: Record<PropertyKey, unknown>): void {
+  for (const [key, descriptor] of injectedGlobalRestore) {
+    if (descriptor) Object.defineProperty(g, key, descriptor);
+    else Reflect.deleteProperty(g, key);
+  }
+  injectedGlobalRestore = new Map();
+}
+
+function clearSimGlobals(g: Record<PropertyKey, unknown>): void {
+  restoreInjectedGlobals(g);
+  for (const key of SIM_GLOBAL_SLOTS) Reflect.deleteProperty(g, key);
+}
+
+function installExtraGlobals(
+  g: Record<PropertyKey, unknown>,
+  extraGlobals: Record<string, unknown> | undefined,
+): void {
+  if (!extraGlobals) return;
+  const hostSlots = new Set<PropertyKey>(SIM_GLOBAL_SLOTS);
+  for (const key of Reflect.ownKeys(extraGlobals)) {
+    if (!hostSlots.has(key)) {
+      injectedGlobalRestore.set(key, Object.getOwnPropertyDescriptor(g, key));
+    }
+  }
+  Object.assign(g, extraGlobals);
+}
 
 export interface SimWorld {
   /** One host frame: buttons bitmask, analog byte, packed touch contacts
    *  (framework/src/touch.ts __packTouch format) — exactly the native frame() shape. */
   frame: (buttons: number, analog?: number, touches?: readonly number[], axes?: readonly AxisDelta[], motion?: MotionState | null) => void;
   tick: () => void;
+  /** Borrowed wasm-memory view, valid until this world renders again. */
   render: () => Uint8Array;
   /** Mirror a desktop window resize (hosts/desktop/src/main.rs Input::Resize):
    *  resize the core viewport, then invoke the guest hook the framework
@@ -220,7 +272,9 @@ export interface SimViewportOptions {
 /**
  * Boot a fresh world: fresh wasm core, fresh bundle eval, host globals
  * (ui/__pak/__simHz/effect trace/DevTools transport) installed before eval —
- * the identical boot the browser host performs, minus the screen.
+ * the identical boot the browser host performs, minus the screen. A Bun
+ * realm has one active world: the next boot supersedes the previous handle,
+ * and among overlapping requests the newest one wins before globals change.
  * `extraGlobals` land before eval too (e.g. a __pocketEffectDriver override —
  * tools/flake-lab.ts injects a wall-clock driver this way).
  */
@@ -243,36 +297,40 @@ export async function bootWorld(
   } else {
     ensureBuilt(bundle + ".js", [process.execPath, "tools/build.ts", app]);
   }
+  const worldId = ++nextWorldId;
   const appName = external ? basename(app) : app;
-  if (!wasmBytes) wasmBytes = await Bun.file(WASM_PATH).arrayBuffer();
-  const wasm = await createWasmUi(wasmBytes, viewport);
+  const [loadedWasm, pak, src] = await Promise.all([
+    wasmBytes ? Promise.resolve(wasmBytes) : Bun.file(WASM_PATH).arrayBuffer(),
+    existsSync(bundle + ".pak")
+      ? Bun.file(bundle + ".pak").arrayBuffer()
+      : Promise.resolve(undefined),
+    Bun.file(bundle + ".js").text(),
+  ]);
+  wasmBytes ??= loadedWasm;
+  const wasm = await createWasmUi(loadedWasm, viewport);
+  if (worldId !== nextWorldId) {
+    throw new Error(`sim: boot for ${appName} was superseded by a newer boot`);
+  }
   const renderScale = viewport.renderScale ?? 1;
-  const g = globalThis as Record<string, unknown>;
+  const g = globalThis as Record<PropertyKey, unknown>;
   const effects: EffectEvent[] = [];
   const inbox: string[] = [];
   const outbox: string[] = [];
+  activeWorldId = worldId;
+  clearSimGlobals(g);
   g.ui = wasm.ops;
   // Host-flavored op extensions (the launcher runner adds appTable/appLaunch/
   // appShot here) — installed before eval like every other contract slot.
   mutateOps?.(wasm.ops as unknown as Record<string, unknown>);
-  g.__pak = existsSync(bundle + ".pak")
-    ? await Bun.file(bundle + ".pak").arrayBuffer()
-    : undefined;
-  g.frame = undefined;
-  g.offload = undefined; // isolated capability namespace; only test providers grant it
-  g.audio = undefined; // audio module namespace: absent unless extraGlobals mounts one
-  g.db = undefined; // db module namespace: absent unless extraGlobals mounts one
-  g.fs = undefined; // fs module namespace: absent unless extraGlobals mounts one
+  g.__pak = pak;
   g.__pocketApp = appName;
   g.__simHz = hz;
   g.__pocketEffectTrace = (e: EffectEvent) => effects.push(e);
-  g.__pocketEffectDriver = undefined; // no host override unless extraGlobals injects one
   g.__pocketDevtoolsTransport = {
     send: (line: string) => outbox.push(line),
     recv: () => (inbox.length ? inbox.shift() : null),
   };
-  if (extraGlobals) Object.assign(g, extraGlobals);
-  const src = await Bun.file(bundle + ".js").text();
+  installExtraGlobals(g, extraGlobals);
   (0, eval)(src);
   const appFrame = g.frame as
     | ((buttons: number, analog?: number, touches?: readonly number[], hits?: readonly number[], touchSurfaces?: readonly number[], rightAnalog?: number, axes?: readonly AxisDelta[], motion?: MotionState | null) => void)
@@ -280,25 +338,40 @@ export async function bootWorld(
   if (typeof appFrame !== "function") {
     throw new Error("sim: bundle did not install globalThis.frame (entry must call render()/mount())");
   }
+  const appResize = g.__pocketResizeViewport as
+    | ((width: number, height: number) => void)
+    | undefined;
+  const assertActive = (): void => {
+    if (activeWorldId !== worldId) {
+      throw new Error(`sim: ${appName} world was superseded by a newer boot`);
+    }
+  };
   // Touch hit facts (docs/TOUCH.md): the sim is a host, so it resolves each
   // new contact's bounds hit against the committed core frame and carries it
   // — the guest never queries on the touch path, exactly like device hosts.
   const hitTestBounds = (wasm.ops as { hitTestBounds?: (x: number, y: number) => number })
     .hitTestBounds;
   const hitFacts = hitTestBounds ? createTouchHitFacts(hitTestBounds) : undefined;
-  const frame = (buttons: number, analog?: number, touches?: readonly number[], axes?: readonly AxisDelta[], motion?: MotionState | null): void =>
+  const frame = (buttons: number, analog?: number, touches?: readonly number[], axes?: readonly AxisDelta[], motion?: MotionState | null): void => {
+    assertActive();
     appFrame(buttons, analog, touches, hitFacts?.(touches), undefined, undefined, axes, motion);
+  };
   return {
     frame,
-    tick: wasm.tick,
-    render: () => wasm.renderScaled(renderScale),
+    tick: () => {
+      assertActive();
+      wasm.tick();
+    },
+    render: () => {
+      assertActive();
+      return wasm.renderScaled(renderScale);
+    },
     resizeViewport: (width: number, height: number) => {
+      assertActive();
       // Same order as hosts/desktop/src/main.rs: core first, guest hook
       // after, so the guest reads the new size from hostViewport().
       wasm.resizeViewport(width, height);
-      const resize = (globalThis as { __pocketResizeViewport?: (w: number, h: number) => void })
-        .__pocketResizeViewport;
-      resize?.(width, height);
+      appResize?.(width, height);
     },
     ticksPerFrame: TICKS_PER_SECOND / hz,
     hz,
@@ -307,6 +380,7 @@ export async function bootWorld(
     // shim polls its transport at frame start). The probe frame advances the
     // world — call it only when the run is over.
     getTree: () => {
+      assertActive();
       outbox.length = 0;
       inbox.push(JSON.stringify({ t: "getTree" }));
       frame(0);
