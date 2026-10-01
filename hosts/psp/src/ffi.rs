@@ -313,7 +313,13 @@ unsafe extern "C" fn js_free_texture(
     argc: i32,
     argv: *mut JSValue,
 ) -> JSValue {
-    ui().free_texture(arg_i32(ctx, argc, argv, 0));
+    let handle = arg_i32(ctx, argc, argv, 0);
+    if ui().texture(handle).is_some() {
+        // The previous display list can still reference this RAM while JS
+        // prepares the next frame. Finish its reads before reusing the block.
+        psp::sys::sceGuSync(psp::sys::GuSyncMode::Finish, psp::sys::GuSyncBehavior::Wait);
+        ui().free_texture(handle);
+    }
     JS_UNDEFINED
 }
 
