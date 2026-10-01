@@ -1269,6 +1269,12 @@ pub unsafe fn register(
         add_fn(ctx, io, b"uploadIndexedImage\0", js_offload_upload_indexed, 4);
         JS_SetPropertyStr(ctx, global, b"offload\0".as_ptr() as *const _, io);
     }
+    #[cfg(feature = "bench")]
+    {
+        add_fn(ctx, global, b"__pspNow\0", js_psp_now, 0);
+        add_fn(ctx, global, b"__pspRoundTrip\0", js_psp_round_trip, 1);
+        add_fn(ctx, global, b"__pspLog\0", js_psp_log, 1);
+    }
     let ui_obj = JS_NewObject(ctx);
     if crate::pak_external::enabled() {
         add_fn(ctx, global, b"__pakRead\0", js_pak_read, 3);
@@ -1420,7 +1426,6 @@ pub unsafe fn register_audio(ctx: *mut JSContext, global: JSValue) {
     add_fn(ctx, audio_obj, b"poll\0", js_audio_poll, 0);
     JS_SetPropertyStr(ctx, global, b"audio\0".as_ptr() as *const _, audio_obj);
 }
-
 unsafe extern "C" fn js_pak_read(ctx: *mut JSContext, _: JSValue, n: i32, a: *mut JSValue) -> JSValue {
     if n < 3 { return JS_UNDEFINED; }
     let start = arg_i32(ctx, n, a, 1);
@@ -1452,4 +1457,30 @@ unsafe extern "C" fn js_load_image_texture(ctx: *mut JSContext, _: JSValue, n: i
 unsafe extern "C" fn js_image_texture_bytes(ctx: *mut JSContext, _: JSValue, n: i32, a: *mut JSValue) -> JSValue {
     let bytes = ui().texture(arg_i32(ctx, n, a, 0)).map(|t| t.pixels.len() + t.palette.map_or(0, |p| p.len())).unwrap_or(0);
     JS_NewInt32(ctx, bytes as i32)
+}
+
+#[cfg(feature = "bench")]
+unsafe extern "C" fn js_psp_now(ctx: *mut JSContext, _: JSValue, _: i32, _: *mut JSValue) -> JSValue {
+    JS_NewFloat64(ctx, psp::sys::sceKernelGetSystemTimeWide() as f64)
+}
+#[cfg(feature = "bench")]
+unsafe extern "C" fn js_psp_log(ctx: *mut JSContext, _: JSValue, n: i32, a: *mut JSValue) -> JSValue {
+    use psp::sys::{self, IoOpenFlags};
+    if n < 1 { return JS_UNDEFINED; }
+    let mut len = 0;
+    let p = JS_ToCStringLen2(ctx, &mut len, *a, 0);
+    if !p.is_null() {
+        let fd = sys::sceIoOpen(b"host0:/profile.jsonl\0".as_ptr(), IoOpenFlags::WR_ONLY | IoOpenFlags::CREAT | IoOpenFlags::APPEND, 0o777);
+        if fd.0 >= 0 { sys::sceIoWrite(fd, p as *const _, len); sys::sceIoWrite(fd, b"\n".as_ptr() as *const _, 1); sys::sceIoClose(fd); }
+        JS_FreeCString(ctx, p);
+    }
+    JS_UNDEFINED
+}
+
+#[cfg(feature = "bench")]
+unsafe extern "C" fn js_psp_round_trip(ctx: *mut JSContext, _: JSValue, n: i32, a: *mut JSValue) -> JSValue {
+    if n < 1 { return JS_UNDEFINED; }
+    let mut value = 0.0;
+    if JS_ToFloat64(ctx, &mut value, *a) < 0 { return JS_UNDEFINED; }
+    JS_NewFloat64(ctx, value)
 }
