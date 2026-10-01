@@ -170,6 +170,9 @@ export interface HostOps {
   /** Decode tile `index` of a TILESET pak entry (`key`) into a texture.
    *  → generation-tagged handle, or -1 (absent/solid/malformed tile). */
   loadTileTexture?(key: string, index: number): number;
+  /** Optional file-backed image source. The renderer owns residency. */
+  loadImageTexture?(key: string): number;
+  imageTextureBytes?(handle: number): number;
   /** Release a texture slot. The handle is dead afterwards (stale handles
    *  draw nothing — handles are generation-tagged, spec TEX_SLOT_BITS). */
   freeTexture?(handle: number): void;
