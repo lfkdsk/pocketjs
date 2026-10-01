@@ -36,10 +36,10 @@ one JSON line (`{data:{"$b":…}, size, eof}`), `write(path, data, mode)`
 with truncate/append modes, `remove(path, recursive)`, `list(path, offset)`
 → name-sorted, paged entries, `stat(path)` → `{kind, size}`,
 `mkdir(path)` (recursive, idempotent), `rename(from, to)`, `usage()` →
-`{usedBytes, quotaBytes}`, and `lastError()`. Hosts may also expose
+`{usedBytes, quotaBytes}`, and `lastError()`. Hosts may expose
 `readText(path)`, which validates and returns one complete UTF-8 file as a raw
 string. It returns `""` on error and sets `lastError()`; a successful empty file
-also returns `""` but clears `lastError()`. The SDK probes for the method and
+returns `""` but clears `lastError()`. The SDK probes for the method and
 falls back to `read` when it is absent.
 
 **Payloads** cross as one JSON value: text as a JSON string (stored as its
@@ -88,9 +88,9 @@ whole-file atomicity above 64 KiB writes to a sibling name and
 
 **Ceilings.** `FS_MAX_IO_BYTES` (64 KiB) per read/write payload — the SDK
 chunks larger files, so the ceiling bounds marshaling, not file size. It does
-not apply to optional `readText`, whose successful return always holds the
-complete file; memory-constrained hosts omit that method and retain paged
-binary reads.
+not apply to optional `readText`, whose successful return holds the complete
+file up to `FS_MAX_TEXT_BYTES` (1 MiB). Larger files fall back to paged binary
+reads, and memory-constrained hosts may omit the method.
 `FS_MAX_DIR_ENTRIES` (256) per `list()` call, paged via offset + eof — a
 big directory is slower to enumerate, never impossible. Paths:
 `FS_MAX_DEPTH` (8) segments of `FS_MAX_SEGMENT_BYTES` (64) each,
