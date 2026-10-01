@@ -3,6 +3,7 @@ import type { HostOps } from "./host.ts";
 import {
   adoptNativeRoot,
   createElement,
+  destroyNodeTree,
   insertNode,
   releaseNativeRoot,
   setProp,
@@ -83,7 +84,7 @@ export function unmountAuxiliarySurface(ops: HostOps): void {
   if (!mounted) return;
   for (const child of mounted.native.children.splice(0)) {
     child.parent = null;
-    ops.destroyNode(child.id);
+    destroyNodeTree(child, ops);
   }
   releaseNativeRoot(mounted.native);
 }
