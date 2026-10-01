@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   FS_MAX_DIR_ENTRIES,
   FS_MAX_IO_BYTES,
+  FS_MAX_TEXT_BYTES,
   FS_WRITE_APPEND,
   FS_WRITE_TRUNCATE,
   fsValidPath,
@@ -98,13 +99,16 @@ describe("sim host ops", () => {
     expect(JSON.parse(ns.read("f.txt", 0, FS_MAX_IO_BYTES + 1)).error).toContain("maxBytes");
   });
 
-  test("readText returns complete strict UTF-8 without the binary I/O ceiling", () => {
+  test("readText returns complete strict UTF-8 above the binary per-call ceiling", () => {
     const ns = mount().ns as Ns;
     const chunk = "x".repeat(FS_MAX_IO_BYTES);
     expect(ns.write("big.txt", text(chunk), FS_WRITE_TRUNCATE)).toBe(0);
     expect(ns.write("big.txt", text("终"), FS_WRITE_APPEND)).toBe(0);
     expect(ns.readText("big.txt")).toBe(`${chunk}终`);
     expect(ns.lastError()).toBe("");
+
+    expect(ns.write("bom.txt", text("\ufeffline\n\0"), FS_WRITE_TRUNCATE)).toBe(0);
+    expect(ns.readText("bom.txt")).toBe("\ufeffline\n\0");
 
     expect(ns.write("empty.txt", text(""), FS_WRITE_TRUNCATE)).toBe(0);
     expect(ns.readText("missing.txt")).toBe("");
@@ -270,6 +274,16 @@ describe("fs SDK", () => {
     sim.log.length = 0;
     expect(readFileSync("legacy.txt", "utf8")).toBe("legacy ✓");
     expect(sim.log[0]).toBe(`op read legacy.txt 0 ${FS_MAX_IO_BYTES}`);
+  });
+
+  test("UTF-8 reads fall back to paged bytes above the text ceiling", () => {
+    const sim = mount();
+    const text = "x".repeat(FS_MAX_TEXT_BYTES + 1);
+    write("large.txt", text);
+    sim.log.length = 0;
+    expect(readFileSync("large.txt", "utf8")).toBe(text);
+    expect(sim.log[0]).toBe("op readText large.txt");
+    expect(sim.log[1]).toBe(`op read large.txt 0 ${FS_MAX_IO_BYTES}`);
   });
 
   test("UTF-8 reads surface native validation failures", () => {
