@@ -563,11 +563,15 @@ mod tests {
                 // JSON.stringify("ok") is a text payload; stored bytes are
                 // its decoded value ("ok" = 2 bytes).
                 if (read.size !== 2 || !read.eof) throw new Error("bad read: " + JSON.stringify(read));
+                if (fs.readText("saves/slot1.json") !== "ok" || fs.lastError() !== "") {
+                    throw new Error("bad text read");
+                }
                 if (JSON.parse(fs.read("../other/data/x", 0, 16)).error !== "invalid path") {
                     throw new Error("traversal not refused");
                 }
-                // The namespace carries all nine ops.
-                for (const op of ["read","write","remove","list","stat","mkdir","rename","usage","lastError"]) {
+                // The desktop namespace carries all required ops and the
+                // optional whole-file text acceleration.
+                for (const op of ["read","write","remove","list","stat","mkdir","rename","usage","lastError","readText"]) {
                     if (typeof fs[op] !== "function") throw new Error("fs." + op + " missing");
                 }
                 globalThis.fsProbe = read.size;

@@ -537,8 +537,8 @@ pub mod db {
 }
 
 /// FS module boundary (contracts/spec/fs.ts — `globalThis.fs`).
-/// A per-app file tree behind nine synchronous ops; every path resolves
-/// under the app's own data root. No clock, no events, no mtime.
+/// A per-app file tree behind nine required ops plus optional readText;
+/// every path resolves under the app's own data root. No clock, no events, no mtime.
 pub mod fs {
     pub const OP_READ: u8 = 1;
     pub const OP_WRITE: u8 = 2;
@@ -549,6 +549,7 @@ pub mod fs {
     pub const OP_RENAME: u8 = 7;
     pub const OP_USAGE: u8 = 8;
     pub const OP_LAST_ERROR: u8 = 9;
+    pub const OP_READ_TEXT: u8 = 10;
     /// write() modes.
     pub const WRITE_TRUNCATE: u32 = 0;
     pub const WRITE_APPEND: u32 = 1;
