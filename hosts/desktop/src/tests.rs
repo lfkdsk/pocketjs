@@ -201,11 +201,11 @@ mod tests {
     #[test]
     fn data_roots_are_per_app_under_the_base() {
         let base = TempBase::new("roots");
-        let a = fs::data_roots(Some(base.path()), "dev.pocket-stack.a").unwrap();
-        let b = fs::data_roots(Some(base.path()), "dev.pocket-stack.b").unwrap();
-        assert!(a.data.ends_with("dev.pocket-stack.a/data"));
-        assert!(a.tmp.ends_with("dev.pocket-stack.a/tmp"));
-        assert!(b.data.ends_with("dev.pocket-stack.b/data"));
+        let a = fs::data_roots(Some(base.path()), "dev.pocket-nexus.a").unwrap();
+        let b = fs::data_roots(Some(base.path()), "dev.pocket-nexus.b").unwrap();
+        assert!(a.data.ends_with("dev.pocket-nexus.a/data"));
+        assert!(a.tmp.ends_with("dev.pocket-nexus.a/tmp"));
+        assert!(b.data.ends_with("dev.pocket-nexus.b/data"));
         assert_ne!(a.data, b.data);
         assert!(a.data.is_dir(), "the data root is created on resolve");
         // App ids that could steer the join outside the base are refused.
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn fs_conformance_write_read_list_remove_usage_and_boundaries() {
         let base = TempBase::new("conformance");
-        let (m, data_dir) = module_at(base.path(), "dev.pocket-stack.fs");
+        let (m, data_dir) = module_at(base.path(), "dev.pocket-nexus.fs");
         let mut m = m.borrow_mut();
 
         // write + read: text payloads store their decoded UTF-8 bytes.
@@ -291,7 +291,7 @@ mod tests {
         std::mem::drop(m);
 
         // A second module over the same root sees the persisted tree.
-        let (m2, _) = module_at(base.path(), "dev.pocket-stack.fs");
+        let (m2, _) = module_at(base.path(), "dev.pocket-nexus.fs");
         let mut m2 = m2.borrow_mut();
         let again = json(&m2.read(".config", 0, 16));
         assert_eq!(again["size"], 3);
@@ -300,8 +300,8 @@ mod tests {
     #[test]
     fn fs_app_trees_are_isolated_on_disk() {
         let base = TempBase::new("isolation");
-        let (a, dir_a) = module_at(base.path(), "dev.pocket-stack.iso-a");
-        let (b, _dir_b) = module_at(base.path(), "dev.pocket-stack.iso-b");
+        let (a, dir_a) = module_at(base.path(), "dev.pocket-nexus.iso-a");
+        let (b, _dir_b) = module_at(base.path(), "dev.pocket-nexus.iso-b");
         a.borrow_mut()
             .write("save.json", &text("{\"chapter\":1}"), 0);
         // b cannot name a's file: the vocabulary is bound to b's root.
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn fs_treats_a_host_planted_symlink_as_absent() {
         let base = TempBase::new("symlink");
-        let (m, data_dir) = module_at(base.path(), "dev.pocket-stack.sym");
+        let (m, data_dir) = module_at(base.path(), "dev.pocket-nexus.sym");
         let outside = base.path().join("outside.txt");
         std::fs::write(&outside, b"secret").unwrap();
         std::os::unix::fs::symlink(&outside, data_dir.join("link.txt")).unwrap();
@@ -349,16 +349,16 @@ mod tests {
         // must fail before a module exists, so the victim's bytes can never be
         // served under the attacker's id.
         let base = TempBase::new("bind-approot");
-        let (victim, _) = module_at(base.path(), "dev.pocket-stack.victim");
+        let (victim, _) = module_at(base.path(), "dev.pocket-nexus.victim");
         victim.borrow_mut().write("save.json", &text("secret"), 0);
         drop(victim);
 
         // The attacker id has never been resolved: plant the link where its
         // app-root would be, pointing at the victim's whole tree.
-        let attacker_root = base.path().join("dev.pocket-stack.attacker");
-        std::os::unix::fs::symlink(base.path().join("dev.pocket-stack.victim"), &attacker_root)
+        let attacker_root = base.path().join("dev.pocket-nexus.attacker");
+        std::os::unix::fs::symlink(base.path().join("dev.pocket-nexus.victim"), &attacker_root)
             .unwrap();
-        let err = fs::data_roots(Some(base.path()), "dev.pocket-stack.attacker")
+        let err = fs::data_roots(Some(base.path()), "dev.pocket-nexus.attacker")
             .err()
             .expect("a symlinked app-root crossing the app boundary is refused");
         assert!(
@@ -367,7 +367,7 @@ mod tests {
         );
         // No bind succeeded through the link; the victim file is intact.
         assert_eq!(
-            std::fs::read_to_string(base.path().join("dev.pocket-stack.victim/data/save.json"))
+            std::fs::read_to_string(base.path().join("dev.pocket-nexus.victim/data/save.json"))
                 .unwrap(),
             "secret"
         );
@@ -384,10 +384,10 @@ mod tests {
         std::fs::write(outside.path().join("data/save.json"), b"secret").unwrap();
 
         // Real app-root, but a data child linked at a tree outside the base.
-        let app_root = base.path().join("dev.pocket-stack.leak");
+        let app_root = base.path().join("dev.pocket-nexus.leak");
         std::fs::create_dir_all(&app_root).unwrap();
         std::os::unix::fs::symlink(outside.path().join("data"), app_root.join("data")).unwrap();
-        let err = fs::data_roots(Some(base.path()), "dev.pocket-stack.leak")
+        let err = fs::data_roots(Some(base.path()), "dev.pocket-nexus.leak")
             .err()
             .expect("a data symlink resolving outside the base is refused");
         assert!(
@@ -397,12 +397,12 @@ mod tests {
 
         // A dangling link is refused too: it must not be created through or
         // silently accepted.
-        let dangling_root = base.path().join("dev.pocket-stack.dangling");
+        let dangling_root = base.path().join("dev.pocket-nexus.dangling");
         std::fs::create_dir_all(&dangling_root).unwrap();
         std::os::unix::fs::symlink(app_root.join("does-not-exist"), dangling_root.join("data"))
             .unwrap();
         assert!(
-            fs::data_roots(Some(base.path()), "dev.pocket-stack.dangling").is_err(),
+            fs::data_roots(Some(base.path()), "dev.pocket-nexus.dangling").is_err(),
             "a dangling bind symlink is refused"
         );
     }
@@ -413,7 +413,7 @@ mod tests {
         // A link whose target stays under <base>/<app-id> binds normally: the
         // bytes physically land in the linked directory.
         let base = TempBase::new("bind-datain");
-        let app_id = "dev.pocket-stack.linked";
+        let app_id = "dev.pocket-nexus.linked";
         fs::data_roots(Some(base.path()), app_id).unwrap(); // lay out the real tree
         let app_root = base.path().join(app_id);
         std::fs::remove_dir(app_root.join("data")).unwrap();
@@ -460,7 +460,7 @@ mod tests {
             ("both-to-store", Some("store"), Some("store"), &["store"]),
         ] {
             let base = TempBase::new(&format!("overlap-{layout}"));
-            let app_root = base.path().join("dev.pocket-stack.overlap");
+            let app_root = base.path().join("dev.pocket-nexus.overlap");
             std::fs::create_dir_all(&app_root).unwrap();
             for dir in extra {
                 std::fs::create_dir_all(app_root.join(dir)).unwrap();
@@ -481,7 +481,7 @@ mod tests {
             let save = std::fs::canonicalize(&data_path).unwrap().join("save.json");
             std::fs::write(&save, b"saved-progress").unwrap();
 
-            let err = fs::data_roots(Some(base.path()), "dev.pocket-stack.overlap")
+            let err = fs::data_roots(Some(base.path()), "dev.pocket-nexus.overlap")
                 .err()
                 .unwrap_or_else(|| panic!("overlapping data/tmp must be refused: {layout}"));
             assert!(
@@ -503,12 +503,12 @@ mod tests {
     #[test]
     fn fs_bind_pins_the_canonical_data_root_against_alias_retarget() {
         let base = TempBase::new("bind-retarget");
-        let app_root = base.path().join("dev.pocket-stack.rtrg");
+        let app_root = base.path().join("dev.pocket-nexus.rtrg");
         let store = app_root.join("store");
         std::fs::create_dir_all(&store).unwrap();
         unix_symlink(&store, &app_root.join("data"));
 
-        let roots = fs::data_roots(Some(base.path()), "dev.pocket-stack.rtrg")
+        let roots = fs::data_roots(Some(base.path()), "dev.pocket-nexus.rtrg")
             .expect("an in-tree data alias binds");
         assert_eq!(
             roots.data,
@@ -520,7 +520,7 @@ mod tests {
         assert_eq!(mounted.borrow_mut().write("own", &text("own"), 0), 0);
 
         // A host-side actor repoints the accepted alias at a second app's tree.
-        let victim = base.path().join("dev.pocket-stack.victim/data");
+        let victim = base.path().join("dev.pocket-nexus.victim/data");
         std::fs::create_dir_all(&victim).unwrap();
         std::fs::write(victim.join("sentinel"), b"secret").unwrap();
         std::fs::remove_file(app_root.join("data")).unwrap();
@@ -549,7 +549,7 @@ mod tests {
     fn mounted_fs_namespace_serves_a_desktop_guest_in_its_data_root() {
         let base = TempBase::new("guest");
         let guest = Guest::new().unwrap();
-        let roots = fs::data_roots(Some(base.path()), "dev.pocket-stack.guest").unwrap();
+        let roots = fs::data_roots(Some(base.path()), "dev.pocket-nexus.guest").unwrap();
         let _mount = fs::mount_fs(&guest, &roots).unwrap();
         guest
             .eval(
@@ -563,11 +563,15 @@ mod tests {
                 // JSON.stringify("ok") is a text payload; stored bytes are
                 // its decoded value ("ok" = 2 bytes).
                 if (read.size !== 2 || !read.eof) throw new Error("bad read: " + JSON.stringify(read));
+                if (fs.readText("saves/slot1.json") !== "ok" || fs.lastError() !== "") {
+                    throw new Error("bad text read");
+                }
                 if (JSON.parse(fs.read("../other/data/x", 0, 16)).error !== "invalid path") {
                     throw new Error("traversal not refused");
                 }
-                // The namespace carries all nine ops.
-                for (const op of ["read","write","remove","list","stat","mkdir","rename","usage","lastError"]) {
+                // The desktop namespace carries all required ops and the
+                // optional whole-file text acceleration.
+                for (const op of ["read","write","remove","list","stat","mkdir","rename","usage","lastError","readText"]) {
                     if (typeof fs[op] !== "function") throw new Error("fs." + op + " missing");
                 }
                 globalThis.fsProbe = read.size;
