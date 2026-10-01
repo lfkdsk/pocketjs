@@ -184,6 +184,17 @@ world.logs;                 // each console line with the frame that wrote it
 - **It builds nothing.** A missing wasm core or bundle is an error that names
   the path. A tool installed without the engine sources passes `wasm`.
 
+`bootWorld()` owns the process-global guest slots used by an evaluated bundle,
+so one Bun realm has one active simulated world. Sequential boots are
+supported; a newer boot supersedes the previous world and calls through the
+old handle fail explicitly. If boots overlap, the newest request wins and an
+older request that is still loading rejects before it can install globals.
+Run genuinely concurrent worlds in separate processes or realms.
+
+`world.render()` returns a borrowed view of that world's wasm framebuffer.
+Hash or consume it immediately, or call `.slice()` before retaining pixels
+across another render of the same world.
+
 ## The control experiment (`tools/flake-lab.ts`)
 
 One bundle, one journey, two clocks:
