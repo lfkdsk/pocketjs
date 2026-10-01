@@ -569,6 +569,10 @@ pub mod fs {
     pub const MAX_PATH_BYTES: usize = 160;
     /// Payload ceiling per read()/write() call, in bytes.
     pub const MAX_IO_BYTES: usize = 65536;
+    /// Whole-file ceiling for the optional readText() acceleration.
+    pub const MAX_TEXT_BYTES: usize = 1048576;
+    /// Stable readText() size error used by the SDK for paged fallback.
+    pub const READ_TEXT_TOO_LARGE: &str = "readText exceeds FS_MAX_TEXT_BYTES";
     /// Entries per list() call (paged via offset + eof).
     pub const MAX_DIR_ENTRIES: usize = 256;
 }
