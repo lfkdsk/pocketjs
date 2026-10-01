@@ -11,12 +11,17 @@ use psp::sys::{
     TexturePixelFormat, ThreadAttributes,
 };
 use psp::vram_alloc::get_vram_allocator;
-use psp::{Align16, BUF_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH};
+use psp::{BUF_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH};
 
-// GE display list buffer (1 MB), 16-byte aligned. One per program; the
+// GE display list buffer (1 MB), isolated on 64-byte CPU cache lines. The
+// GU writes through its uncached alias; cached BSS initialization must not
+// overwrite those commands on a later cache eviction.
+#[repr(C, align(64))]
+struct CommandList([u32; 0x40000]);
+// One per program; the
 // frame loop owns sceGuStart/Finish against it (the "dreamcart contract" —
 // ge.rs never opens or kicks lists).
-static mut LIST: Align16<[u32; 0x40000]> = Align16([0; 0x40000]);
+static mut LIST: CommandList = CommandList([0; 0x40000]);
 
 /// The display-list pointer for `sceGuStart`.
 pub fn list_ptr() -> *mut c_void {
@@ -147,6 +152,7 @@ pub unsafe fn init_graphics_with_format(cfg: GfxConfig, format: DisplayPixelForm
     }
 
     sys::sceGuInit();
+    sys::sceKernelDcacheWritebackInvalidateRange(list_ptr(), core::mem::size_of::<CommandList>() as u32);
     sys::sceGuStart(GuContextType::Direct, list_ptr());
     sys::sceGuDrawBuffer(format, fbp0 as _, BUF_WIDTH as i32);
     if !matches!(format, DisplayPixelFormat::Psm8888) {
