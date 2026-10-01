@@ -21,10 +21,16 @@ interface Entry {
   off: number; // blob offset from pack start
   len: number; // blob byte length
   dtype: number; // advisory PAK_DTYPE
+  external?: boolean;
 }
 
 let map: Map<string, Entry> | null = null;
 let bytes: Uint8Array | null = null;
+
+type ExternalRead = (key: string, start: number, end: number) => ArrayBuffer | undefined;
+function externalReader(): ExternalRead | undefined {
+  return (globalThis as { __pakRead?: ExternalRead }).__pakRead;
+}
 
 // ASCII-only keys (we control them); avoid TextDecoder, which QuickJS lacks.
 function readKey(u8: Uint8Array, off: number, len: number): string {
@@ -59,6 +65,27 @@ function parse(ab: ArrayBuffer): void {
       len: byteLen,
       dtype,
     });
+  }
+  // A PSP split pack embeds the complete directory while its payloads
+  // remain in assets.pak. Preserve enumeration, dtype and range semantics.
+  const index = m.get("pocket:external-index");
+  if (index && externalReader()) {
+    const external = u8.subarray(index.off, index.off + index.len);
+    const view = new DataView(external.buffer, external.byteOffset, external.byteLength);
+    if (external.length < PAK_HEADER_SIZE || view.getUint32(0, true) !== PAK_MAGIC || view.getUint16(4, true) !== PAK_VERSION)
+      throw new Error("pak: invalid external index");
+    const count = view.getUint32(8, true), directory = view.getUint32(12, true), names = view.getUint32(16, true), fileLength = view.getUint32(24, true);
+    if (directory > external.length || count > Math.floor((external.length - directory) / PAK_ENTRY_SIZE) || names > external.length || fileLength < external.length)
+      throw new Error("pak: invalid external index");
+    for (let i = 0; i < count; i++) {
+      const e = directory + i * PAK_ENTRY_SIZE;
+      const off = view.getUint32(e + 4, true), len = view.getUint32(e + 8, true);
+      const name = names + view.getUint32(e + 12, true), nameLen = view.getUint16(e + 16, true);
+      if (name > external.length || nameLen > external.length - name || off > fileLength || len > fileLength - off)
+        throw new Error("pak: invalid external index");
+      const key = readKey(external, name, nameLen);
+      if (!m.has(key)) m.set(key, { off, len, dtype: external[e + 18]!, external: true });
+    }
   }
   map = m;
   bytes = u8;
@@ -117,6 +144,12 @@ export function get(key: string, start = 0, end?: number): Uint8Array {
   const stop = end ?? e.len;
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(stop) || start < 0 || stop < start || stop > e.len)
     throw new RangeError("pak: invalid byte range");
+  if (e.external) {
+    const read = externalReader();
+    const value = read?.(key, start, stop);
+    if (!value || value.byteLength !== stop - start) throw new Error("pak: external read failed for " + key);
+    return new Uint8Array(value);
+  }
   return bytes!.slice(e.off + start, e.off + stop);
 }
 
