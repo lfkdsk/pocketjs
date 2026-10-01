@@ -68,11 +68,13 @@
 //                     offset/eof envelope: success always means the complete
 //                     file reached EOF. FS_MAX_IO_BYTES does not apply because
 //                     chunking can split a UTF-8 sequence and would recreate
-//                     guest-side joining; a host that cannot hold a complete
-//                     text file omits this optional op and the SDK falls back
-//                     to read(). The raw string avoids JSON escaping/parsing
-//                     and a second full-size copy; lastError() supplies the
-//                     otherwise ambiguous error channel]
+//                     guest-side joining. Files above FS_MAX_TEXT_BYTES fail
+//                     with "readText exceeds FS_MAX_TEXT_BYTES"; the SDK then
+//                     falls back to paged read(). A host may omit this optional
+//                     op and receive the same fallback. The raw string avoids
+//                     JSON escaping/parsing and a second full-size copy;
+//                     lastError() supplies the otherwise ambiguous error
+//                     channel]
 //   write(path, data:string, mode:number) -> 0 | 1
 //                    [data is the payload encoding below, decoded byte length
 //                     <= FS_MAX_IO_BYTES per call (the SDK chunks larger
@@ -257,6 +259,14 @@ export function fsValidPath(path: string): boolean {
  * the ceiling bounds marshaling, not file size.
  */
 export const FS_MAX_IO_BYTES = 65536;
+
+/** Whole-file ceiling for the optional readText() acceleration. This permits
+ *  enough read() chunks to amortize the native crossing while keeping one
+ *  host allocation and one guest string bounded. Larger files use read(). */
+export const FS_MAX_TEXT_BYTES = FS_MAX_IO_BYTES * 16;
+
+/** Stable error used by the SDK to fall back from readText() to read(). */
+export const FS_READ_TEXT_TOO_LARGE = "readText exceeds FS_MAX_TEXT_BYTES";
 
 /**
  * Entries per list() call. list() pages (offset + eof), so a big directory

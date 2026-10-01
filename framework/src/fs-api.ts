@@ -29,6 +29,7 @@
 import {
   FS_BLOB_KEY,
   FS_MAX_IO_BYTES,
+  FS_READ_TEXT_TOO_LARGE,
   FS_WRITE_APPEND,
   FS_WRITE_TRUNCATE,
 } from "../../contracts/spec/fs.ts";
@@ -38,6 +39,7 @@ export {
   FS_MAX_DEPTH,
   FS_MAX_DIR_ENTRIES,
   FS_MAX_IO_BYTES,
+  FS_MAX_TEXT_BYTES,
   FS_MAX_PATH_BYTES,
   fsValidPath,
 } from "../../contracts/spec/fs.ts";
@@ -117,6 +119,7 @@ function readTextAll(ops: FsOps, path: string): string {
   if (typeof ops.readText === "function") {
     const text = ops.readText(path);
     const error = ops.lastError();
+    if (error === FS_READ_TEXT_TOO_LARGE) return utf8ToString(readAll(ops, path));
     if (error !== "") throw new Error(`fs: read ${path}: ${error}`);
     return text;
   }
