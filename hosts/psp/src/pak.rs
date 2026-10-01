@@ -38,7 +38,8 @@ static mut PAK: &[u8] = &[];
 /// Single-threaded main-thread contract (ffi::UI's): no concurrent
 /// `install`/`installed` calls exist.
 pub unsafe fn install(pak: &'static [u8]) {
-    PAK = pak
+    PAK = pak;
+    crate::pak_external::install(find(pak, "pocket:external-index").unwrap_or(&[]));
 }
 
 /// The installed pak (empty slice until `install` runs — every `find` on it
