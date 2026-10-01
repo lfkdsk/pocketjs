@@ -76,6 +76,7 @@ pub const STYLE_PROPS: &[(&str, u8, &str)] = &[
     ("arcStart", 140, "f32"),
     ("arcSweep", 141, "f32"),
     ("arcWidth", 142, "f32"),
+    ("spriteClock", 143, "i32"),
 ];
 pub const HOST_ATTRIBUTES: &[(&str, &[&str])] = &[
     ("View", &["class", "style", "focusable", "debug-name"]),

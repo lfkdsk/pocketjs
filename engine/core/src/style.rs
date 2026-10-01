@@ -305,6 +305,9 @@ pub struct Resolved {
     pub arc_start: f32,
     pub arc_sweep: f32,
     pub arc_width: f32,
+    /// Explicit animated-sprite reference clock for this subtree. u32::MAX
+    /// means absent, preserving the legacy host-vblank clock.
+    pub sprite_clock: u32,
 }
 
 impl Default for Resolved {
@@ -368,6 +371,7 @@ impl Default for Resolved {
             arc_start: 0.0,
             arc_sweep: 0.0,
             arc_width: 0.0,
+            sprite_clock: u32::MAX,
         }
     }
 }
@@ -460,6 +464,7 @@ impl Resolved {
             p::ARC_START => self.arc_start = f,
             p::ARC_SWEEP => self.arc_sweep = f,
             p::ARC_WIDTH => self.arc_width = f,
+            p::SPRITE_CLOCK => self.sprite_clock = bits,
             _ => {}
         }
     }
@@ -536,6 +541,7 @@ impl Resolved {
             p::ARC_START => self.arc_start.to_bits(),
             p::ARC_SWEEP => self.arc_sweep.to_bits(),
             p::ARC_WIDTH => self.arc_width.to_bits(),
+            p::SPRITE_CLOCK => self.sprite_clock,
             _ => 0,
         }
     }

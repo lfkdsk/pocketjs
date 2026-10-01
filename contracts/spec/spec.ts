@@ -400,6 +400,9 @@ export const PROP = {
   //                    center = node center, outer radius = min(w,h)/2, color
   //                    = bgColor. Axis-aligned worlds only (rotation belongs
   //                    in arcStart).
+  spriteClock: 143, //  i32 reference-frame clock for animated sprites in this
+  //                    subtree. The nearest declaration wins; absent means
+  //                    the legacy per-sprite host-vblank clock.
 } as const;
 
 export type PropName = keyof typeof PROP;
@@ -532,6 +535,7 @@ export const PROP_VALUE_KIND: Record<PropName, number> = {
   rotateX: VALUE_KIND.f32, rotateY: VALUE_KIND.f32,
   translateZ: VALUE_KIND.f32, perspective: VALUE_KIND.f32,
   arcStart: VALUE_KIND.f32, arcSweep: VALUE_KIND.f32, arcWidth: VALUE_KIND.f32,
+  spriteClock: VALUE_KIND.int,
 };
 
 // ---------------------------------------------------------------------------
