@@ -45,6 +45,8 @@ export {
 /** The mounted fs namespace — one method per spec op (FS_OP codes). */
 export interface FsOps {
   read(path: string, offset: number, maxBytes: number): string;
+  /** Optional whole-file UTF-8 fast path (FS_OP.readText). */
+  readText?(path: string): string;
   write(path: string, data: string, mode: number): number;
   remove(path: string, recursive: number): number;
   list(path: string, offset: number): string;
@@ -107,6 +109,18 @@ function readAll(ops: FsOps, path: string): Uint8Array {
     o += c.length;
   }
   return out;
+}
+
+/** Read the whole file as strict UTF-8. New hosts return the raw string;
+ *  older hosts keep the byte/base64 path for compatibility. */
+function readTextAll(ops: FsOps, path: string): string {
+  if (typeof ops.readText === "function") {
+    const text = ops.readText(path);
+    const error = ops.lastError();
+    if (error !== "") throw new Error(`fs: read ${path}: ${error}`);
+    return text;
+  }
+  return utf8ToString(readAll(ops, path));
 }
 
 /** Write `data` in <= FS_MAX_IO_BYTES payloads: one truncate, then appends.
@@ -195,7 +209,7 @@ export class PocketFile {
   }
 
   text(): string {
-    return utf8ToString(this.bytes());
+    return readTextAll(host(), this.path);
   }
 
   json(): unknown {
@@ -232,8 +246,10 @@ export function usage(): { usedBytes: number; quotaBytes: number } {
 export function readFileSync(path: string): Uint8Array;
 export function readFileSync(path: string, encoding: "utf8" | "utf-8"): string;
 export function readFileSync(path: string, encoding?: string): Uint8Array | string {
-  const bytes = readAll(host(), path);
-  return encoding === "utf8" || encoding === "utf-8" ? utf8ToString(bytes) : bytes;
+  const ops = host();
+  return encoding === "utf8" || encoding === "utf-8"
+    ? readTextAll(ops, path)
+    : readAll(ops, path);
 }
 
 export function writeFileSync(path: string, data: string | Uint8Array): void {

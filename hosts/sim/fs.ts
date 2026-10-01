@@ -65,6 +65,10 @@ export function createSimFsHost(options?: { quotaBytes?: number }): SimFsHost {
     lastError = message;
     return JSON.stringify({ error: message });
   };
+  const errText = (message: string): string => {
+    lastError = message;
+    return "";
+  };
 
   const isDir = (path: string): boolean => path === "" || dirs.has(path);
 
@@ -124,6 +128,19 @@ export function createSimFsHost(options?: { quotaBytes?: number }): SimFsHost {
           eof: offset + chunk.length >= bytes.length,
         }),
       );
+    },
+    readText(path: string): string {
+      log.push(`op readText ${path}`);
+      if (!fsValidPath(path)) return errText("invalid path");
+      const bytes = files.get(path);
+      if (!bytes) return errText(isDir(path) ? "is a directory" : "not found");
+      try {
+        // ignoreBOM keeps U+FEFF in the returned string so re-encoding yields
+        // the file's exact bytes, matching the native host.
+        return ok(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
+      } catch {
+        return errText("invalid UTF-8");
+      }
     },
     write(path: string, data: string, mode: number): number {
       log.push(`op write ${path} ${mode}`);

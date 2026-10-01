@@ -45,6 +45,7 @@ afterEach(() => {
 
 type Ns = {
   read(path: string, offset: number, maxBytes: number): string;
+  readText(path: string): string;
   write(path: string, data: string, mode: number): number;
   remove(path: string, recursive: number): number;
   list(path: string, offset: number): string;
@@ -95,6 +96,25 @@ describe("sim host ops", () => {
     expect(rest.eof).toBe(true);
     expect(JSON.parse(ns.read("f.txt", 0, 0)).error).toContain("maxBytes");
     expect(JSON.parse(ns.read("f.txt", 0, FS_MAX_IO_BYTES + 1)).error).toContain("maxBytes");
+  });
+
+  test("readText returns complete strict UTF-8 without the binary I/O ceiling", () => {
+    const ns = mount().ns as Ns;
+    const chunk = "x".repeat(FS_MAX_IO_BYTES);
+    expect(ns.write("big.txt", text(chunk), FS_WRITE_TRUNCATE)).toBe(0);
+    expect(ns.write("big.txt", text("终"), FS_WRITE_APPEND)).toBe(0);
+    expect(ns.readText("big.txt")).toBe(`${chunk}终`);
+    expect(ns.lastError()).toBe("");
+
+    expect(ns.write("empty.txt", text(""), FS_WRITE_TRUNCATE)).toBe(0);
+    expect(ns.readText("missing.txt")).toBe("");
+    expect(ns.lastError()).toBe("not found");
+    expect(ns.readText("empty.txt")).toBe("");
+    expect(ns.lastError()).toBe("");
+
+    expect(ns.write("bad.bin", JSON.stringify({ $b: "/w==" }), FS_WRITE_TRUNCATE)).toBe(0);
+    expect(ns.readText("bad.bin")).toBe("");
+    expect(ns.lastError()).toBe("invalid UTF-8");
   });
 
   test("a payload beyond FS_MAX_IO_BYTES fails loudly", () => {
@@ -216,11 +236,12 @@ describe("fs SDK", () => {
   });
 
   test("the node:fs sync subset behaves like node", () => {
-    mount();
+    const sim = mount();
     mkdirSync("a/b");
     writeFileSync("a/b/f.txt", "one");
     appendFileSync("a/b/f.txt", "+two");
     expect(readFileSync("a/b/f.txt", "utf8")).toBe("one+two");
+    expect(sim.log.at(-1)).toBe("op readText a/b/f.txt");
     expect(readFileSync("a/b/f.txt")).toBeInstanceOf(Uint8Array);
 
     expect(readdirSync("a")).toEqual(["b"]);
@@ -240,6 +261,22 @@ describe("fs SDK", () => {
     expect(existsSync("a")).toBe(false);
 
     expect(usage().usedBytes).toBe(0);
+  });
+
+  test("UTF-8 reads fall back to binary read on an older host", () => {
+    const sim = mount();
+    write("legacy.txt", "legacy ✓");
+    sim.ns.readText = undefined;
+    sim.log.length = 0;
+    expect(readFileSync("legacy.txt", "utf8")).toBe("legacy ✓");
+    expect(sim.log[0]).toBe(`op read legacy.txt 0 ${FS_MAX_IO_BYTES}`);
+  });
+
+  test("UTF-8 reads surface native validation failures", () => {
+    mount();
+    write("raw.bin", new Uint8Array([0xff]));
+    expect(() => readFileSync("raw.bin", "utf8")).toThrow("invalid UTF-8");
+    expect(Array.from(readFileSync("raw.bin"))).toEqual([0xff]);
   });
 
   test("errors surface as thrown Errors with the op detail", () => {
