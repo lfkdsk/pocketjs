@@ -307,20 +307,26 @@ const hostEnvironment = buildPlan
       POCKETJS_RASTER_DENSITY: "1",
     };
 
+const gcc = process.env.POCKETJS_PSP_C_COMPILER === "gcc";
 const env = {
   POCKETJS_OFFLOAD_SLOT: buildPlan?.features["io.offload"] ? createHash("sha256").update(buildPlan.app.id).digest("hex").slice(0, 16) : "",
   ...toolchain.environment,
   RUSTFLAGS: rustflags,
   CRATE_CC_NO_DEFAULTS: "1",
-  TARGET_CC: "clang",
+  TARGET_CC: gcc ? pspUiDir + "tools/cli/psp-gcc-wrapper.ts" : "clang",
+  POCKETJS_PSP_GCC: `${sdk}/bin/psp-gcc`,
+  POCKETJS_PSP_OBJCOPY: `${toolchain.llvmBin}/llvm-objcopy`,
   TARGET_AR: `${toolchain.llvmBin}/llvm-ar`,
   // Match the Rust PSP target's +noabicalls mode. -G0 avoids clang's MIPS
   // backend selecting unsupported GP-relative accesses for large C sources.
-  // -O2 must live HERE: CRATE_CC_NO_DEFAULTS=1 makes the cc crate drop its
+  // Optimization flags must live here: CRATE_CC_NO_DEFAULTS=1 drops the
   // synthesized flags, including the -O from build.rs opt_level() — without
   // it every C dependency (QuickJS!) silently compiles at -O0.
-  TARGET_CFLAGS:
-    `-target mipsel-sony-psp -mcpu=mips2 -msingle-float -mlittle-endian -mno-abicalls -fno-pic -G0 -mno-check-zero-division ` +
+  TARGET_CFLAGS: gcc
+    ? `-march=allegrex -mabi=32 -msingle-float -EL -mno-abicalls -fno-pic -G0 -mno-check-zero-division ` +
+      `-fno-stack-protector -fomit-frame-pointer -O3 -fno-gcse -std=gnu11 -fwrapv -fno-strict-aliasing ` +
+      `-Wno-error=incompatible-pointer-types -I${sdk}/psp/include -I${sdk}/psp/sdk/include`
+    : `-target mipsel-sony-psp -mcpu=mips2 -msingle-float -mlittle-endian -mno-abicalls -fno-pic -G0 -mno-check-zero-division ` +
     `-fno-stack-protector -O2 -I${sdk}/psp/include -I${sdk}/psp/sdk/include`,
   // CRITICAL: archive MIPS objects with llvm-ar (Apple ar drops them -> undefined JS_*).
   AR_mipsel_sony_psp: `${toolchain.llvmBin}/llvm-ar`,
