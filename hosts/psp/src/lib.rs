@@ -31,6 +31,7 @@ mod framebuffer;
 pub mod ge;
 pub mod host;
 pub mod pak;
+pub mod pak_external;
 pub mod qjs_alloc;
 pub mod stats;
 pub mod svc;
