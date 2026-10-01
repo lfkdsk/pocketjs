@@ -169,14 +169,16 @@ impl FsModule {
 
     /// `readText(path) -> string` (spec OP_READ_TEXT). The raw return avoids
     /// a JSON/base64 round trip; lastError distinguishes an empty file from
-    /// failure. This optional op reads the complete file and validates UTF-8.
+    /// failure. This optional op reads the complete file up to
+    /// FS_MAX_TEXT_BYTES and validates UTF-8.
     pub fn read_text(&mut self, path: &str) -> String {
         if !valid_path(path) {
             return self.err_text("invalid path");
         }
         let result = match &mut self.backend {
             Backend::Memory { files, dirs } => match files.get(path) {
-                Some(bytes) => Ok(bytes.clone()),
+                Some(bytes) if bytes.len() <= spec::MAX_TEXT_BYTES => Ok(bytes.clone()),
+                Some(_) => Err(spec::READ_TEXT_TOO_LARGE.to_owned()),
                 None if dirs.contains(path) => Err("is a directory".to_owned()),
                 None => Err("not found".to_owned()),
             },
@@ -559,6 +561,9 @@ fn dir_read_all(root: &Path, path: &str) -> Result<Vec<u8>, String> {
     if md.is_dir() {
         return Err("is a directory".to_owned());
     }
+    if md.len() > spec::MAX_TEXT_BYTES as u64 {
+        return Err(spec::READ_TEXT_TOO_LARGE.to_owned());
+    }
     std::fs::read(&full).map_err(|e| e.to_string())
 }
 
@@ -927,6 +932,13 @@ mod tests {
         assert_eq!(m.write("bad.bin", &invalid, spec::WRITE_TRUNCATE), 0);
         assert_eq!(m.read_text("bad.bin"), "");
         assert_eq!(m.last_error(), "invalid UTF-8");
+
+        assert_eq!(m.write("too-big.txt", &text(&chunk), spec::WRITE_TRUNCATE), 0);
+        for _ in 0..(spec::MAX_TEXT_BYTES / spec::MAX_IO_BYTES) {
+            assert_eq!(m.write("too-big.txt", &text(&chunk), spec::WRITE_APPEND), 0);
+        }
+        assert_eq!(m.read_text("too-big.txt"), "");
+        assert_eq!(m.last_error(), spec::READ_TEXT_TOO_LARGE);
     }
 
     #[test]
@@ -1038,6 +1050,18 @@ mod tests {
             assert!(!tmp.join("7").exists(), "orphan swept on construction");
             assert_eq!(m.write("notes/a.md", &text("hello"), spec::WRITE_TRUNCATE), 0);
             assert_eq!(m.write("notes/a.md", &text(" world"), spec::WRITE_APPEND), 0);
+            std::fs::write(root.join("notes/bom.txt"), b"\xef\xbb\xbfline\n\0").unwrap();
+            assert_eq!(m.read_text("notes/bom.txt"), "\u{feff}line\n\0");
+            std::fs::write(root.join("notes/bad.bin"), [0xff]).unwrap();
+            assert_eq!(m.read_text("notes/bad.bin"), "");
+            assert_eq!(m.last_error(), "invalid UTF-8");
+            std::fs::write(
+                root.join("notes/too-big.txt"),
+                vec![b'x'; spec::MAX_TEXT_BYTES + 1],
+            )
+            .unwrap();
+            assert_eq!(m.read_text("notes/too-big.txt"), "");
+            assert_eq!(m.last_error(), spec::READ_TEXT_TOO_LARGE);
             m.mkdir("empty");
             let listing = line(&m.list("", 0));
             let names: Vec<&str> = listing["entries"]
@@ -1101,6 +1125,11 @@ mod tests {
                 if (!read.eof) throw new Error("expected eof");
                 if (fs.readText("notes/hi.txt") !== "from-guest") {
                     throw new Error("bad text read");
+                }
+                const sample = "\uFEFF行🚀\n\"quoted\"\0tail";
+                if (fs.write("notes/unicode.txt", JSON.stringify(sample), 0) !== 0 ||
+                    fs.readText("notes/unicode.txt") !== sample) {
+                    throw new Error("raw text bridge changed Unicode");
                 }
                 const escape = JSON.parse(fs.read("../../etc/passwd", 0, 64));
                 if (escape.error !== "invalid path") throw new Error("traversal not refused");
