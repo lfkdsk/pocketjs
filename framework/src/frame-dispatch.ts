@@ -17,6 +17,16 @@ export interface FrameSnapshot {
 /** Runs one deferred press; the Solid pump restores the node's list row. */
 export type RunPress = (node: NodeMirror, invoke: () => void) => void;
 
+function collectDeferredPresses(
+  node: NodeMirror,
+  pending: ReadonlyMap<NodeMirror, readonly (() => void)[]>,
+  ordered: [NodeMirror, () => void][],
+): void {
+  const entries = pending.get(node);
+  if (entries) for (const invoke of entries) ordered.push([node, invoke]);
+  for (const child of node.children) collectDeferredPresses(child, pending, ordered);
+}
+
 export class FrameRegistry {
   private readonly callbacks = new Set<FrameCallback>();
   private readonly placed = new Map<FrameCallback, NodeMirror>();
@@ -91,11 +101,8 @@ export function dispatchFrame(
     roots.add(root);
   }
   const ordered: [NodeMirror, () => void][] = [];
-  const collect = (node: NodeMirror): void => {
-    const entries = queued.get(node);
-    if (entries) for (const invoke of entries) ordered.push([node, invoke]);
-    for (const child of node.children) collect(child);
-  };
-  for (const root of roots) collect(root);
+  // A local recursive closure would retain this frame's queue in a
+  // reference cycle until the host performs a full garbage collection.
+  for (const root of roots) collectDeferredPresses(root, queued, ordered);
   for (const [node, invoke] of ordered) run(node, invoke);
 }
