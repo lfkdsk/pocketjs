@@ -149,6 +149,13 @@ struct BenchState {
     eval_end_us: u64,
     frame0_complete_us: u64,
     frames: u32,
+    window_start: u32,
+    samples: [u32; 300],
+    // Slowest frames: frame, work, JS, jobs, tick, draw, render (microseconds).
+    slowest: [[u32; 7]; 8],
+    gc_count: u32,
+    gc_sum_us: u64,
+    max_gc_us: u64,
     js_sum_us: u64,
     jobs_sum_us: u64,
     tick_sum_us: u64,
@@ -172,6 +179,12 @@ impl BenchState {
             eval_end_us: 0,
             frame0_complete_us: 0,
             frames: 0,
+            window_start: 0,
+            samples: [0; 300],
+            slowest: [[0; 7]; 8],
+            gc_count: 0,
+            gc_sum_us: 0,
+            max_gc_us: 0,
             js_sum_us: 0,
             jobs_sum_us: 0,
             tick_sum_us: 0,
@@ -260,7 +273,7 @@ unsafe fn bench_window() -> (u32, u32) {
     }
     #[cfg(not(feature = "capture"))]
     {
-        (0, 120)
+        (BENCH.window_start, 300)
     }
 }
 
@@ -286,6 +299,16 @@ unsafe fn bench_record_frame(
     let draw_us = after_draw.saturating_sub(after_tick);
     let render_us = after_render.saturating_sub(after_draw).saturating_sub(present_us);
     let work_us = after_render.saturating_sub(t0).saturating_sub(present_us);
+    for index in 0..BENCH.slowest.len() {
+        if work_us > BENCH.slowest[index][1] as u64 {
+            for next in ((index + 1)..BENCH.slowest.len()).rev() {
+                BENCH.slowest[next] = BENCH.slowest[next - 1];
+            }
+            BENCH.slowest[index] = [frame_count, work_us as u32, js_us as u32,
+                jobs_us as u32, tick_us as u32, draw_us as u32, render_us as u32];
+            break;
+        }
+    }
     if BENCH.frames > 0 {
         let interval_us = t0.saturating_sub(BENCH.previous_frame_start_us);
         BENCH.frame_interval_sum_us = BENCH.frame_interval_sum_us.saturating_add(interval_us);
@@ -294,6 +317,7 @@ unsafe fn bench_record_frame(
         }
     }
     BENCH.previous_frame_start_us = t0;
+    if (BENCH.frames as usize) < BENCH.samples.len() { BENCH.samples[BENCH.frames as usize] = work_us as u32; }
     BENCH.frames = BENCH.frames.saturating_add(1);
     BENCH.js_sum_us = BENCH.js_sum_us.saturating_add(js_us);
     BENCH.jobs_sum_us = BENCH.jobs_sum_us.saturating_add(jobs_us);
@@ -365,6 +389,24 @@ unsafe fn bench_maybe_flush(frame_count: u32) {
         arena_stats.configured_bytes,
     );
     bench_write(line.as_bytes());
+    let qjs = pocketjs_psp::qjs_alloc::stats();
+    bench_write(alloc::format!(
+        "{{\"window_start\":{},\"slowest_columns\":[\"frame\",\"work_us\",\"js_us\",\"jobs_us\",\"tick_us\",\"draw_us\",\"render_us\"],\"slowest\":{:?},\"gc_count\":{},\"gc_us\":{},\"max_gc_us\":{},\"qjs_live_bytes\":{},\"qjs_peak_bytes\":{},\"qjs_failed_request\":{}}}\n",
+        start, BENCH.slowest, BENCH.gc_count, BENCH.gc_sum_us, BENCH.max_gc_us,
+        qjs.live_requested, qjs.peak_requested, qjs.last_failed_request,
+    ).as_bytes());
+    #[cfg(not(feature = "capture"))]
+    {
+        BENCH.samples.sort_unstable();
+        bench_write(alloc::format!("{{\"window_start\":{},\"work_p50_us\":{},\"work_p95_us\":{},\"work_p99_us\":{},\"work_over_16ms\":{}}}\n", start, BENCH.samples[150], BENCH.samples[285], BENCH.samples[297], BENCH.samples.iter().filter(|&&us| us > 16683).count()).as_bytes());
+        let old = BENCH;
+        BENCH = BenchState::new();
+        BENCH.run_start_us = old.run_start_us;
+        BENCH.eval_begin_us = old.eval_begin_us;
+        BENCH.eval_end_us = old.eval_end_us;
+        BENCH.frame0_complete_us = old.frame0_complete_us;
+        BENCH.window_start = start + n;
+    }
 }
 
 unsafe fn boot() {
@@ -682,7 +724,16 @@ unsafe fn run_guest(
             const GC_BUMP_STEP: usize = 256 * 1024;
             let bump = arena::stats().bump_bytes;
             if bump > LAST_GC_BUMP.saturating_add(GC_BUMP_STEP) {
+                #[cfg(feature = "bench")]
+                let gc_start = bench_now_us();
                 JS_RunGC(rt);
+                #[cfg(feature = "bench")]
+                {
+                    let elapsed = bench_now_us().saturating_sub(gc_start);
+                    BENCH.gc_count += 1;
+                    BENCH.gc_sum_us += elapsed;
+                    BENCH.max_gc_us = BENCH.max_gc_us.max(elapsed);
+                }
                 LAST_GC_BUMP = arena::stats().bump_bytes;
             }
         }
