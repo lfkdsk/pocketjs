@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 
 use libquickjs_sys::*;
 extern "C" {
+    fn JS_NewArrayBufferCopy(ctx: *mut JSContext, buf: *const u8, len: usize) -> JSValue;
     fn JS_ParseJSON(
         ctx: *mut JSContext,
         buf: *const core::ffi::c_char,
@@ -294,7 +295,7 @@ unsafe extern "C" fn js_load_tile_texture(
     let handle = match core::str::from_utf8(core::slice::from_raw_parts(s as *const u8, len)) {
         Ok(key) => match crate::pak::find(crate::pak::installed(), key) {
             Some(blob) => ui().upload_tileset_tile(blob, arg_i32(ctx, argc, argv, 1) as u32),
-            None => -1,
+            None => crate::pak_external::read(key).map(|blob| ui().upload_tileset_tile(&blob, arg_i32(ctx, argc, argv, 1) as u32)).unwrap_or(-1),
         },
         Err(_) => -1,
     };
@@ -1269,6 +1270,11 @@ pub unsafe fn register(
         JS_SetPropertyStr(ctx, global, b"offload\0".as_ptr() as *const _, io);
     }
     let ui_obj = JS_NewObject(ctx);
+    if crate::pak_external::enabled() {
+        add_fn(ctx, global, b"__pakRead\0", js_pak_read, 3);
+        add_fn(ctx, ui_obj, b"loadImageTexture\0", js_load_image_texture, 1);
+        add_fn(ctx, ui_obj, b"imageTextureBytes\0", js_image_texture_bytes, 1);
+    }
 
     add_fn(ctx, ui_obj, b"createNode\0", js_create_node, 1);
     add_fn(ctx, ui_obj, b"destroyNode\0", js_destroy_node, 1);
@@ -1413,4 +1419,37 @@ pub unsafe fn register_audio(ctx: *mut JSContext, global: JSValue) {
     add_fn(ctx, audio_obj, b"endStream\0", js_audio_end_stream, 1);
     add_fn(ctx, audio_obj, b"poll\0", js_audio_poll, 0);
     JS_SetPropertyStr(ctx, global, b"audio\0".as_ptr() as *const _, audio_obj);
+}
+
+unsafe extern "C" fn js_pak_read(ctx: *mut JSContext, _: JSValue, n: i32, a: *mut JSValue) -> JSValue {
+    if n < 3 { return JS_UNDEFINED; }
+    let start = arg_i32(ctx, n, a, 1);
+    let end = arg_i32(ctx, n, a, 2);
+    if start < 0 || end < start { return JS_UNDEFINED; }
+    let mut len = 0;
+    let p = JS_ToCStringLen2(ctx, &mut len, *a, 0);
+    if p.is_null() { return JS_UNDEFINED; }
+    let out = core::str::from_utf8(core::slice::from_raw_parts(p as *const u8, len)).ok()
+        .and_then(|key| crate::pak_external::read_range(key, start as usize, end as usize));
+    JS_FreeCString(ctx, p);
+    match out {
+        Some(bytes) => JS_NewArrayBufferCopy(ctx, bytes.as_ptr(), bytes.len()),
+        None => JS_UNDEFINED,
+    }
+}
+unsafe extern "C" fn js_load_image_texture(ctx: *mut JSContext, _: JSValue, n: i32, a: *mut JSValue) -> JSValue {
+    if n < 1 { return JS_NewInt32(ctx, -1); }
+    let mut len = 0;
+    let p = JS_ToCStringLen2(ctx, &mut len, *a, 0);
+    if p.is_null() { return JS_NewInt32(ctx, -1); }
+    let handle = core::str::from_utf8(core::slice::from_raw_parts(p as *const u8, len)).ok()
+        .and_then(|key| crate::pak_external::read(&alloc::format!("ui:img.{}", key)))
+        .map(|bytes| ui().upload_img_entry(&bytes)).unwrap_or(-1);
+    JS_FreeCString(ctx, p);
+    if handle >= 0 { crate::ge::writeback_texture(ui(), handle); }
+    JS_NewInt32(ctx, handle)
+}
+unsafe extern "C" fn js_image_texture_bytes(ctx: *mut JSContext, _: JSValue, n: i32, a: *mut JSValue) -> JSValue {
+    let bytes = ui().texture(arg_i32(ctx, n, a, 0)).map(|t| t.pixels.len() + t.palette.map_or(0, |p| p.len())).unwrap_or(0);
+    JS_NewInt32(ctx, bytes as i32)
 }
