@@ -27,6 +27,7 @@ use winit::{
     keyboard::{Key, ModifiersState, NamedKey},
     window::{CursorIcon, Window, WindowId},
 };
+mod audio;
 mod fs;
 mod gpu;
 mod net;
@@ -83,6 +84,9 @@ struct Runtime {
     guest: Guest,
     supervisor: AppSupervisor,
     offload: OffloadWorker,
+    audio: audio::AudioSurface,
+    /// Owns the one device callback shared by the shell and child realms.
+    _audio_host: audio::AudioHost,
     /// The fs module core the guest's `globalThis.fs` closures hold; kept
     /// here for the runtime's life (the mount owns clones too).
     _fs: fs::FsMount,
@@ -113,8 +117,18 @@ impl Runtime {
         surface.set_tick_rate(60);
         surface.set_svc_allowlist(args.companions.clone());
         surface.feed_pak(&pak);
-        let supervisor =
-            AppSupervisor::new(args.system.as_ref(), &surface, args.data_root.clone())?;
+        let audio_host = audio::AudioHost::new(
+            1 + args
+                .system
+                .as_ref()
+                .map_or(0, |system| system.applications.len()),
+        );
+        let supervisor = AppSupervisor::new(
+            args.system.as_ref(),
+            &surface,
+            args.data_root.clone(),
+            &audio_host,
+        )?;
         let guest = Guest::new()?;
         surface.mount(&guest)?;
         let offload = text_worker(pak);
@@ -128,6 +142,8 @@ impl Runtime {
             "pocket-desktop-host: data.fs bound at {}",
             fs_roots.data.display()
         );
+        let audio = audio::AudioSurface::new(audio_host.client(0));
+        audio.mount(&guest)?;
         guest.eval(&args.app, &source)?;
         if !guest.has_frame() {
             return Err(anyhow!("bundle installed no frame handler"));
@@ -153,6 +169,8 @@ impl Runtime {
             guest,
             supervisor,
             offload,
+            audio,
+            _audio_host: audio_host,
             _fs: fs_mount,
             ticks: 0,
             buttons: 0,
@@ -228,6 +246,8 @@ impl Runtime {
                 self.svc(json!({"t":"ch","s":"x".repeat(n.min(512) as usize)}));
             }
         }
+        self._audio_host.begin_tick();
+        self.audio.begin_tick();
         self.offload.begin_frame();
         let buttons = if self.args.editor {
             if self.mouse_down || self.script_mouse || self.click_edge {

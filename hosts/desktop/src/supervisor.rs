@@ -2,6 +2,7 @@ struct AppCatalogEntry {
     package: SystemPackagePlan,
     /// Native compositor handle published to the shell as `ui.__surfaces`.
     surface_handle: u32,
+    audio: audio::AudioClient,
 }
 
 struct AppInstance {
@@ -11,6 +12,7 @@ struct AppInstance {
     surface: UiSurface,
     guest: Guest,
     offload: OffloadWorker,
+    audio: audio::AudioSurface,
     /// The per-app fs module mounted as the instance's `globalThis.fs`.
     _fs: fs::FsMount,
     buttons: u32,
@@ -74,6 +76,7 @@ impl AppSupervisor {
         system: Option<&ResolvedSystemPlan>,
         shell: &UiSurface,
         data_root: Option<PathBuf>,
+        audio_host: &audio::AudioHost,
     ) -> Result<Self> {
         let Some(system) = system else {
             return Ok(Self {
@@ -92,13 +95,14 @@ impl AppSupervisor {
             return Err(anyhow!("unknown System backgroundExecution policy"));
         }
         let mut catalog = Vec::new();
-        for package in &system.applications {
+        for (index, package) in system.applications.iter().enumerate() {
             let surface_handle = shell
                 .register_compositor_surface(package.package.clone())
                 .ok_or_else(|| anyhow!("reserving compositor surface for {}", package.package))?;
             catalog.push(AppCatalogEntry {
                 package: package.clone(),
                 surface_handle: surface_handle as u32,
+                audio: audio_host.client(index + 1),
             });
         }
         Ok(Self {
@@ -154,6 +158,8 @@ impl AppSupervisor {
             "pocket-desktop-host: data.fs bound at {}",
             fs_roots.data.display()
         );
+        let audio = audio::AudioSurface::new(entry.audio.clone());
+        audio.mount(&guest)?;
         guest.eval(output, &bundle)?;
         if !guest.has_frame() {
             return Err(anyhow!("{output} evaluated but installed no frame()"));
@@ -167,6 +173,7 @@ impl AppSupervisor {
             surface,
             guest,
             offload,
+            audio,
             _fs: fs_mount,
             buttons: 0,
             visible: false,
@@ -314,8 +321,10 @@ impl AppSupervisor {
         let schedule = scheduled_app_instances(&facts);
         for index in schedule {
             let instance = &mut self.instances[index];
+            instance.audio.begin_tick();
             instance.offload.begin_frame();
             if let Err(error) = instance.guest.frame(instance.buttons) {
+                instance.audio.reset();
                 instance.state = AppInstanceState::Failed;
                 failures.push((instance.package.package.clone(), error.to_string()));
                 continue;
