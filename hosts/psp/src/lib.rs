@@ -33,6 +33,7 @@ pub mod host;
 pub mod pak;
 #[cfg(feature = "runtime")]
 pub mod package_file;
+pub mod pak_external;
 pub mod qjs_alloc;
 pub mod stats;
 pub mod svc;
