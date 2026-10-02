@@ -65,6 +65,156 @@ mod tests {
         assert!(settings_absent);
     }
 
+    /// Sets an environment variable for the test's lifetime, restoring the
+    /// previous value on drop.
+    struct EnvGuard {
+        key: String,
+        old: Option<String>,
+    }
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            // SAFETY: test-only process-global mutation; no other thread in
+            // this binary reads POCKETJS_DIST.
+            unsafe { std::env::set_var(key, value) };
+            EnvGuard {
+                key: key.to_string(),
+                old,
+            }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: restores the value captured in `set`.
+            unsafe {
+                if let Some(old) = &self.old {
+                    std::env::set_var(&self.key, old);
+                } else {
+                    std::env::remove_var(&self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn app_supervisor_child_realms_collect_at_the_tick_boundary() {
+        // AppSupervisor child realms use the same between-tick collection as
+        // the top-level guest: a turn's cyclic garbage is reclaimed by
+        // idle_gc at the end of the tick, not inside whichever turn crosses
+        // the engine's allocation threshold.
+        let dist = TempBase::new("supervisor-dist");
+        let app = "dev.pocket-nexus.child";
+        std::fs::write(
+            dist.path().join(format!("{app}.js")),
+            // 3,000 two-object cycles per turn: enough to cross the soft
+            // limit without crossing the GC threshold, so the collection
+            // lands at the boundary.
+            "globalThis.frame = (buttons) => { \
+                for (let i = 0; i < 3000; i++) { const a = {}; const b = { a }; a.b = b; } \
+                globalThis.lastButtons = buttons; \
+            };",
+        )
+        .unwrap();
+        std::fs::write(dist.path().join(format!("{app}.pak")), b"").unwrap();
+        let _dist_guard = EnvGuard::set("POCKETJS_DIST", dist.path().to_str().unwrap());
+
+        let plan: ResolvedSystemPlan = serde_json::from_value(serde_json::json!({
+            "system": {
+                "id": "dev.pocket-nexus.desktop",
+                "name": "pocket-desktop",
+                "title": "Pocket Desktop",
+                "version": "0.1.0"
+            },
+            "target": { "id": HOST_ID, "hostAbi": HOST_ABI },
+            "roles": { "systemUI": "dev.pocket-nexus.shell" },
+            "lifecycle": { "backgroundExecution": "suspend" },
+            "installation": {
+                "installedPackages": ["dev.pocket-nexus.shell", "dev.pocket-nexus.child"]
+            },
+            "systemUI": {
+                "package": "dev.pocket-nexus.shell",
+                "source": "apps/shell/pocket.json",
+                "required": true,
+                "plan": {
+                    "app": {
+                        "id": "dev.pocket-nexus.shell",
+                        "output": "shell-main",
+                        "title": "System UI",
+                        "version": "0.1.0",
+                        "entry": "apps/shell/main.tsx",
+                        "framework": "solid"
+                    },
+                    "target": { "id": HOST_ID, "hostAbi": HOST_ABI },
+                    "viewport": {
+                        "logical": [800, 600],
+                        "physical": [1600, 1200],
+                        "presentation": "native",
+                        "rasterDensity": 2,
+                        "policy": "dynamic"
+                    },
+                    "features": { "ui.compositor-surfaces": true },
+                    "companions": ["system-ui"],
+                    "planHash": "sha256:package"
+                }
+            },
+            "applications": [{
+                "package": app,
+                "source": "apps/child/pocket.json",
+                "required": true,
+                "plan": {
+                    "app": {
+                        "id": app,
+                        "output": app,
+                        "title": "Child",
+                        "version": "0.1.0",
+                        "entry": "apps/child/main.tsx",
+                        "framework": "solid"
+                    },
+                    "target": { "id": HOST_ID, "hostAbi": HOST_ABI },
+                    "viewport": {
+                        "logical": [320, 240],
+                        "physical": [320, 240],
+                        "presentation": "native",
+                        "rasterDensity": 1,
+                        "policy": "dynamic"
+                    },
+                    "features": {},
+                    "companions": [],
+                    "planHash": "sha256:child"
+                }
+            }],
+            "planHash": "sha256:system"
+        }))
+        .unwrap();
+
+        let shell = UiSurface::new((800.0, 600.0));
+        let data = TempBase::new("supervisor-data");
+        let audio = audio::AudioHost::new(2);
+        let mut supervisor =
+            AppSupervisor::new(Some(&plan), &shell, Some(data.path().to_path_buf()), &audio)
+                .unwrap();
+        let handle = shell.register_compositor_surface(app).unwrap() as u32;
+        assert!(supervisor.open(handle).unwrap());
+        assert_eq!(supervisor.instances.len(), 1);
+
+        for _ in 0..8 {
+            supervisor.tick();
+        }
+        let stats = supervisor.instances[0]
+            .guest
+            .idle_gc_stats()
+            .expect("child realm has idle GC");
+        assert!(
+            stats.idle_collections > 0,
+            "child realm did not collect at the tick boundary: {stats:?}"
+        );
+        // The child's turn still ran between collections.
+        let buttons: u32 = supervisor.instances[0]
+            .guest
+            .with(|ctx| ctx.globals().get("lastButtons").unwrap());
+        assert_eq!(buttons, 0);
+    }
+
     #[test]
     fn app_instance_repaint_hash_includes_raster_revision() {
         let surface = UiSurface::new((16.0, 16.0));
