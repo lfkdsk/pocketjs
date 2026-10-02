@@ -40,6 +40,7 @@ import {
 import { fileURLToPath } from "node:url";
 import { resolve, join } from "node:path";
 import { fontSlotInfo } from "./tailwind.ts";
+import type { FallbackTtf } from "./font-config.ts";
 
 const FONTS_DIR = resolve(fileURLToPath(new URL("../../assets/fonts/", import.meta.url)));
 export const DEFAULT_REGULAR = join(FONTS_DIR, "Inter-Regular.ttf");
@@ -79,7 +80,9 @@ export interface BakeOptions {
    *  text they label. A fallback glyph keeps its own advance, scaled to the
    *  slot's px through its own unitsPerEm, so a double-width symbol stays
    *  centred in its box. */
-  fallbackTtfs?: string[];
+  /** String entries apply to every slot. Object entries apply only to slots
+   *  whose logical px size appears in `sizes`. */
+  fallbackTtfs?: readonly FallbackTtf[];
 }
 
 // ---------------------------------------------------------------------------
@@ -454,10 +457,15 @@ export async function bakeAtlases(opts: BakeOptions): Promise<BakedAtlas[]> {
     bold: null,
     mono: null,
   };
-  const fallbacks: Font[] = [];
-  for (const path of opts.fallbackTtfs ?? []) {
+  const fallbacks: { font: Font; sizes?: ReadonlySet<number> }[] = [];
+  for (const fallback of opts.fallbackTtfs ?? []) {
+    const path = typeof fallback === "string" ? fallback : fallback.path;
+    const sizes = typeof fallback === "string" ? undefined : new Set(fallback.sizes);
+    if (!path || (sizes && (!sizes.size || [...sizes].some(size => !Number.isInteger(size))))) {
+      throw new Error("PocketJS bake-font: invalid fallback font selection");
+    }
     opts.onRead?.(path);
-    fallbacks.push(await loadFont(path));
+    fallbacks.push({ font: await loadFont(path), sizes });
   }
   const results: BakedAtlas[] = [];
   for (const slot of [...opts.slots].sort((a, b) => a - b)) {
@@ -473,7 +481,10 @@ export async function bakeAtlases(opts: BakeOptions): Promise<BakedAtlas[]> {
           : (opts.regularTtf ?? DEFAULT_REGULAR);
     opts.onRead?.(path);
     fonts[key] ??= await loadFont(path);
-    results.push(bakeSlot(fonts[key]!, slot, px, bold, chars, rasterDensity, fallbacks));
+    const slotFallbacks = fallbacks
+      .filter(fallback => !fallback.sizes || fallback.sizes.has(px))
+      .map(fallback => fallback.font);
+    results.push(bakeSlot(fonts[key]!, slot, px, bold, chars, rasterDensity, slotFallbacks));
   }
   return results;
 }
