@@ -202,7 +202,7 @@ performance measurements. Captures and per-run logs belong under
 
 ## Packaged fonts and GPU pages
 
-`fonts.json` beside the app entry still declares baked coverage:
+`fonts.json` beside the app entry declares baked coverage:
 
 ```json
 {

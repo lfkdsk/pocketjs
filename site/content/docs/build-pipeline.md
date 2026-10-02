@@ -298,7 +298,7 @@ The charset baked into every slot is the union of:
   **`fonts.json` beside the app entry**;
 - anything passed via **`--extra-chars`**.
 
-`fonts.json` also declares fallback faces for codepoints missing from the slot's
+`fonts.json` declares fallback faces for codepoints missing from the slot's
 primary face. A path string applies to every used slot. An object scopes the
 face to logical pixel sizes:
 

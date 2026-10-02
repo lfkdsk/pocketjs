@@ -39,7 +39,7 @@ import {
 } from "../../contracts/spec/spec.ts";
 import { fileURLToPath } from "node:url";
 import { resolve, join } from "node:path";
-import { fontSlotInfo } from "./tailwind.ts";
+import { fontSlotFor, fontSlotInfo } from "./tailwind.ts";
 import type { FallbackTtf } from "./font-config.ts";
 
 const FONTS_DIR = resolve(fileURLToPath(new URL("../../assets/fonts/", import.meta.url)));
@@ -463,6 +463,13 @@ export async function bakeAtlases(opts: BakeOptions): Promise<BakedAtlas[]> {
     const sizes = typeof fallback === "string" ? undefined : new Set(fallback.sizes);
     if (!path || (sizes && (!sizes.size || [...sizes].some(size => !Number.isInteger(size))))) {
       throw new Error("PocketJS bake-font: invalid fallback font selection");
+    }
+    for (const size of sizes ?? []) {
+      try {
+        fontSlotFor(size, false);
+      } catch {
+        throw new Error(`PocketJS bake-font: unsupported fallback font size ${size}`);
+      }
     }
     opts.onRead?.(path);
     fallbacks.push({ font: await loadFont(path), sizes });
