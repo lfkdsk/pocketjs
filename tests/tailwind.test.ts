@@ -6,6 +6,7 @@ import {
   DEFAULT_FONT_SLOT,
   compileClasses,
   fontSlotFor,
+  fontSlotInfo,
   paletteColor,
   parseClassLiteral,
 } from "../framework/compiler/tailwind.ts";
@@ -198,6 +199,24 @@ describe("text", () => {
     expect(fontSlotFor(54, false)).toBe(14);
     expect(fontSlotFor(54, true)).toBe(15);
     expect(props(parseClassLiteral("text-5xl font-bold")).get(PROP.fontSlot)).toBe(15);
+  });
+  test("text-2xs is a 10px pair appended at slots 19/20, legacy slots unchanged", () => {
+    expect(props(parseClassLiteral("text-2xs")).get(PROP.fontSlot)).toBe(19);
+    expect(props(parseClassLiteral("text-2xs font-bold")).get(PROP.fontSlot)).toBe(20);
+    expect(fontSlotFor(10, false)).toBe(19);
+    expect(fontSlotFor(10, true)).toBe(20);
+    expect(fontSlotInfo(19)).toEqual({ px: 10, bold: false, mono: false });
+    expect(fontSlotInfo(20)).toEqual({ px: 10, bold: true, mono: false });
+    // Every earlier slot still round-trips to the same triple.
+    for (let slot = 0; slot <= 20; slot++) {
+      const { px, bold, mono } = fontSlotInfo(slot);
+      expect(fontSlotFor(px, bold, mono)).toBe(slot);
+    }
+    expect(fontSlotFor(12, false)).toBe(0);
+    expect(fontSlotFor(16, false, true)).toBe(18);
+    // No 10px monospace face, and slots past the pair stay unassigned.
+    expect(() => parseClassLiteral("text-2xs font-mono")).toThrow(/no monospace font slot for 10px/);
+    expect(() => fontSlotInfo(21)).toThrow(/bad font slot 21/);
   });
   test("font-bold alone defaults to 16px bold", () => {
     const m = props(parseClassLiteral("font-bold"));
