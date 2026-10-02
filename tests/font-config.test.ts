@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { Font, Glyph, Path } from "opentype.js";
 import { readFontConfig } from "../framework/compiler/font-config.ts";
 import { bakeAtlases } from "../framework/compiler/bake-font.ts";
 import { pack, unpack, PAK_DTYPE } from "../framework/compiler/pak.ts";
@@ -15,6 +16,23 @@ function config(value: unknown) {
   return { dir, path };
 }
 
+function fallbackFace(path: string, familyName: string, advanceWidth: number) {
+  const outline = new Path();
+  outline.moveTo(100, 100); outline.lineTo(900, 100); outline.lineTo(900, 700); outline.lineTo(100, 700); outline.close();
+  const face = new Font({
+    familyName,
+    styleName: "Regular",
+    unitsPerEm: 1000,
+    ascender: 800,
+    descender: -200,
+    glyphs: [
+      new Glyph({ name: ".notdef", advanceWidth: 500, path: new Path() }),
+      new Glyph({ name: "uni4E00", unicode: 0x4e00, advanceWidth, path: outline }),
+    ],
+  });
+  writeFileSync(path, new Uint8Array(face.toArrayBuffer()));
+}
+
 test("runtime character policy tracks external data and preserves supplementary scalars", () => {
   const { dir, path } = config({ characters: "你", characterFiles: ["titles.txt"], ranges: ["U+3042-3044"] });
   writeFileSync(join(dir, "titles.txt"), "気迫\n你好\n𠮷");
@@ -26,17 +44,32 @@ test("runtime character policy tracks external data and preserves supplementary 
 
 test("malformed or oversized character policies fail before baking", () => {
   for (const value of [{ ranges: ["U+110000"] }, { ranges: ["U+FFFF-0000"] }, { ranges: ["U+0000-10FFFF"] },
-    { characters: 1 }, { characterFiles: ["absent"] }, { charset: "typo" }, { fallback: 1 }, { fallback: null },
-    { fallback: [1] }, { fallback: [""] }, { fallback: [{}] }, { fallback: [{ path: "font.otf" }] },
-    { fallback: [{ sizes: [16] }] }, { fallback: [{ path: "font.otf", sizes: [] }] },
-    { fallback: [{ path: "font.otf", sizes: [15] }] }, { fallback: [{ path: "font.otf", sizes: [16.5] }] },
-    { fallback: [{ path: "font.otf", sizes: ["16"] }] },
-    { fallback: [{ path: "font.otf", sizes: [16], slots: [2] }] }]) {
+    { characters: 1 }, { characterFiles: ["absent"] }, { charset: "typo" }]) {
     expect(() => readFontConfig(config(value).path)).toThrow();
   }
   const { dir, path } = config({ characterFiles: ["bad.txt"] });
   writeFileSync(join(dir, "bad.txt"), new Uint8Array([0xc0, 0xaf]));
   expect(() => readFontConfig(path)).toThrow();
+});
+
+test("fallback size policies reject invalid shapes before reading the face", () => {
+  const face = resolve("assets/fonts/NotoSansCJK-Demo.otf");
+  for (const [fallback, message] of [
+    [1, "fallback must be an array"],
+    [null, "fallback must be an array"],
+    [[1], "fallback[0] must be a nonempty path string or an object"],
+    [[""], "fallback[0] must be a nonempty path string or an object"],
+    [[{}], "fallback[0].path must be a nonempty string"],
+    [[{ path: face }], "fallback[0].sizes must be a nonempty array"],
+    [[{ sizes: [16] }], "fallback[0].path must be a nonempty string"],
+    [[{ path: face, sizes: [] }], "fallback[0].sizes must be a nonempty array"],
+    [[{ path: face, sizes: [15] }], "fallback[0].sizes contains unsupported font size 15"],
+    [[{ path: face, sizes: [16.5] }], "fallback[0].sizes must contain integer font sizes"],
+    [[{ path: face, sizes: ["16"] }], "fallback[0].sizes must contain integer font sizes"],
+    [[{ path: face, sizes: [16], slots: [2] }], "unknown field fallback[0].slots"],
+  ] as const) {
+    expect(() => readFontConfig(config({ fallback }).path)).toThrow(message);
+  }
 });
 
 test("fallback entries preserve the all-size default and normalize explicit sizes", () => {
@@ -46,6 +79,37 @@ test("fallback entries preserve the all-size default and normalize explicit size
     face,
     { path: face, sizes: [12, 16] },
   ]);
+});
+
+test("the direct atlas API rejects unsupported fallback sizes", async () => {
+  const face = resolve("assets/fonts/NotoSansCJK-Demo.otf");
+  await expect(bakeAtlases({
+    slots: [2],
+    codepoints: ["你".codePointAt(0)!],
+    fallbackTtfs: [{ path: face, sizes: [15] }],
+  })).rejects.toThrow("unsupported fallback font size 15");
+});
+
+test("size filtering preserves the order of active fallback faces", async () => {
+  const { dir } = config({});
+  const first = join(dir, "first.otf"), second = join(dir, "second.otf");
+  fallbackFace(first, "First fallback", 250);
+  fallbackFace(second, "Second fallback", 750);
+  const advance = async (firstSizes: number[]) => {
+    const [atlas] = await bakeAtlases({
+      slots: [2],
+      codepoints: [0x4e00],
+      fallbackTtfs: [{ path: first, sizes: firstSizes }, second],
+    });
+    const view = new DataView(atlas.bytes.buffer, atlas.bytes.byteOffset, atlas.bytes.byteLength);
+    for (let index = 0; index < atlas.glyphCount; index++) {
+      const at = 16 + index * 8;
+      if (view.getUint32(at, true) === 0x4e00) return view.getUint8(at + 6);
+    }
+    throw new Error("test fallback glyph missing");
+  };
+  expect(await advance([12])).toBe(12);
+  expect(await advance([16])).toBe(4);
 });
 
 test("declared ranges and dynamic CJK metadata have real baked glyphs", async () => {
