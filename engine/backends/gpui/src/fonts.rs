@@ -18,10 +18,11 @@ use pocketjs_core::text::{MeasureFn, WrapFn};
 
 /// Slot -> px mirror of the compiler's slot registry
 /// (framework/compiler/tailwind.ts FONT_PX: slots 0..6 regular, 7..13 bold,
-/// 14/15 the 54 px display pair, 16..18 monospace 12/14/16) — the same
-/// hand-mirror note-widget's cjk.rs keeps.
+/// 14/15 the 54 px display pair, 16..18 monospace 12/14/16, 19/20 the 10 px
+/// `text-2xs` pair) — the same hand-mirror note-widget's cjk.rs keeps.
 const FONT_PX: [f32; 7] = [12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 36.0];
 const LARGE_PX: f32 = 54.0;
+const SMALL_PX: f32 = 10.0;
 const MONO_PX: [f32; 3] = [12.0, 14.0, 16.0];
 
 /// (font px, bold, mono) for a font slot; unknown slots read as slot 1.
@@ -32,6 +33,8 @@ pub fn slot_px(slot: u8) -> (f32, bool, bool) {
         14 => (LARGE_PX, false, false),
         15 => (LARGE_PX, true, false),
         16..=18 => (MONO_PX[(slot - 16) as usize], false, true),
+        19 => (SMALL_PX, false, false),
+        20 => (SMALL_PX, true, false),
         _ => (FONT_PX[1], false, false),
     }
 }

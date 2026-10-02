@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { parse as parseFont } from "opentype.js";
-import { bakeSlot, DEFAULT_REGULAR } from "../framework/compiler/bake-font.ts";
+import { bakeAtlases, bakeSlot, DEFAULT_REGULAR } from "../framework/compiler/bake-font.ts";
 import {
   FONT_CMAP_ENTRY_SIZE,
   FONT_HEADER_SIZE,
@@ -175,5 +175,29 @@ describe("fill rule", () => {
       return atlas.coverageH;
     };
     expect(topInk(h)).toBeLessThan(topInk(n));
+  });
+});
+
+describe("10px text-2xs slots", () => {
+  test("slot 19 bakes a 10px regular atlas, smaller than the 12px slot 0", async () => {
+    const [small, xs] = await bakeAtlases({ codepoints: [0x4e2d], slots: [19, 0] }).then((atlases) =>
+      [atlases.find((a) => a.slot === 19)!, atlases.find((a) => a.slot === 0)!],
+    );
+    expect([small.px, small.bold]).toEqual([10, false]);
+    expect(small.bytes[12]).toBe(19); // header slot byte
+    expect(small.bytes[13]).toBe(0); // not bold
+    // A 10px face: line height and cell are smaller than the 12px slot's.
+    expect(small.bytes[11]).toBeLessThan(xs.bytes[11]);
+    expect(small.cellH).toBeLessThan(xs.cellH);
+    expect(small.bytes[11]).toBeGreaterThanOrEqual(10);
+    expect(small.bytes[11]).toBeLessThanOrEqual(13);
+    // Same charset (ASCII + the collected codepoint) as any other slot.
+    expect(small.glyphCount).toBe(xs.glyphCount);
+  });
+
+  test("slot 20 bakes the bold face at 10px", async () => {
+    const [bold] = await bakeAtlases({ codepoints: [], slots: [20] });
+    expect([bold.px, bold.bold, bold.bytes[12]]).toEqual([10, true, 20]);
+    expect(bold.bytes[13]).not.toBe(0);
   });
 });

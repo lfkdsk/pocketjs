@@ -31,6 +31,8 @@ fn slot_px(slot: u8) -> f32 {
         16 => 12.0,
         17 => 14.0,
         18 => 16.0,
+        // The 10 px `text-2xs` pair (tailwind.ts SMALL_FONT_PX).
+        19 | 20 => 10.0,
         s => [12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 36.0][(s % 7) as usize],
     }
 }

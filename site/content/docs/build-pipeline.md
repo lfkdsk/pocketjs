@@ -285,6 +285,10 @@ The assigned slots:
 | 7–13 | Inter Bold | the same seven sizes |
 | 14, 15 | Inter Regular / Bold | 54 px |
 | 16–18 | JetBrains Mono Regular | 12/14/16 px |
+| 19, 20 | Inter Regular / Bold | 10 px (`text-2xs`) |
+
+Slot numbers are append-only: a new size takes the next free slots, so a
+pinned slot never changes meaning between releases.
 
 A bold request under `font-mono` still lands on the mono slot for its size —
 there is no bold mono face. `--font-regular` and `--font-bold` swap the Inter
