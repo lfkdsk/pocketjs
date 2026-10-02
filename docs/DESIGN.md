@@ -326,7 +326,7 @@ widths):
   spans), `border`+`border-{c}`
 - **text**: `text-{palette}`, `text-xs|sm|base|lg|xl|2xl|4xl` → baked slots
   **12/14/16/18/20/24/36 px** (slots derived from the utility list, both
-  weights **[R]**), `font-bold`, `text-left|center|right`, `leading-N`,
+  weights **[R]**; `text-5xl` 54 px and `text-2xs` 10 px are appended pairs), `font-bold`, `text-left|center|right`, `leading-N`,
   `tracking-wide`
 - **transform** (animatable, no relayout): `translate-x/y-N`, `scale-N`,
   `rotate-N`, `scale-x/y-N`, `origin-center|top|bottom|left|right|top-left|…`
