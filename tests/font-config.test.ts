@@ -26,12 +26,26 @@ test("runtime character policy tracks external data and preserves supplementary 
 
 test("malformed or oversized character policies fail before baking", () => {
   for (const value of [{ ranges: ["U+110000"] }, { ranges: ["U+FFFF-0000"] }, { ranges: ["U+0000-10FFFF"] },
-    { characters: 1 }, { characterFiles: ["absent"] }, { charset: "typo" }]) {
+    { characters: 1 }, { characterFiles: ["absent"] }, { charset: "typo" }, { fallback: 1 }, { fallback: null },
+    { fallback: [1] }, { fallback: [""] }, { fallback: [{}] }, { fallback: [{ path: "font.otf" }] },
+    { fallback: [{ sizes: [16] }] }, { fallback: [{ path: "font.otf", sizes: [] }] },
+    { fallback: [{ path: "font.otf", sizes: [15] }] }, { fallback: [{ path: "font.otf", sizes: [16.5] }] },
+    { fallback: [{ path: "font.otf", sizes: ["16"] }] },
+    { fallback: [{ path: "font.otf", sizes: [16], slots: [2] }] }]) {
     expect(() => readFontConfig(config(value).path)).toThrow();
   }
   const { dir, path } = config({ characterFiles: ["bad.txt"] });
   writeFileSync(join(dir, "bad.txt"), new Uint8Array([0xc0, 0xaf]));
   expect(() => readFontConfig(path)).toThrow();
+});
+
+test("fallback entries preserve the all-size default and normalize explicit sizes", () => {
+  const face = resolve("assets/fonts/NotoSansCJK-Demo.otf");
+  const { path } = config({ fallback: [face, { path: face, sizes: [16, 12, 16] }] });
+  expect(readFontConfig(path).fallbackTtfs).toEqual([
+    face,
+    { path: face, sizes: [12, 16] },
+  ]);
 });
 
 test("declared ranges and dynamic CJK metadata have real baked glyphs", async () => {
@@ -46,6 +60,32 @@ test("declared ranges and dynamic CJK metadata have real baked glyphs", async ()
     for (const c of text) expect(mapped.get(c.codePointAt(0)!), `slot ${atlas.slot}, ${c}`).toBeGreaterThan(0);
     expect(mapped.has(0x9fff)).toBe(false); // Coverage is explicit, not an all-Unicode claim.
   }
+});
+
+test("size-scoped fallbacks bake CJK only into matching slots and leave visible tofu elsewhere", async () => {
+  const text = "你好";
+  const { path } = config({
+    fallback: [{ path: resolve("assets/fonts/NotoSansCJK-Demo.otf"), sizes: [16] }],
+    characters: text,
+  });
+  const atlases = await bakeAtlases({ ...readFontConfig(path), slots: [0, 2, 9, 18] });
+  const glyph = (atlas: (typeof atlases)[number], codepoint: number): number | undefined => {
+    const view = new DataView(atlas.bytes.buffer, atlas.bytes.byteOffset, atlas.bytes.byteLength);
+    for (let i = 0; i < atlas.glyphCount; i++) {
+      const at = 16 + i * 8;
+      if (view.getUint32(at, true) === codepoint) return view.getUint16(at + 4, true);
+    }
+  };
+  for (const atlas of atlases.filter(atlas => atlas.px === 16)) {
+    expect(glyph(atlas, "你".codePointAt(0)!)).toBeGreaterThan(0);
+    expect(glyph(atlas, "好".codePointAt(0)!)).toBeGreaterThan(0);
+  }
+  const excluded = atlases.find(atlas => atlas.slot === 0)!;
+  expect(glyph(excluded, "你".codePointAt(0)!)).toBeUndefined();
+  expect(glyph(excluded, 0xfffd)).toBe(0);
+  const coverageOffset = 16 + excluded.glyphCount * 8;
+  const tofu = excluded.bytes.subarray(coverageOffset, coverageOffset + excluded.coverageW * excluded.coverageH);
+  expect(tofu.some(sample => sample > 0)).toBe(true);
 });
 
 test("runtime UTF-8 data survives a pack round trip without TextDecoder on the guest", () => {
