@@ -211,7 +211,7 @@ describe("sim world lifecycle", () => {
     expect(active?.render().byteLength).toBe(480 * 272 * 4);
   });
 
-  test("a replaced world cannot drive the active world", async () => {
+  test("a replaced world cannot drive or resize the active world", async () => {
     let olderOps: Record<string, unknown> | undefined;
     const older = await bootWorld(
       "cafe-main",
@@ -232,10 +232,14 @@ describe("sim world lifecycle", () => {
     expect(() => older.frame(0)).toThrow("superseded by a newer boot");
     expect(() => older.tick()).toThrow("superseded by a newer boot");
     expect(() => older.render()).toThrow("superseded by a newer boot");
+    expect(() => older.resizeViewport(600, 400)).toThrow("superseded by a newer boot");
     expect(() => older.getTree()).toThrow("superseded by a newer boot");
     expect(olderOps?.__viewport).toEqual({ w: 720, h: 480 });
     expect(activeOps?.__viewport).toEqual({ w: 480, h: 272 });
     expect(active.render().byteLength).toBe(480 * 272 * 4);
+    active.resizeViewport(600, 400);
+    expect(activeOps?.__viewport).toEqual({ w: 600, h: 400 });
+    expect(active.render().byteLength).toBe(600 * 400 * 4);
   });
 
   test("a fresh boot clears capabilities and custom globals from its predecessor", async () => {
