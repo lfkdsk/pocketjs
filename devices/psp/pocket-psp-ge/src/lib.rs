@@ -4,6 +4,7 @@
 extern crate alloc;
 pub mod list;
 pub mod pool;
+pub mod strips;
 pub mod swizzle;
 pub use list::DisplayList;
 pub use pool::FramePool;

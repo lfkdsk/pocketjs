@@ -45,5 +45,3 @@ pub mod offload;
 pub mod offload_image;
 pub mod offload_local;
 pub mod offload_packet;
-
-mod tex_strips;
