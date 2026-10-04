@@ -465,6 +465,7 @@ export async function bootWorld(
     axes?: readonly AxisDelta[],
     motion?: MotionState | null,
   ) => void;
+  let appResize: ((width: number, height: number) => void) | undefined;
   try {
     restoreGlobalEntries(g, previousGlobalRestore);
     restoreMutableGlobalObjects(previousObjectRestore);
@@ -499,6 +500,10 @@ export async function bootWorld(
       throw new Error("sim: bundle did not install globalThis.frame (entry must call render()/mount())");
     }
     appFrame = installedFrame as typeof appFrame;
+    const installedResize = g.__pocketResizeViewport;
+    appResize = typeof installedResize === "function"
+      ? installedResize as typeof appResize
+      : undefined;
     if (worldId !== nextWorldId) {
       throw new Error(`sim: boot for ${app} was superseded by a newer boot`);
     }
@@ -552,9 +557,7 @@ export async function bootWorld(
       // Same order as hosts/desktop/src/main.rs: core first, guest hook
       // after, so the guest reads the new size from hostViewport().
       wasm.resizeViewport(width, height);
-      const resize = (globalThis as { __pocketResizeViewport?: (w: number, h: number) => void })
-        .__pocketResizeViewport;
-      resize?.(width, height);
+      appResize?.(width, height);
     },
     ticksPerFrame: TICKS_PER_SECOND / hz,
     hz,
