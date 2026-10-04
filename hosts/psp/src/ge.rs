@@ -361,7 +361,7 @@ fn strip_texels(psm: u32) -> i32 {
     }
 }
 
-use crate::tex_strips::strip_count;
+use pocket_psp_ge::strips::strip_count;
 
 /// Render one frame's DrawList into the open display list.
 pub unsafe fn render(ui: &Ui, words: &[u32]) {

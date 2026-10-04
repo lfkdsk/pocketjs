@@ -3,6 +3,7 @@
 #![no_std]
 extern crate alloc;
 pub mod pool;
+pub mod strips;
 pub mod swizzle;
 pub use pool::FramePool;
 
