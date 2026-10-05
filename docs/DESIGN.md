@@ -47,7 +47,8 @@ artifacts: `$JOB_TMP/map-*.json`).
   `window`/`document`/`setTimeout`/`WeakRef`; needs Proxy, WeakMap, Promise.
   Prior art: Lightning TV, `@opentui/solid`. Preact+DOM-shim is the fallback.
 - **QuickJS reality [R]**: the linked engine (exact-revision
-  `pocket-nexus/quickjs-rs` Cargo dependency) is
+  `pocket-nexus/quickjs-rs` Cargo dependency; the PSP host pins a fork of it
+  that adds a generational collector) is
   **Bellard 2025 (VERSION 2026-06-04), ~ES2023** — logical assignment, WeakRef
   and **FinalizationRegistry are available**. Still absent: `queueMicrotask`
   (polyfill via `Promise.resolve().then`), `setTimeout`, `MessageChannel`,

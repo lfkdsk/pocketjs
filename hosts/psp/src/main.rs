@@ -27,7 +27,7 @@ use psp::sys::DisplayPixelFormat;
 use psp::sys::{self, CtrlMode, GuContextType, GuSyncBehavior, GuSyncMode, IoOpenFlags, SceCtrlData};
 
 use pocketjs_core::spec;
-use pocketjs_psp::gc_policy::{GcTrigger, Sample as GcSample};
+use pocketjs_psp::gc_policy::{self, Collection, GcKind, GcTrigger, Sample as GcSample};
 use pocketjs_psp::{arena, audio_mod, dbg, ffi, ge, host, pak, svc, switch, veil, vid};
 
 psp::module!("pocketjs", 1, 1);
@@ -51,6 +51,15 @@ static POCKETJS_TRACE: &str = env!("POCKETJS_TRACE");
 // (local-extern pattern, same as host.rs JS_ExecutePendingJob).
 extern "C" {
     fn JS_RunGC(rt: *mut JSRuntime);
+    // The generational collector (pocket-nexus/quickjs-rs).
+    fn JS_RunGCMinor(rt: *mut JSRuntime);
+    fn JS_PromoteGCObjects(rt: *mut JSRuntime);
+    fn JS_SetGCYoungLimit(
+        rt: *mut JSRuntime,
+        limit: u32,
+        hook: Option<unsafe extern "C" fn(*mut JSRuntime, i32)>,
+    );
+    fn JS_FreePendingObjects(rt: *mut JSRuntime, max_count: i32) -> i32;
 }
 
 
@@ -153,6 +162,11 @@ struct BenchState {
     gc_count: u32,
     gc_sum_us: u64,
     max_gc_us: u64,
+    // Start of a minor collection QuickJS runs mid-frame (YOUNG_LIMIT).
+    gc_hook_start_us: u64,
+    // Releasing what minor collections queued (FREE_BUDGET per frame).
+    gc_free_sum_us: u64,
+    max_gc_free_us: u64,
     js_sum_us: u64,
     jobs_sum_us: u64,
     tick_sum_us: u64,
@@ -182,6 +196,9 @@ impl BenchState {
             gc_count: 0,
             gc_sum_us: 0,
             max_gc_us: 0,
+            gc_hook_start_us: 0,
+            gc_free_sum_us: 0,
+            max_gc_free_us: 0,
             js_sum_us: 0,
             jobs_sum_us: 0,
             tick_sum_us: 0,
@@ -388,8 +405,9 @@ unsafe fn bench_maybe_flush(frame_count: u32) {
     bench_write(line.as_bytes());
     let qjs = pocketjs_psp::qjs_alloc::stats();
     bench_write(alloc::format!(
-        "{{\"window_start\":{},\"slowest_columns\":[\"frame\",\"work_us\",\"js_us\",\"jobs_us\",\"tick_us\",\"draw_us\",\"render_us\"],\"slowest\":{:?},\"gc_count\":{},\"gc_us\":{},\"max_gc_us\":{},\"qjs_live_bytes\":{},\"qjs_peak_bytes\":{},\"qjs_failed_request\":{}}}\n",
+        "{{\"window_start\":{},\"slowest_columns\":[\"frame\",\"work_us\",\"js_us\",\"jobs_us\",\"tick_us\",\"draw_us\",\"render_us\"],\"slowest\":{:?},\"gc_count\":{},\"gc_us\":{},\"max_gc_us\":{},\"gc_free_us\":{},\"max_gc_free_us\":{},\"qjs_live_bytes\":{},\"qjs_peak_bytes\":{},\"qjs_failed_request\":{}}}\n",
         start, BENCH.slowest, BENCH.gc_count, BENCH.gc_sum_us, BENCH.max_gc_us,
+        BENCH.gc_free_sum_us, BENCH.max_gc_free_us,
         qjs.live_requested, qjs.peak_requested, qjs.last_failed_request,
     ).as_bytes());
     #[cfg(not(feature = "capture"))]
@@ -475,6 +493,25 @@ unsafe fn run() {
         veil::play();
     }
 }
+
+/// Times the minor collections QuickJS runs mid-frame once `YOUNG_LIMIT`
+/// young objects exist: `end` is 0 before the collection and 1 after.
+#[cfg(feature = "bench")]
+unsafe extern "C" fn bench_young_gc(_rt: *mut JSRuntime, end: i32) {
+    if end == 0 {
+        BENCH.gc_hook_start_us = bench_now_us();
+    } else {
+        let elapsed = bench_now_us().saturating_sub(BENCH.gc_hook_start_us);
+        BENCH.gc_count += 1;
+        BENCH.gc_sum_us += elapsed;
+        BENCH.max_gc_us = BENCH.max_gc_us.max(elapsed);
+    }
+}
+
+#[cfg(feature = "bench")]
+const YOUNG_GC_HOOK: Option<unsafe extern "C" fn(*mut JSRuntime, i32)> = Some(bench_young_gc);
+#[cfg(not(feature = "bench"))]
+const YOUNG_GC_HOOK: Option<unsafe extern "C" fn(*mut JSRuntime, i32)> = None;
 
 /// Allocator readings for the host-forced GC trigger (no allocation).
 unsafe fn gc_sample() -> GcSample {
@@ -566,6 +603,7 @@ unsafe fn run_guest(
     trace("run: JS_NewRuntime ok");
     // Host-forced GC baselines belong to this runtime (frame loop below).
     let mut gc_trigger = GcTrigger::new(gc_sample());
+    let mut gc_kind = GcKind::new();
     trace("run: JS_NewContext begin");
     let ctx = JS_NewContext(rt);
     if ctx.is_null() {
@@ -729,12 +767,22 @@ unsafe fn run_guest(
         // engine's lazy live*1.5 threshold otherwise lets its slab chunks pin
         // the fixed arena). The bump drives it until the arena tail is spent,
         // then QuickJS live bytes do (gc_policy.rs); steady-state guests never
-        // trigger it.
+        // trigger it. GcKind picks the collection: the first one promotes the
+        // loaded heap, later ones are minor, and a full walk of the heap runs
+        // only near the arena's capacity.
         {
             if gc_trigger.frame_end(gc_sample()) {
+                let collection = gc_kind.choose(gc_sample(), arena::stats().capacity_bytes);
                 #[cfg(feature = "bench")]
                 let gc_start = bench_now_us();
-                JS_RunGC(rt);
+                match collection {
+                    Collection::Promote => {
+                        JS_PromoteGCObjects(rt);
+                        JS_SetGCYoungLimit(rt, gc_policy::YOUNG_LIMIT, YOUNG_GC_HOOK);
+                    }
+                    Collection::Minor => JS_RunGCMinor(rt),
+                    Collection::Full => JS_RunGC(rt),
+                }
                 #[cfg(feature = "bench")]
                 {
                     let elapsed = bench_now_us().saturating_sub(gc_start);
@@ -742,7 +790,21 @@ unsafe fn run_guest(
                     BENCH.gc_sum_us += elapsed;
                     BENCH.max_gc_us = BENCH.max_gc_us.max(elapsed);
                 }
+                if collection == Collection::Full {
+                    gc_kind.full_done(gc_sample().live);
+                }
                 gc_trigger.collected(gc_sample());
+            }
+            // Release what minor collections queued, a bounded batch per
+            // frame (a list check when nothing is queued).
+            #[cfg(feature = "bench")]
+            let free_start = bench_now_us();
+            JS_FreePendingObjects(rt, gc_policy::FREE_BUDGET);
+            #[cfg(feature = "bench")]
+            {
+                let elapsed = bench_now_us().saturating_sub(free_start);
+                BENCH.gc_free_sum_us += elapsed;
+                BENCH.max_gc_free_us = BENCH.max_gc_free_us.max(elapsed);
             }
         }
         if trace_enabled() && guest_frame % 25 == 0 {
