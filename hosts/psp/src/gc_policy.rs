@@ -1,9 +1,9 @@
-//! When the PSP frame loop forces a QuickJS collection.
+//! When the PSP frame loop forces a QuickJS collection, and which kind.
 //!
 //! QuickJS's own trigger never fires on this host (the arena-backed malloc
 //! hooks leave its `malloc_size` at zero), so the frame loop decides. Pure
 //! state so the rule can be tested on the build machine; `main.rs` owns one
-//! `GcTrigger` per QuickJS runtime.
+//! `GcTrigger` and one `GcKind` per QuickJS runtime.
 //!
 //! - While the arena still has a bump tail, the bump is the signal: collect
 //!   when it has advanced more than `GC_STEP` since the last collection.
@@ -12,9 +12,76 @@
 //!   drain the free lists until an allocation fails. QuickJS live request
 //!   bytes take over: collect when they have grown `GC_STEP` above their
 //!   low-water mark since the last collection.
+//!
+//! A full `JS_RunGC` walks every live object, so its pause grows with the
+//! heap (~150 ms for a 25 MB guest under PPSSPP). Collections are therefore
+//! generational (`GcKind`): the first one only marks everything old (the
+//! loaded program and its data), later ones are minor collections over the
+//! objects allocated since the previous one, and a full collection runs only
+//! when the live heap nears the arena (`FULL_LIVE_NUM`/`FULL_LIVE_DEN`).
+//! QuickJS also runs a minor collection by itself once `YOUNG_LIMIT` young
+//! objects exist, and objects a collection queued for release are freed
+//! `FREE_BUDGET` at a time per frame.
 
 /// Growth (bytes) that triggers a collection, for both signals.
 pub const GC_STEP: usize = 256 * 1024;
+
+/// Young objects at which QuickJS runs a minor collection mid-frame, so an
+/// allocation burst (a map load) cannot build one long collection.
+pub const YOUNG_LIMIT: u32 = 8_000;
+
+/// Objects released per frame from the queue a minor collection leaves.
+pub const FREE_BUDGET: i32 = 1_000;
+
+/// A full collection becomes due once live bytes exceed this fraction of the
+/// arena capacity and the tail is spent...
+pub const FULL_LIVE_NUM: usize = 5;
+pub const FULL_LIVE_DEN: usize = 8;
+/// ...and live bytes have grown this much since the previous full one.
+pub const FULL_STEP: usize = 2 * 1024 * 1024;
+
+/// The collection to run when [`GcTrigger::frame_end`] asks for one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Collection {
+    /// Mark every object old without collecting (`JS_PromoteGCObjects`).
+    Promote,
+    /// Collect cycles among young objects only (`JS_RunGCMinor`).
+    Minor,
+    /// Walk the whole heap, old objects included (`JS_RunGC`).
+    Full,
+}
+
+/// Chooses the collection kind for one QuickJS runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GcKind {
+    promoted: bool,
+    full_live: usize,
+}
+
+impl GcKind {
+    pub const fn new() -> Self {
+        Self { promoted: false, full_live: 0 }
+    }
+
+    /// The kind for a collection the trigger asked for. `capacity` is the
+    /// arena capacity in bytes.
+    pub fn choose(&mut self, now: Sample, capacity: usize) -> Collection {
+        if !self.promoted {
+            self.promoted = true;
+            return Collection::Promote;
+        }
+        let near_full = now.live > capacity / FULL_LIVE_DEN * FULL_LIVE_NUM;
+        if now.tail_free < GC_STEP && near_full && now.live > self.full_live.saturating_add(FULL_STEP) {
+            return Collection::Full;
+        }
+        Collection::Minor
+    }
+
+    /// Record live bytes right after a full collection.
+    pub fn full_done(&mut self, live: usize) {
+        self.full_live = live;
+    }
+}
 
 /// Allocator readings at the end of a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +207,31 @@ mod tests {
         // Then one step plus a byte of cycles collects again.
         assert!(!b.frame_end(s(45 * MIB, 0, 20 * MIB + GC_STEP)));
         assert!(b.frame_end(s(45 * MIB, 0, 20 * MIB + GC_STEP + 1)));
+    }
+
+    #[test]
+    fn the_first_collection_only_promotes() {
+        let mut kind = GcKind::new();
+        let cap = 46 * MIB;
+        assert_eq!(kind.choose(s(30 * MIB, 16 * MIB, 12 * MIB), cap), Collection::Promote);
+        assert_eq!(kind.choose(s(30 * MIB, 16 * MIB, 12 * MIB), cap), Collection::Minor);
+    }
+
+    #[test]
+    fn a_full_collection_needs_a_spent_tail_and_a_live_heap_near_the_arena() {
+        let cap = 48 * MIB; // 5/8 = 30 MiB
+        let mut kind = GcKind::new();
+        kind.choose(s(20 * MIB, 28 * MIB, 12 * MIB), cap);
+        // Tail left: minor even far above the threshold.
+        assert_eq!(kind.choose(s(40 * MIB, 8 * MIB, 32 * MIB), cap), Collection::Minor);
+        // Spent tail, live at the threshold: still minor.
+        assert_eq!(kind.choose(s(48 * MIB, 4 * KIB, 30 * MIB), cap), Collection::Minor);
+        // Spent tail, live past it: full.
+        assert_eq!(kind.choose(s(48 * MIB, 4 * KIB, 30 * MIB + 1), cap), Collection::Full);
+        kind.full_done(29 * MIB);
+        // The next full one waits for FULL_STEP of growth past the last.
+        assert_eq!(kind.choose(s(48 * MIB, 4 * KIB, 31 * MIB), cap), Collection::Minor);
+        assert_eq!(kind.choose(s(48 * MIB, 4 * KIB, 31 * MIB + 1), cap), Collection::Full);
     }
 
     #[test]

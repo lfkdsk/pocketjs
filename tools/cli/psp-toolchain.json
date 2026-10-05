@@ -9,8 +9,8 @@
     "rev": "2cbaf8c9bc72569c76240a1d9743de10731e5f6b"
   },
   "quickJsRs": {
-    "repository": "https://github.com/pocket-nexus/quickjs-rs.git",
-    "rev": "ba5bdd0dc013518768e76cd9e05cd30ed53dd35b"
+    "repository": "https://github.com/lfkdsk/quickjs-rs.git",
+    "rev": "2af09e8f18b0b810a7f1b0699762c0f08bcc0f85"
   },
   "cargoPsp": {
     "package": "cargo-psp",

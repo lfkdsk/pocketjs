@@ -31,6 +31,11 @@ function tempRoot(): string {
   return path;
 }
 
+const VITA_QUICKJS_RS = {
+  repository: "https://github.com/pocket-nexus/quickjs-rs.git",
+  rev: "ba5bdd0dc013518768e76cd9e05cd30ed53dd35b",
+} as const;
+
 describe("canonical PSP toolchain", () => {
   test("pins organization-owned source and binary inputs", () => {
     expect(PSP_TOOLCHAIN).toMatchObject({
@@ -40,9 +45,10 @@ describe("canonical PSP toolchain", () => {
         repository: "https://github.com/pocket-nexus/rust-psp.git",
         rev: "2cbaf8c9bc72569c76240a1d9743de10731e5f6b",
       },
+      // pocket-nexus/quickjs-rs ba5bdd0 plus the generational collector.
       quickJsRs: {
-        repository: "https://github.com/pocket-nexus/quickjs-rs.git",
-        rev: "ba5bdd0dc013518768e76cd9e05cd30ed53dd35b",
+        repository: "https://github.com/lfkdsk/quickjs-rs.git",
+        rev: "2af09e8f18b0b810a7f1b0699762c0f08bcc0f85",
       },
       sdk: {
         repository: "https://github.com/pocket-nexus/pspdev",
@@ -275,17 +281,19 @@ describe("canonical PSP toolchain", () => {
       expect(source, file).toContain(`git = "${PSP_TOOLCHAIN.rustPsp.repository}"`);
       expect(source, file).toContain(`rev = "${PSP_TOOLCHAIN.rustPsp.rev}"`);
     }
-    for (const file of ["hosts/psp/Cargo.toml", "hosts/vita/Cargo.toml"]) {
-      const source = await Bun.file(join(root, file)).text();
-      expect(source, file).toContain(`git = "${PSP_TOOLCHAIN.quickJsRs.repository}"`);
-      expect(source, file).toContain(`rev = "${PSP_TOOLCHAIN.quickJsRs.rev}"`);
-    }
+    const psp = await Bun.file(join(root, "hosts/psp/Cargo.toml")).text();
+    expect(psp).toContain(`git = "${PSP_TOOLCHAIN.quickJsRs.repository}"`);
+    expect(psp).toContain(`rev = "${PSP_TOOLCHAIN.quickJsRs.rev}"`);
+    // The Vita host does not use the generational collector.
+    const vita = await Bun.file(join(root, "hosts/vita/Cargo.toml")).text();
+    expect(vita).toContain(`git = "${VITA_QUICKJS_RS.repository}"`);
+    expect(vita).toContain(`rev = "${VITA_QUICKJS_RS.rev}"`);
   });
 
   test("committed native lockfiles contain only the organization revisions", async () => {
     const locks = {
       "hosts/psp/Cargo.lock": [PSP_TOOLCHAIN.rustPsp.rev, PSP_TOOLCHAIN.quickJsRs.rev],
-      "hosts/vita/Cargo.lock": [PSP_TOOLCHAIN.quickJsRs.rev],
+      "hosts/vita/Cargo.lock": [VITA_QUICKJS_RS.rev],
     } as const;
     for (const [file, revisions] of Object.entries(locks)) {
       const source = await Bun.file(join(root, file)).text();

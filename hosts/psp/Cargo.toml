@@ -23,7 +23,10 @@ edition = "2021"
 [dependencies]
 pocket-psp-ge = { path = "../../devices/psp/pocket-psp-ge" }
 psp = { git = "https://github.com/pocket-nexus/rust-psp.git", rev = "2cbaf8c9bc72569c76240a1d9743de10731e5f6b", features = ["external-c-heap", "abort-only", "external-global-alloc"] }
-libquickjs-sys = { git = "https://github.com/pocket-nexus/quickjs-rs.git", rev = "ba5bdd0dc013518768e76cd9e05cd30ed53dd35b" }
+# The generational collector (JS_RunGCMinor & co.) is on lfkdsk/quickjs-rs
+# psp-minor-gc, based on pocket-nexus/quickjs-rs ba5bdd0. The Vita host
+# keeps ba5bdd0.
+libquickjs-sys = { git = "https://github.com/lfkdsk/quickjs-rs.git", rev = "2af09e8f18b0b810a7f1b0699762c0f08bcc0f85" }
 pocketjs-core = { path = "../../engine/core" }
 
 [features]
