@@ -28,6 +28,7 @@ pub mod c_heap;
 pub mod dbg;
 pub mod ffi;
 mod framebuffer;
+pub mod gc_policy;
 pub mod ge;
 pub mod host;
 pub mod pak;

@@ -27,6 +27,7 @@ use psp::sys::DisplayPixelFormat;
 use psp::sys::{self, CtrlMode, GuContextType, GuSyncBehavior, GuSyncMode, IoOpenFlags, SceCtrlData};
 
 use pocketjs_core::spec;
+use pocketjs_psp::gc_policy::{GcTrigger, Sample as GcSample};
 use pocketjs_psp::{arena, audio_mod, dbg, ffi, ge, host, pak, svc, switch, veil, vid};
 
 psp::module!("pocketjs", 1, 1);
@@ -45,10 +46,6 @@ const MULTI_APP_SIM_HZ: u32 = 20;
 #[cfg(feature = "bench")]
 static POCKETJS_APP_NAME: &str = env!("POCKETJS_APP");
 static POCKETJS_TRACE: &str = env!("POCKETJS_TRACE");
-
-// Arena bump high-water at the last host-forced collection (frame loop's
-// arena-pressure GC below). Single-threaded QuickJS worker.
-static mut LAST_GC_BUMP: usize = 0;
 
 // libquickjs-sys omits JS_RunGC; the linked QuickJS C library provides it
 // (local-extern pattern, same as host.rs JS_ExecutePendingJob).
@@ -479,6 +476,16 @@ unsafe fn run() {
     }
 }
 
+/// Allocator readings for the host-forced GC trigger (no allocation).
+unsafe fn gc_sample() -> GcSample {
+    let arena_stats = arena::stats();
+    GcSample {
+        bump: arena_stats.bump_bytes,
+        tail_free: arena_stats.tail_free_bytes,
+        live: pocketjs_psp::qjs_alloc::stats().live_requested,
+    }
+}
+
 /// Wait for the first vblank at or after the fixed-rate presentation target.
 ///
 /// Counting from the previous *actual* swap lets CPU and GE work overlap the
@@ -557,6 +564,8 @@ unsafe fn run_guest(
         halt("JS_NewRuntime returned null");
     }
     trace("run: JS_NewRuntime ok");
+    // Host-forced GC baselines belong to this runtime (frame loop below).
+    let mut gc_trigger = GcTrigger::new(gc_sample());
     trace("run: JS_NewContext begin");
     let ctx = JS_NewContext(rt);
     if ctx.is_null() {
@@ -718,12 +727,11 @@ unsafe fn run_guest(
         // Arena-pressure GC (post-profiler-stub this WORKS: the guest's
         // per-frame cycles are collectable once no WeakMap pins them, and the
         // engine's lazy live*1.5 threshold otherwise lets its slab chunks pin
-        // the fixed arena). Collect when a frame leaves the bump >256 KiB
-        // past the last collection; steady-state guests never trigger it.
+        // the fixed arena). The bump drives it until the arena tail is spent,
+        // then QuickJS live bytes do (gc_policy.rs); steady-state guests never
+        // trigger it.
         {
-            const GC_BUMP_STEP: usize = 256 * 1024;
-            let bump = arena::stats().bump_bytes;
-            if bump > LAST_GC_BUMP.saturating_add(GC_BUMP_STEP) {
+            if gc_trigger.frame_end(gc_sample()) {
                 #[cfg(feature = "bench")]
                 let gc_start = bench_now_us();
                 JS_RunGC(rt);
@@ -734,7 +742,7 @@ unsafe fn run_guest(
                     BENCH.gc_sum_us += elapsed;
                     BENCH.max_gc_us = BENCH.max_gc_us.max(elapsed);
                 }
-                LAST_GC_BUMP = arena::stats().bump_bytes;
+                gc_trigger.collected(gc_sample());
             }
         }
         if trace_enabled() && guest_frame % 25 == 0 {
