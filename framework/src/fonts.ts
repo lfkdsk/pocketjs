@@ -153,7 +153,7 @@ export function createFontArchive(options: FontArchiveOptions, host: HostOps, cl
     for (const id of requests) client.cancel(id);
     requests.clear(); inflight.clear(); retries.clear(); opening = false;
     for (const b of batches) { b.admitted = false; publish(b, pending()); }
-    for (const s of configured) host.fontStreamConfigure!(config(s, 0, 0));
+    for (const s of configured) host.fontStreamConfigure!(config(s, 0, 0, false));
     configured = []; face = undefined;
     status.state = "opening"; status.error = ""; changed();
   };
@@ -190,7 +190,7 @@ export function createFontArchive(options: FontArchiveOptions, host: HostOps, cl
         for (const b of batches) if (b.common) admit(b);
         refresh();
       } catch (e) {
-        for (const s of configured) host.fontStreamConfigure!(config(s, 0, 0));
+        for (const s of configured) host.fontStreamConfigure!(config(s, 0, 0, false));
         configured = []; face = undefined; fail(String(e));
       }
     });
