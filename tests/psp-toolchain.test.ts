@@ -37,7 +37,7 @@ const VITA_QUICKJS_RS = {
 } as const;
 
 describe("canonical PSP toolchain", () => {
-  test("pins organization-owned source and binary inputs", () => {
+  test("pins the source and binary inputs", () => {
     expect(PSP_TOOLCHAIN).toMatchObject({
       schemaVersion: 1,
       rust: { toolchain: "nightly-2026-05-28", components: ["rust-src"] },
@@ -45,7 +45,10 @@ describe("canonical PSP toolchain", () => {
         repository: "https://github.com/pocket-nexus/rust-psp.git",
         rev: "2cbaf8c9bc72569c76240a1d9743de10731e5f6b",
       },
-      // pocket-nexus/quickjs-rs ba5bdd0 plus the generational collector.
+      // The generational collector (JS_RunGCMinor & co.) is not in
+      // pocket-nexus/quickjs-rs yet: quickJsRs pins a personal fork
+      // (lfkdsk/quickjs-rs, based on pocket-nexus/quickjs-rs ba5bdd0)
+      // whose collector branch has been proposed upstream.
       quickJsRs: {
         repository: "https://github.com/lfkdsk/quickjs-rs.git",
         rev: "2af09e8f18b0b810a7f1b0699762c0f08bcc0f85",
