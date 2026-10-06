@@ -1,11 +1,14 @@
 //! Bounded leased glyph cells. Disk work belongs to io.offload.
-//! Drawing never creates demand; a batch pins its entire set until release.
+//! A batch pins its entire set until release. A stream configured with the
+//! draw-demand flag also records codepoints the layout resolves to tofu, so
+//! a guest can fetch on-screen glyphs it never leased explicitly; the demand
+//! queue is bounded and drained through font_stream_requests.
 use crate::{
     text::{Atlas, CmapEntry},
     Ui,
 };
 use alloc::{format, string::String, vec, vec::Vec};
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 
 pub const CONFIG_MAGIC: u32 = 0x31534650; // PFS1
 pub const GLYPH_MAGIC: u32 = 0x31474650; // PFG1
@@ -15,6 +18,9 @@ pub const MAX_LEASES: usize = 32;
 pub const MAX_PIXELS: usize = 4096;
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_BATCH: usize = 4;
+/// Draw-demand queue bound per stream: enough for a screenful of distinct
+/// missing glyphs; the rest re-demand on the next frame.
+pub const MAX_DEMAND: usize = 256;
 
 pub(crate) struct Entry {
     cp: u32,
@@ -42,6 +48,10 @@ pub(crate) struct Stream {
     pub advance: u8,
     evictions: u64,
     rejected: u64,
+    /// When true, drawing a glyph the atlas does not hold records its
+    /// codepoint in `demand` for the scheduler to fetch.
+    draw_demand: bool,
+    demand: RefCell<Vec<u32>>,
 }
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
@@ -56,10 +66,22 @@ impl Atlas {
             s.epoch.set(s.epoch.get().saturating_add(1));
         }
     }
-    pub(crate) fn stream_visible(&self, _cp: u32, gid: u16) -> bool {
+    pub(crate) fn stream_visible(&self, cp: u32, gid: u16) -> bool {
         if let Some(s) = &self.stream {
             if gid >= s.base && (gid - s.base) < s.entries.len() as u16 {
                 s.entries[(gid - s.base) as usize].seen.set(s.epoch.get());
+            } else if s.draw_demand && gid == 0 && cp != 0xFFFD && scalar(cp) {
+                // A glyph the atlas does not hold resolved to tofu. Record it
+                // for the scheduler unless the stream already knows it.
+                let already = self.lookup_entry(cp).is_some()
+                    || s.wanted.binary_search(&cp).is_ok()
+                    || s.absent.binary_search(&cp).is_ok();
+                if !already {
+                    let mut demand = s.demand.borrow_mut();
+                    if demand.len() < MAX_DEMAND && !demand.contains(&cp) {
+                        demand.push(cp);
+                    }
+                }
             }
         }
         true
@@ -241,6 +263,8 @@ impl Atlas {
             advance: b[13],
             evictions: 0,
             rejected: 0,
+            draw_demand: b[15] & 1 != 0,
+            demand: RefCell::new(Vec::new()),
         });
         true
     }
@@ -275,7 +299,10 @@ impl Atlas {
         for i in 0..n {
             let at = 12 + i * (8 + packed);
             let cp = u32_at(b, at).unwrap();
-            if s.wanted.binary_search(&cp).is_err()
+            // Lease mode commits only pinned scalars; draw-demand mode commits
+            // whatever the scheduler fetched from the request queue (wanted or
+            // drawn-missing), since no lease covers those.
+            if (!s.draw_demand && s.wanted.binary_search(&cp).is_err())
                 || self.cmap.binary_search_by_key(&cp, |e| e.codepoint).is_ok()
             {
                 continue;
@@ -362,7 +389,7 @@ impl Ui {
         if b.len() != 20
             || u32_at(b, 0) != Some(CONFIG_MAGIC)
             || b[8] as usize >= crate::spec::MAX_FONT_SLOTS
-            || b[15] != 0
+            || b[15] & !1 != 0
             || b[18] != 0
             || b[19] != 0
         {
@@ -407,7 +434,8 @@ impl Ui {
         }
         self.fonts.atlas_mut(b[8]).map_or(-3, |a| a.stream_batch(b))
     }
-    /// Explicit batch demand only. The scheduler filters in-flight requests.
+    /// Explicit batch demand, then draw-demand for streams configured with
+    /// the flag. The scheduler filters in-flight requests.
     pub fn font_stream_requests(&self) -> String {
         use core::fmt::Write;
         let mut out = String::from("[");
@@ -449,6 +477,36 @@ impl Ui {
             }
             if count == 32 || !progress {
                 break;
+            }
+        }
+        // Draw-demand: drain each flagged stream's queue, skipping glyphs the
+        // atlas already holds or the archive marked absent.
+        for slot in 0..crate::spec::MAX_FONT_SLOTS {
+            if count == 32 {
+                break;
+            }
+            let Some(a) = self.fonts.atlas(slot as u8) else {
+                continue;
+            };
+            let Some(s) = &a.stream else { continue };
+            if !s.draw_demand {
+                continue;
+            }
+            let pending = s.demand.take();
+            for cp in pending {
+                if count == 32 {
+                    // Re-queue the rest for the next poll.
+                    s.demand.borrow_mut().push(cp);
+                    continue;
+                }
+                if a.lookup(cp).is_some() || s.absent.contains(&cp) {
+                    continue;
+                }
+                if count > 0 {
+                    out.push(',');
+                }
+                let _ = write!(out, "[{},{},{}]", s.generation, slot, cp);
+                count += 1;
             }
         }
         out.push(']');
