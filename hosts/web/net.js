@@ -9,11 +9,22 @@ const MAX_HEADERS = 32;
 const MAX_HEADER_BYTES = 8 * 1024;
 const MAX_TIMEOUT_MS = 120_000;
 const MAX_REDIRECTS = 3;
+const MAX_URL_BYTES = 2048;
 const METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]);
+
+const encoder = new TextEncoder();
+
+function urlBytes(url) {
+  return encoder.encode(url).byteLength;
+}
+
+/** A transport failure that already carries its portable code. */
+function netFailure(code, message) {
+  return Object.assign(new Error(message), { netCode: code });
+}
 
 function headerBytes(headers) {
   let bytes = 0;
-  const encoder = new TextEncoder();
   for (const [name, value] of Object.entries(headers)) {
     bytes += name.length + encoder.encode(value).byteLength + 4;
   }
@@ -89,7 +100,13 @@ async function followBounded(nativeFetch, request, signal) {
     if (redirects >= MAX_REDIRECTS) throw new Error("redirect_limit");
     const location = response.headers.get("location");
     if (!location) throw new Error("redirect_location");
-    url = new URL(location, url).href;
+    const next = new URL(location, url);
+    // Same-scheme hops only: no https -> http downgrade and no http -> https
+    // upgrade the request did not ask for.
+    if (next.protocol !== new URL(url).protocol) throw new Error("redirect_scheme");
+    // Every hop stays within the request URL bound (desktop fetch.rs).
+    if (urlBytes(next.href) > MAX_URL_BYTES) throw netFailure("redirect", "redirect URL too long");
+    url = next.href;
     if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === "POST")) {
       method = "GET";
       body = undefined;
@@ -123,7 +140,8 @@ export function createNetHost(nativeFetch = globalThis.fetch.bind(globalThis)) {
       }
       const body = new Uint8Array(bodyBuffer).slice();
       if (pending.size >= MAX_INFLIGHT) return refuse("busy", "at most 2 requests may be in flight");
-      if (typeof meta.url !== "string" || !/^https?:\/\/[^\s/]+(?:\/|$)/.test(meta.url)) {
+      if (typeof meta.url !== "string" || !/^https?:\/\/[^\s/]+(?:\/|$)/.test(meta.url) ||
+          urlBytes(meta.url) > MAX_URL_BYTES) {
         return refuse("invalid_request", "url must be absolute HTTP(S)");
       }
       if (!METHODS.has(meta.method)) return refuse("invalid_request", "unsupported method");
@@ -152,6 +170,13 @@ export function createNetHost(nativeFetch = globalThis.fetch.bind(globalThis)) {
       const request = { ...meta, body };
       void followBounded(nativeFetch, request, controller.signal)
         .then(async (response) => {
+          // The done event reports the final URL. meta.url and every followed
+          // hop are within the bound, so a longer response URL is one the
+          // request was moved to.
+          if (response.url && urlBytes(response.url) > MAX_URL_BYTES) {
+            await response.body?.cancel();
+            throw netFailure("redirect", "response URL too long");
+          }
           const headers = Object.create(null);
           response.headers.forEach((value, name) => {
             headers[name.toLowerCase()] = value;
@@ -172,13 +197,15 @@ export function createNetHost(nativeFetch = globalThis.fetch.bind(globalThis)) {
         .catch((error) => {
           if (!pending.has(handle)) return;
           const message = error instanceof Error ? error.message : String(error);
-          const mapped = message === "response_too_large"
-            ? { code: "response_too_large", message: `response exceeded ${meta.maxBytes} bytes` }
-            : message.startsWith("redirect_")
-              ? { code: "redirect", message }
-              : message === "response_headers"
-                ? { code: "protocol", message: "response headers exceed limits" }
-                : failure(error, timedOut);
+          const mapped = error?.netCode
+            ? { code: error.netCode, message }
+            : message === "response_too_large"
+              ? { code: "response_too_large", message: `response exceeded ${meta.maxBytes} bytes` }
+              : message.startsWith("redirect_")
+                ? { code: "redirect", message }
+                : message === "response_headers"
+                  ? { code: "protocol", message: "response headers exceed limits" }
+                  : failure(error, timedOut);
           completed.push({ t: "error", h: handle, ...mapped });
         })
         .finally(() => {

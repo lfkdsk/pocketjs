@@ -285,6 +285,8 @@ describe("platform registry", () => {
       "io.offload",
       "text.layout.offload",
       "data.fs",
+      "net.http",
+      "net.socket",
     ]);
     expect(POCKET_TARGETS["macos-app"].roleCapabilities).toEqual({
       systemUI: ["ui.compositor-surfaces"],
@@ -317,6 +319,8 @@ describe("platform registry", () => {
         "io.offload",
         "text.layout.offload",
         "data.fs",
+        "net.http",
+        "net.socket",
       ],
       roleCapabilities: { systemUI: ["ui.compositor-surfaces"] },
     });
@@ -341,6 +345,8 @@ describe("platform registry", () => {
         "text.glyphs.baked",
         "io.offload",
         "text.layout.offload",
+        "net.http",
+        "net.socket",
       ],
       roleCapabilities: { systemUI: ["ui.compositor-surfaces"] },
     });
@@ -565,6 +571,7 @@ describe("semantic resolution", () => {
       note: [false, false, true, true],
       notifications: [true, true, false, true],
       settings: [true, true, false, true],
+      "socket-zone": [false, false, false, true], // net.socket: the desktop app hosts mount the socket module
       "solid-aot-lab": [true, true, false, true],
       stats: [true, true, false, true],
       "text-offload": [true, false, false, true], // requires a supported companion transport
@@ -751,6 +758,25 @@ describe("semantic resolution", () => {
       expect(refused.ok).toBe(false);
       if (refused.ok) continue;
       expect(refused.diagnostics.some((item) => item.code === "capability.unavailable")).toBe(true);
+    }
+  });
+
+  test("net.http and net.socket admit on the desktop and web System hosts only", () => {
+    // hosts/desktop mounts the pocket-net/pocket-socket cores and
+    // hosts/web/system-engine.js mounts hosts/web/net.js and socket.js in
+    // every package Realm, so those targets advertise both modules. PSP
+    // mounts neither and must refuse an app that requires them.
+    for (const capability of ["net.http", "net.socket"] as const) {
+      const needsNet = structuredClone(portableInput) as Record<string, any>;
+      needsNet.engine.capabilities.requires = ["input.buttons", "text.glyphs.baked", capability];
+      for (const target of ["linux-app", "macos-app", "web-app"] as const) {
+        expect(POCKET_TARGETS[target].capabilities).toContain(capability);
+        const admitted = validateAndResolveBuildPlan(needsNet, { target });
+        expect(`${capability}@${target}:${admitted.ok}`).toBe(`${capability}@${target}:true`);
+        if (admitted.ok) expect(admitted.plan.features[capability]).toBe(true);
+      }
+      const refused = validateAndResolveBuildPlan(needsNet, { target: "psp" });
+      expect(refused.ok).toBe(false);
     }
   });
 

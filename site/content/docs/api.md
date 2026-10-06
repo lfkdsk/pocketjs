@@ -1204,7 +1204,8 @@ the buffered reads `text()`, `json()`, `bytes()`, `arrayBuffer()`.
 
 The response is whole-body — the promise resolves once the body is complete
 and holds it — so the omitted surface is streams, cookies, cache, `Request`,
-`Headers`, `AbortSignal`, WebSocket, servers, and raw sockets.
+`Headers`, `AbortSignal`, servers, and raw sockets. WebSocket clients are
+`@pocketjs/framework/socket`.
 
 | Resource | Limit |
 | --- | ---: |
@@ -1213,7 +1214,8 @@ and holds it — so the omitted surface is streams, cookies, cache, `Request`,
 | Response body | 128 KiB default, 256 KiB maximum |
 | Headers | 32 fields / 8 KiB |
 | Timeout | 30 s default, 120 s maximum |
-| Redirects | 3 |
+| Redirects | 3, same scheme |
+| URL | 2048 bytes |
 
 A fetch settles at a tick boundary and never inside a native callback: the
 first pending request registers a service pump that makes one `net.poll()`
@@ -1223,6 +1225,60 @@ with `ok === false`. A transport failure rejects with a `NetError` whose
 `code` is one of `unavailable`, `invalid_request`, `busy`, `dns`, `connect`,
 `tls`, `timeout`, `redirect`, `response_too_large`, `protocol`, `cancelled`,
 `other`.
+
+## `@pocketjs/framework/socket`
+
+A bounded WebSocket client over the host's `socket` namespace. Declare
+`net.socket` in the manifest's `requires`; where no host mounts the module
+`openSocket` throws a `SocketError` with code `unavailable`.
+
+```ts
+import { openSocket } from "@pocketjs/framework/socket";
+
+const socket = openSocket("wss://zone.example.com/ws", { protocols: ["zone.v1"] });
+socket.onOpen = () => socket.send(JSON.stringify({ type: "join" }));
+socket.onMessage = (data) => {
+  if (typeof data !== "string") applySnapshot(data); // Uint8Array
+};
+socket.onClose = ({ code, reason, clean }) => scheduleReconnect(code);
+```
+
+```ts
+function openSocket(url: string, options?: { protocols?: string[]; timeoutMs?: number }): PocketSocket
+
+interface PocketSocket {
+  readonly url: string;
+  readonly protocol: string;
+  readonly readyState: "connecting" | "open" | "closing" | "closed";
+  onOpen?: () => void;
+  onMessage?: (data: string | Uint8Array) => void;
+  onError?: (error: SocketError) => void;
+  onClose?: (event: { code: number; reason: string; clean: boolean }) => void;
+  send(data: string | Uint8Array | ArrayBuffer): boolean;
+  close(code?: number, reason?: string): void;
+}
+```
+
+`url` must be an absolute `ws://` or `wss://` URL of at most 2048 bytes with
+a host and an optional port 1..65535, without userinfo or a fragment.
+`timeoutMs` (1..60000, default 10000) bounds connect, TLS and the opening
+handshake. Callbacks run from the service pump at a tick boundary, never
+inside `openSocket`, `send` or a native callback; `onClose` runs exactly once
+per socket and `onError` precedes it when the connection failed.
+
+`send` returns `false` when the connection's outbound queue would exceed its
+bound (code `backpressure`) and throws `SocketError` for other refusals
+(`closed`, `message_too_large`, `invalid_request`). `close` accepts code 1000
+or 3000..4999 and a reason of at most 123 bytes.
+
+| Resource | Limit |
+| --- | ---: |
+| Live sockets | 4 |
+| Message, either direction | 64 KiB |
+| Queued outbound per socket | 256 KiB, each message charged 64 bytes on top of its payload |
+| Received, undelivered per socket | 256 KiB, same per-message charge |
+| Events delivered per tick | 64 |
+| Opening handshake | 10 s default, 60 s maximum |
 
 ---
 

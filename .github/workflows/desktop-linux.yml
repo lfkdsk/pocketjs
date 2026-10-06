@@ -24,6 +24,13 @@ on:
       - "apps/text-offload/**"
       - "apps/music/**"
       - "hosts/desktop/**"
+      - "engine/crates/pocket-net/**"
+      - "engine/crates/pocket-socket/**"
+      - "framework/src/net-api.ts"
+      - "framework/src/socket-api.ts"
+      - "tests/desktop-net.test.ts"
+      - "tests/fixtures/desktop-net-probe.ts"
+      - "apps/socket-zone/**"
       - "engine/crates/pocket-ui-wgpu/**"
       - "engine/pocket3d/crates/pocket3d/**"
       - "hosts/web/app-instance.*"
@@ -57,6 +64,13 @@ on:
       - "apps/text-offload/**"
       - "apps/music/**"
       - "hosts/desktop/**"
+      - "engine/crates/pocket-net/**"
+      - "engine/crates/pocket-socket/**"
+      - "framework/src/net-api.ts"
+      - "framework/src/socket-api.ts"
+      - "tests/desktop-net.test.ts"
+      - "tests/fixtures/desktop-net-probe.ts"
+      - "apps/socket-zone/**"
       - "engine/crates/pocket-ui-wgpu/**"
       - "engine/pocket3d/crates/pocket3d/**"
       - "hosts/web/app-instance.*"
@@ -144,6 +158,9 @@ jobs:
 
       - name: Build linux-app release host
         run: cargo build --release --locked --manifest-path hosts/desktop/Cargo.toml
+
+      - name: Desktop net.http and net.socket against a Bun server
+        run: bun test tests/desktop-net.test.ts
 
       - name: Launch linux-app under X11
         env:

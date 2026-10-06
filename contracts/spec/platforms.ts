@@ -189,6 +189,11 @@ export const POCKET_CAPABILITIES = defineCapabilityRegistry([
   // core exercise the contract without granting network access to every host.
   "io.offload",
   "net.http",
+  // Bounded WebSocket client through `openSocket()` and the socket module's
+  // namespace (`globalThis.socket`, contracts/spec/socket.ts): whole
+  // messages, per-connection send/receive byte bounds, events batched to
+  // tick boundaries. Same host-owned transport rule as net.http.
+  "net.socket",
   // SQLite behind the db module's own namespace (`globalThis.db`,
   // contracts/spec/db.ts): five synchronous ops, rows as one JSON line per
   // query() call, per-app storage the host confines. Registered ahead of any
@@ -374,6 +379,11 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
       // app's own data root (~/Library/Application Support/pocketjs/<app>/
       // data on macOS), mounted as globalThis.fs.
       "data.fs",
+      // hosts/desktop/src/fetch.rs and websocket.rs: ureq and tungstenite
+      // transports on worker threads behind the pocket-net and
+      // pocket-socket cores, mounted as globalThis.net / globalThis.socket.
+      "net.http",
+      "net.socket",
     ],
     roleCapabilities: {
       systemUI: ["ui.compositor-surfaces"],
@@ -403,6 +413,11 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
       // ~/Library/Application Support/pocketjs/<app>/data on macOS),
       // mounted as globalThis.fs.
       "data.fs",
+      // hosts/desktop/src/fetch.rs and websocket.rs: ureq and tungstenite
+      // transports on worker threads behind the pocket-net and
+      // pocket-socket cores, mounted as globalThis.net / globalThis.socket.
+      "net.http",
+      "net.socket",
     ],
     roleCapabilities: {
       systemUI: ["ui.compositor-surfaces"],
@@ -429,6 +444,13 @@ export const POCKET_TARGETS = defineTargetRegistry<PocketCapabilityId, {
       "text.glyphs.baked",
       "io.offload",
       "text.layout.offload",
+      // hosts/web/system-engine.js createPackageNetwork(): one
+      // hosts/web/net.js and one hosts/web/socket.js host per package Realm
+      // over the System page's fetch and WebSocket, mounted as
+      // globalThis.net / globalThis.socket and ticked before that package's
+      // frame().
+      "net.http",
+      "net.socket",
     ],
     roleCapabilities: {
       systemUI: ["ui.compositor-surfaces"],

@@ -246,7 +246,7 @@ build. The JavaScript uses them beside the same UI and input APIs.
 ```text
 TypeScript application → guest bundle, one frame at a time
   ui       tree, layout, draw, input, focus
-  net      poll batches
+  net      fetch, websocket; poll batches
   audio    pcm mixer
   strike   bsp, bots, hits
   voxel    chunks, meshing
@@ -420,6 +420,7 @@ bun run site:preview          # build, then serve the site at http://127.0.0.1:4
 | Runtime internals | [Architecture](https://pocketjs.pocket.nexus/docs/architecture/) · [Native contract](https://pocketjs.pocket.nexus/docs/native-contract/) |
 | Targets and packaging | [Platform contracts](https://pocketjs.pocket.nexus/docs/platform-contracts/) · [The `.pocket` platform](./docs/PLATFORM.md) |
 | Debugging and verification | [DevTools](./docs/DEVTOOLS.md) · [Determinism](./docs/DETERMINISM.md) |
+| Feature status per host | [Status](./docs/status.md) |
 | Runtimes beyond 2D UI | [The runtime family](./docs/RUNTIMES.md) · [Pocket3D](./engine/pocket3d/README.md) |
 | Complete examples | [`apps/`](./apps/) · [Blog](https://pocketjs.pocket.nexus/blog/) |
 

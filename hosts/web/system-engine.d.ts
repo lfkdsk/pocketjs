@@ -20,6 +20,12 @@ export declare function createSurfaceCatalog(
 /** Throws unless the plan is a web-app ABI 4 System the browser host can run. */
 export declare function validateSystemPlan(plan: ResolvedSystemPlan): void;
 
+/**
+ * Boot the System: one iframe Realm and wasm Ui per package, each with its
+ * own globalThis.net / globalThis.socket over this page's fetch/WebSocket.
+ * stop() removes every AppInstance, closing its sockets and aborting its
+ * fetches.
+ */
 export declare function mountPocketSystem(
   canvas: unknown,
   options?: {
@@ -28,6 +34,8 @@ export declare function mountPocketSystem(
     distBase?: string;
     wasmUrl?: string;
     instanceUrl?: string;
+    liveResize?: boolean;
     onLog?: (message: string) => void;
+    onQuit?: () => void;
   },
-): Promise<unknown>;
+): Promise<{ plan: ResolvedSystemPlan; stop(): void }>;

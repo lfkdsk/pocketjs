@@ -118,6 +118,8 @@ describe("published npm artifacts", () => {
       "engine/crates/pocket-mod/Cargo.toml",
       "engine/crates/pocket-net/src",
       "engine/crates/pocket-net/Cargo.toml",
+      "engine/crates/pocket-socket/src",
+      "engine/crates/pocket-socket/Cargo.toml",
       "engine/crates/pocket-sim/src",
       "engine/crates/pocket-sim/Cargo.toml",
       "engine/crates/pocket-ui-surface/src",

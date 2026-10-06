@@ -13,6 +13,8 @@ audio-output = ["dep:cpal"]
 pocketjs-core = { path = "../../engine/core" }
 pocket-mod = { path = "../../engine/crates/pocket-mod" }
 pocket-fs = { path = "../../engine/crates/pocket-fs" }
+pocket-net = { path = "../../engine/crates/pocket-net" }
+pocket-socket = { path = "../../engine/crates/pocket-socket" }
 pocket-ui-surface = { path = "../../engine/crates/pocket-ui-surface" }
 pocket-text = { path = "../../engine/crates/pocket-text" }
 pocket-ui-wgpu = { path = "../../engine/crates/pocket-ui-wgpu" }
@@ -26,6 +28,17 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 cpal = { version = "0.18.2", optional = true, default-features = false }
+# net.http / net.socket transports: blocking clients on worker threads, rustls
+# with the ring provider and webpki roots; no async runtime. libc provides the
+# non-blocking connect that close() and host exit can cancel.
+httparse = "1"
+libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
+url = "2"
+# --headless --screenshot readback encoding.
+png = "0.18"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 
 [profile.release]
 debug = false

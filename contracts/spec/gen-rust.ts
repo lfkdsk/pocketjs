@@ -1,4 +1,4 @@
-// Deterministic codegen: contracts/spec/{spec,audio,db,net,physics}.ts -> engine/core/src/spec.rs.
+// Deterministic codegen: contracts/spec/{spec,audio,db,net,socket,physics}.ts -> engine/core/src/spec.rs.
 //
 // Run from PocketJS/:  bun contracts/spec/gen-rust.ts
 //
@@ -49,9 +49,28 @@ import {
   NET_MAX_REQUEST_BYTES,
   NET_MAX_RESPONSE_BYTES,
   NET_MAX_TIMEOUT_MS,
+  NET_MAX_URL_BYTES,
   NET_METHODS,
   NET_OP,
 } from "./net.ts";
+import {
+  SOCKET_CLOSE,
+  SOCKET_DEFAULT_TIMEOUT_MS,
+  SOCKET_ERROR,
+  SOCKET_EVENT,
+  SOCKET_MAX_CLOSE_REASON_BYTES,
+  SOCKET_MAX_CONNECTIONS,
+  SOCKET_MAX_EVENTS_PER_TICK,
+  SOCKET_MAX_MESSAGE_BYTES,
+  SOCKET_MAX_PROTOCOL_BYTES,
+  SOCKET_MAX_PROTOCOLS,
+  SOCKET_MAX_RECV_QUEUE_BYTES,
+  SOCKET_MAX_SEND_QUEUE_BYTES,
+  SOCKET_MAX_TIMEOUT_MS,
+  SOCKET_MAX_URL_BYTES,
+  SOCKET_MESSAGE_OVERHEAD_BYTES,
+  SOCKET_OP,
+} from "./socket.ts";
 import {
   PHYSICS_ALPHA_CURVE,
   PHYSICS_ANCHOR,
@@ -610,11 +629,43 @@ export function generateRust(): string {
   put(`    pub const DEFAULT_TIMEOUT_MS: u32 = ${NET_DEFAULT_TIMEOUT_MS};`);
   put(`    pub const MAX_TIMEOUT_MS: u32 = ${NET_MAX_TIMEOUT_MS};`);
   put(`    pub const MAX_REDIRECTS: usize = ${NET_MAX_REDIRECTS};`);
+  put(`    pub const MAX_URL_BYTES: usize = ${NET_MAX_URL_BYTES};`);
   put(`    pub const METHODS: [&str; ${NET_METHODS.length}] = [${NET_METHODS.map((method) => JSON.stringify(method)).join(", ")}];`);
   for (const [name, v] of Object.entries(NET_EVENT)) {
     put(`    pub const EVENT_${screaming(name)}: &str = ${JSON.stringify(v)};`);
   }
   for (const [name, v] of Object.entries(NET_ERROR)) {
+    put(`    pub const ERROR_${screaming(name)}: &str = ${JSON.stringify(v)};`);
+  }
+  put("}");
+  put("");
+
+  // --- socket module ------------------------------------------------------------
+  put("/// SOCKET module boundary (contracts/spec/socket.ts — `globalThis.socket`).");
+  put("/// Bounded WebSocket client; transport events batch to tick boundaries.");
+  put("pub mod socket {");
+  for (const [name, v] of Object.entries(SOCKET_OP)) {
+    put(`    pub const OP_${screaming(name)}: u8 = ${v};`);
+  }
+  put(`    pub const MAX_CONNECTIONS: usize = ${SOCKET_MAX_CONNECTIONS};`);
+  put(`    pub const MAX_URL_BYTES: usize = ${SOCKET_MAX_URL_BYTES};`);
+  put(`    pub const MAX_PROTOCOLS: usize = ${SOCKET_MAX_PROTOCOLS};`);
+  put(`    pub const MAX_PROTOCOL_BYTES: usize = ${SOCKET_MAX_PROTOCOL_BYTES};`);
+  put(`    pub const MAX_MESSAGE_BYTES: usize = ${SOCKET_MAX_MESSAGE_BYTES};`);
+  put(`    pub const MAX_SEND_QUEUE_BYTES: usize = ${SOCKET_MAX_SEND_QUEUE_BYTES};`);
+  put(`    pub const MAX_RECV_QUEUE_BYTES: usize = ${SOCKET_MAX_RECV_QUEUE_BYTES};`);
+  put(`    pub const MESSAGE_OVERHEAD_BYTES: usize = ${SOCKET_MESSAGE_OVERHEAD_BYTES};`);
+  put(`    pub const MAX_EVENTS_PER_TICK: usize = ${SOCKET_MAX_EVENTS_PER_TICK};`);
+  put(`    pub const DEFAULT_TIMEOUT_MS: u32 = ${SOCKET_DEFAULT_TIMEOUT_MS};`);
+  put(`    pub const MAX_TIMEOUT_MS: u32 = ${SOCKET_MAX_TIMEOUT_MS};`);
+  put(`    pub const MAX_CLOSE_REASON_BYTES: usize = ${SOCKET_MAX_CLOSE_REASON_BYTES};`);
+  for (const [name, v] of Object.entries(SOCKET_CLOSE)) {
+    put(`    pub const CLOSE_${screaming(name)}: u16 = ${v};`);
+  }
+  for (const [name, v] of Object.entries(SOCKET_EVENT)) {
+    put(`    pub const EVENT_${screaming(name)}: &str = ${JSON.stringify(v)};`);
+  }
+  for (const [name, v] of Object.entries(SOCKET_ERROR)) {
     put(`    pub const ERROR_${screaming(name)}: &str = ${JSON.stringify(v)};`);
   }
   put("}");

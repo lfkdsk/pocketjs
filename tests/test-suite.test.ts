@@ -38,6 +38,10 @@ const STAGE_EXCLUSIONS: Readonly<Record<string,
   "tests/ui-cabi-psm-draw.test.ts": {
     workflow: ".github/workflows/native-c-harness.yml",
   },
+  // Drives the release desktop host binary built in that workflow.
+  "tests/desktop-net.test.ts": {
+    workflow: ".github/workflows/desktop-linux.yml",
+  },
   "tests/aot-model-fuzz.test.ts": {
     localCommand: ["bun", "test", "tests/aot-model-fuzz.test.ts"],
     reason: "Model AOT fuzz runs are opt-in local checks, excluded from CI.",

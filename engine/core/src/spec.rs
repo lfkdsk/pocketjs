@@ -595,6 +595,7 @@ pub mod net {
     pub const DEFAULT_TIMEOUT_MS: u32 = 30000;
     pub const MAX_TIMEOUT_MS: u32 = 120000;
     pub const MAX_REDIRECTS: usize = 3;
+    pub const MAX_URL_BYTES: usize = 2048;
     pub const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
     pub const EVENT_DONE: &str = "done";
     pub const EVENT_ERROR: &str = "error";
@@ -609,6 +610,53 @@ pub mod net {
     pub const ERROR_RESPONSE_TOO_LARGE: &str = "response_too_large";
     pub const ERROR_PROTOCOL: &str = "protocol";
     pub const ERROR_CANCELLED: &str = "cancelled";
+    pub const ERROR_OTHER: &str = "other";
+}
+
+/// SOCKET module boundary (contracts/spec/socket.ts — `globalThis.socket`).
+/// Bounded WebSocket client; transport events batch to tick boundaries.
+pub mod socket {
+    pub const OP_OPEN: u8 = 1;
+    pub const OP_SEND: u8 = 2;
+    pub const OP_CLOSE: u8 = 3;
+    pub const OP_POLL: u8 = 4;
+    pub const OP_TAKE: u8 = 5;
+    pub const OP_LAST_ERROR: u8 = 6;
+    pub const MAX_CONNECTIONS: usize = 4;
+    pub const MAX_URL_BYTES: usize = 2048;
+    pub const MAX_PROTOCOLS: usize = 8;
+    pub const MAX_PROTOCOL_BYTES: usize = 512;
+    pub const MAX_MESSAGE_BYTES: usize = 65536;
+    pub const MAX_SEND_QUEUE_BYTES: usize = 262144;
+    pub const MAX_RECV_QUEUE_BYTES: usize = 262144;
+    pub const MESSAGE_OVERHEAD_BYTES: usize = 64;
+    pub const MAX_EVENTS_PER_TICK: usize = 64;
+    pub const DEFAULT_TIMEOUT_MS: u32 = 10000;
+    pub const MAX_TIMEOUT_MS: u32 = 60000;
+    pub const MAX_CLOSE_REASON_BYTES: usize = 123;
+    pub const CLOSE_NORMAL: u16 = 1000;
+    pub const CLOSE_GOING_AWAY: u16 = 1001;
+    pub const CLOSE_PROTOCOL_ERROR: u16 = 1002;
+    pub const CLOSE_ABNORMAL: u16 = 1006;
+    pub const CLOSE_INVALID_PAYLOAD: u16 = 1007;
+    pub const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
+    pub const EVENT_OPEN: &str = "open";
+    pub const EVENT_MESSAGE: &str = "message";
+    pub const EVENT_ERROR: &str = "error";
+    pub const EVENT_CLOSE: &str = "close";
+    pub const ERROR_UNAVAILABLE: &str = "unavailable";
+    pub const ERROR_INVALID_REQUEST: &str = "invalid_request";
+    pub const ERROR_BUSY: &str = "busy";
+    pub const ERROR_CLOSED: &str = "closed";
+    pub const ERROR_BACKPRESSURE: &str = "backpressure";
+    pub const ERROR_DNS: &str = "dns";
+    pub const ERROR_CONNECT: &str = "connect";
+    pub const ERROR_TLS: &str = "tls";
+    pub const ERROR_TIMEOUT: &str = "timeout";
+    pub const ERROR_HANDSHAKE: &str = "handshake";
+    pub const ERROR_MESSAGE_TOO_LARGE: &str = "message_too_large";
+    pub const ERROR_OVERFLOW: &str = "overflow";
+    pub const ERROR_PROTOCOL: &str = "protocol";
     pub const ERROR_OTHER: &str = "other";
 }
 

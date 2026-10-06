@@ -28,9 +28,14 @@ use winit::{
     window::{CursorIcon, Window, WindowId},
 };
 mod audio;
+mod dial;
+mod fetch;
 mod fs;
 mod gpu;
+mod headless;
 mod net;
+mod network;
+mod websocket;
 include!("plan.rs");
 include!("supervisor.rs");
 include!("buttons.rs");
@@ -90,6 +95,8 @@ struct Runtime {
     /// The fs module core the guest's `globalThis.fs` closures hold; kept
     /// here for the runtime's life (the mount owns clones too).
     _fs: fs::FsMount,
+    /// net.http + net.socket; drained once per tick before the guest turn.
+    network: network::Network,
     viewport: (u32, u32),
     ticks: u64,
     buttons: u32,
@@ -146,6 +153,7 @@ impl Runtime {
         );
         let audio = audio::AudioSurface::new(audio_host.client(0));
         audio.mount(&guest)?;
+        let network = network::Network::mount(&guest)?;
         guest.eval(&args.app, &source)?;
         if !guest.has_frame() {
             return Err(anyhow!("bundle installed no frame handler"));
@@ -177,6 +185,7 @@ impl Runtime {
             audio,
             _audio_host: audio_host,
             _fs: fs_mount,
+            network,
             ticks: 0,
             buttons: 0,
             script_buttons: 0,
@@ -254,6 +263,7 @@ impl Runtime {
         self._audio_host.begin_tick();
         self.audio.begin_tick();
         self.offload.begin_frame();
+        self.network.begin_tick();
         let buttons = if self.args.editor {
             if self.mouse_down || self.script_mouse || self.click_edge {
                 BTN_CIRCLE
@@ -775,6 +785,9 @@ impl ApplicationHandler<Wake> for Host {
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = parse_args()?;
+    if let Some(options) = headless::options() {
+        return headless::run(args, options);
+    }
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;
     let (tx, inputs) = sync_channel(256);
     let (outputs, rx) = sync_channel(1);

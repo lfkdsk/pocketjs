@@ -2,6 +2,9 @@
 // iframe Realm with its own wasm Ui. This module owns AppInstance lifecycle,
 // focused scheduling, child raster retention and browser input adaptation.
 
+import { createNetHost } from "./net.js";
+import { createSocketHost } from "./socket.js";
+
 const BTN = {
   SELECT: 0x0001,
   START: 0x0008,
@@ -118,7 +121,34 @@ export function validateSystemPlan(plan) {
   }
 }
 
-async function createRealm(instanceUrl, options) {
+/**
+ * One NET host (hosts/web/net.js) and one SOCKET host (hosts/web/socket.js)
+ * for one package Realm. Each package owns its handle space, in-flight and
+ * connection limits and event queues; reset() aborts its fetches and closes
+ * its WebSockets.
+ */
+function createPackageNetwork(transport) {
+  const net = createNetHost(transport.fetch);
+  const socket = createSocketHost(transport.WebSocket);
+  return {
+    /** Mounted as globalThis.net / globalThis.socket of the package Realm. */
+    install(realm) {
+      realm.net = net.ns;
+      realm.socket = socket.ns;
+    },
+    /** The tick boundary: runs before that package's guest frame(). */
+    beginFrame() {
+      net.beginFrame();
+      socket.beginFrame();
+    },
+    reset() {
+      net.reset();
+      socket.reset();
+    },
+  };
+}
+
+async function createRealm(instanceUrl, options, network) {
   const iframe = document.createElement("iframe");
   iframe.hidden = true;
   iframe.tabIndex = -1;
@@ -136,9 +166,14 @@ async function createRealm(instanceUrl, options) {
     iframe.remove();
     throw new Error("app-instance Realm did not publish PocketAppInstance");
   }
+  // Mounted before create() evaluates the package bundle, the same order as
+  // hosts/web/engine.js, so top-level guest code already sees both modules.
+  network.install(iframe.contentWindow);
   try {
-    return { iframe, api: await factory.create(options) };
+    return { iframe, network, api: await factory.create(options) };
   } catch (error) {
+    // The bundle may have opened connections before it threw.
+    network.reset();
     iframe.remove();
     throw error;
   }
@@ -165,6 +200,15 @@ export async function mountPocketSystem(canvas, options = {}) {
   let image = context.createImageData(viewport[0], viewport[1]);
 
   const { catalog, surfaces } = createSurfaceCatalog(plan.applications);
+  // Every package's NET and SOCKET transport is this System page's fetch and
+  // WebSocket, captured once at mount, not the iframe Realm's: the package
+  // bundle runs in that Realm and can replace its globals, and these objects
+  // outlive iframe.remove(), so network.reset() is the one place a removed
+  // package's requests are aborted and its sockets closed.
+  const transport = {
+    fetch: globalThis.fetch.bind(globalThis),
+    WebSocket: globalThis.WebSocket,
+  };
   const artifact = (entry, extension) =>
     absolute(`${entry.plan.app.output}.${extension}`, distBase);
   const shellRealm = await createRealm(instanceUrl, {
@@ -176,7 +220,7 @@ export async function mountPocketSystem(canvas, options = {}) {
     rasterDensity: shellPlan.viewport.rasterDensity,
     companions: shellPlan.companions,
     surfaces,
-  });
+  }, createPackageNetwork(transport));
   const shell = shellRealm.api;
   shell.sendService({ t: "hello", w: viewport[0], h: viewport[1], epoch: Date.now() });
 
@@ -201,7 +245,7 @@ export async function mountPocketSystem(canvas, options = {}) {
       viewport: entry.plan.viewport.logical,
       rasterDensity: entry.plan.viewport.rasterDensity,
       companions: [],
-    }).then((realm) => ({ ...realm, entry, composited: false }));
+    }, createPackageNetwork(transport)).then((realm) => ({ ...realm, entry, composited: false }));
     children.set(handle, pending);
     try {
       const child = await pending;
@@ -220,11 +264,13 @@ export async function mountPocketSystem(canvas, options = {}) {
     shell.freeSurface(handle);
     if (!child || child instanceof Promise) {
       child?.then((resolved) => {
+        resolved.network.reset();
         resolved.api.dispose();
         resolved.iframe.remove();
       });
       return;
     }
+    child.network.reset();
     child.api.dispose();
     child.iframe.remove();
     log(`removed AppInstance ${child.entry.package}`);
@@ -260,6 +306,7 @@ export async function mountPocketSystem(canvas, options = {}) {
     for (const fact of ordered) {
       const child = children.get(fact.handle);
       if (!child || child instanceof Promise) continue;
+      child.network.beginFrame();
       child.api.step(fact.handle === focusedHandle ? heldButtons : 0);
       if (visible.has(fact.handle)) {
         const pixels = child.api.render();
@@ -301,6 +348,7 @@ export async function mountPocketSystem(canvas, options = {}) {
   }
 
   async function step() {
+    shellRealm.network.beginFrame();
     shell.step(0);
     await reconcile();
     processShellIntents();
@@ -456,6 +504,7 @@ export async function mountPocketSystem(canvas, options = {}) {
       stopped = true;
       cancelAnimationFrame(raf);
       for (const handle of [...children.keys()]) closeChild(handle);
+      shellRealm.network.reset();
       shell.dispose();
       shellRealm.iframe.remove();
       canvas.removeEventListener("pointermove", onPointerMove);

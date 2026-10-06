@@ -268,13 +268,13 @@ directory in `hosts/`:
 
 | Target         | hostAbi | platform / form   | Logical viewport                         | Density | Capabilities |
 | -------------- | ------- | ----------------- | ---------------------------------------- | ------- | ------------ |
-| `psp`          | 1       | psp / takeover    | 480×272 (`native`, `integer-fit`)        | 1       | `input.analog.left`, `input.buttons`, `input.cursor`, `audio.pcm`, `text.glyphs.baked` |
+| `psp`          | 1       | psp / takeover    | 480×272 (`native`, `integer-fit`)        | 1       | `input.analog.left`, `input.buttons`, `input.cursor`, `io.offload`, `text.layout.offload`, `audio.pcm`, `text.glyphs.baked`, `text.glyphs.streamed` |
 | `vita`         | 2       | vita / takeover   | 480×272 (`integer-fit`)                  | 2       | `input.analog.left`, `input.buttons`, `input.cursor`, `input.touch`, `text.glyphs.baked` |
 | `pocketbook`   | 5       | pocketbook / takeover | 480×272 (`integer-fit`)              | 2       | `input.buttons`, `input.touch`, `text.glyphs.baked` |
 | `macos-widget` | 3       | macos / widget    | 420×560 default, 240×180…4096×4096       | 2       | `input.buttons`, `input.ime`, `input.pointer`, `input.text`, `host.clipboard`, `display.viewport.live`, `text.glyphs.baked`, `text.glyphs.runtime` |
-| `macos-app`    | 4       | macos / window    | 720×480 default, 240×180…4096×4096, accepts fixed | 2 | `input.buttons`, `display.viewport.live`, `text.glyphs.baked`, `text.layout.native`; systemUI role adds `ui.compositor-surfaces` |
+| `macos-app`    | 4       | macos / window    | 720×480 default, 240×180…4096×4096, accepts fixed | 2 | `input.buttons`, `audio.pcm`, `display.viewport.live`, `text.glyphs.baked`, `io.offload`, `text.layout.offload`, `data.fs`, `net.http`, `net.socket`; systemUI role adds `ui.compositor-surfaces` |
 | `linux-app`    | 4       | linux / window    | 800×600 default, 240×180…4096×4096, accepts fixed | 1 | same as `macos-app` |
-| `web-app`      | 4       | web / window      | 800×600 default, 320×240…4096×4096, accepts fixed | 1 | `input.buttons`, `display.viewport.live`, `text.glyphs.baked`; systemUI role adds `ui.compositor-surfaces` |
+| `web-app`      | 4       | web / window      | 800×600 default, 320×240…4096×4096, accepts fixed | 1 | `input.buttons`, `display.viewport.live`, `text.glyphs.baked`, `io.offload`, `text.layout.offload`, `net.http`, `net.socket`; systemUI role adds `ui.compositor-surfaces` |
 
 `roleCapabilities.systemUI` is the one conditional column: those APIs reach a
 package only when it resolves in the System-UI role. `ui.compositor-surfaces`
