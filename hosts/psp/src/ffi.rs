@@ -1255,18 +1255,27 @@ pub unsafe fn register(
     textures: &[(String, i32)],
     sprites: &[crate::pak::SpriteReg],
 ) {
-    if crate::offload::enabled() {
+    // The device-local provider (ms0:/PSP/COMMON/pocketjs/) is independent of
+    // the USB companion: it serves the font archive and other on-device files
+    // on every build, not just devtools ones. It shares the offload object
+    // with the companion when that is enabled.
+    let io = if crate::offload::enabled() {
         let io = JS_NewObject(ctx);
         add_fn(ctx, io, b"session\0", js_offload_session, 0);
         add_fn(ctx, io, b"submit\0", js_offload_submit, 1);
         add_fn(ctx, io, b"take\0", js_offload_take, 0);
+        add_fn(ctx, io, b"uploadCoverage\0", js_offload_upload_coverage, 6);
+        add_fn(ctx, io, b"uploadIndexedImage\0", js_offload_upload_indexed, 4);
+        io
+    } else {
+        JS_NewObject(ctx)
+    };
+    {
         let local = JS_NewObject(ctx);
         add_fn(ctx, local, b"session\0", js_local_session, 0);
         add_fn(ctx, local, b"submit\0", js_local_submit, 1);
         add_fn(ctx, local, b"take\0", js_local_take, 0);
         JS_SetPropertyStr(ctx, io, b"local\0".as_ptr() as *const _, local);
-        add_fn(ctx, io, b"uploadCoverage\0", js_offload_upload_coverage, 6);
-        add_fn(ctx, io, b"uploadIndexedImage\0", js_offload_upload_indexed, 4);
         JS_SetPropertyStr(ctx, global, b"offload\0".as_ptr() as *const _, io);
     }
     #[cfg(feature = "bench")]
