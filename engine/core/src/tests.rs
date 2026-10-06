@@ -4615,6 +4615,132 @@ fn draw_demand_stays_off_without_the_flag() {
     assert_eq!(ui.font_stream_requests(), "[]");
 }
 
+fn drain_request_codepoints(ui: &Ui) -> Vec<u32> {
+    let mut out = Vec::new();
+    for _ in 0..64 {
+        let requests = ui.font_stream_requests();
+        if requests == "[]" {
+            break;
+        }
+        for entry in requests[1..requests.len() - 1].split("],[") {
+            let cp = entry
+                .split(',')
+                .nth(2)
+                .unwrap()
+                .trim_matches(|c| c == '[' || c == ']');
+            out.push(cp.parse().unwrap());
+        }
+    }
+    out
+}
+
+#[test]
+fn draw_demand_queue_caps_at_max_demand() {
+    fn stream_config_demand(generation: u32, capacity: u16) -> [u8; 20] {
+        let mut b = stream_config(generation, capacity);
+        b[15] = 1; // draw-demand flag
+        b
+    }
+    let mut ui = Ui::new();
+    assert!(ui.set_tick_rate(60));
+    assert!(ui.load_font_atlas(&encode_atlas(
+        2,
+        8,
+        8,
+        7,
+        10,
+        2,
+        &[(65, 1, 6), (0xfffd, 0, 8)]
+    )));
+    assert!(ui.font_stream_configure(&stream_config_demand(1, 4)));
+    let text = ui.create_node(1);
+    ui.insert_before(spec::ROOT_ID, text, 0);
+    ui.set_prop(text, spec::prop::FONT_SLOT, 2.0);
+    ui.set_viewport(4096.0, 272.0); // one long line, every glyph laid out
+    // More distinct missing glyphs than the queue bound: exactly MAX_DEMAND
+    // are recorded, never the full overflow.
+    let many: String = (0..300)
+        .map(|i| char::from_u32(0x4e00 + i).unwrap())
+        .collect();
+    ui.set_text(text, &many);
+    ui.tick();
+    ui.draw();
+    let queued = drain_request_codepoints(&ui);
+    assert_eq!(
+        queued.len(),
+        crate::font_stream::MAX_DEMAND,
+        "queue must cap at MAX_DEMAND, got {}",
+        queued.len()
+    );
+    let unique: alloc::collections::BTreeSet<_> = queued.iter().copied().collect();
+    assert_eq!(unique.len(), queued.len(), "queue must not duplicate scalars");
+    // Re-draw the same overflowing text a hundred times: the uncommitted
+    // scalars re-demand, but the queue never exceeds the cap.
+    for _ in 0..100 {
+        ui.tick();
+        ui.draw();
+        assert!(drain_request_codepoints(&ui).len() <= crate::font_stream::MAX_DEMAND);
+    }
+}
+
+#[test]
+fn draw_demand_does_not_grow_on_repeated_misses() {
+    fn stream_config_demand(generation: u32, capacity: u16) -> [u8; 20] {
+        let mut b = stream_config(generation, capacity);
+        b[15] = 1;
+        b
+    }
+    let mut ui = Ui::new();
+    assert!(ui.set_tick_rate(60));
+    assert!(ui.load_font_atlas(&encode_atlas(
+        2,
+        8,
+        8,
+        7,
+        10,
+        2,
+        &[(65, 1, 6), (0xfffd, 0, 8)]
+    )));
+    assert!(ui.font_stream_configure(&stream_config_demand(1, 4)));
+    let text = ui.create_node(1);
+    ui.insert_before(spec::ROOT_ID, text, 0);
+    ui.set_prop(text, spec::prop::FONT_SLOT, 2.0);
+    ui.set_viewport(4096.0, 272.0);
+    // The same missing glyph drawn a thousand times is demanded exactly once.
+    ui.set_text(text, "界");
+    for _ in 0..1000 {
+        ui.tick();
+        ui.draw();
+    }
+    assert_eq!(drain_request_codepoints(&ui), vec!['界' as u32]);
+}
+
+#[test]
+fn draw_demand_off_keeps_lease_only_behavior_byte_for_byte() {
+    // With the flag off, a drawn-missing scalar is still rejected by the
+    // pin-until-release commit check (the old behavior).
+    let (mut ui, _) = streamed_ui(4);
+    assert_eq!(ui.font_stream_commit(&stream_batch(1, '你' as u32, 255)), 0);
+    // A thousand draws never submit a request...
+    for _ in 0..1000 {
+        ui.tick();
+        ui.draw();
+    }
+    assert_eq!(ui.font_stream_requests(), "[]");
+    // ...and unknown flag bits are still rejected; only bit 0 is defined.
+    let mut weird = stream_config(1, 4);
+    weird[15] = 2;
+    assert!(!ui.font_stream_configure(&weird));
+    weird[15] = 0x80;
+    assert!(!ui.font_stream_configure(&weird));
+    // The flag bit itself is accepted and round-trips through configure.
+    let mut demand = stream_config(1, 4);
+    demand[15] = 1;
+    assert!(ui.font_stream_configure(&demand));
+    // Detaching with the old zeroed config still works.
+    assert!(ui.font_stream_configure(&stream_config(0, 0)));
+}
+
 #[test]
 fn streamed_detach_reclaims_capacity_and_restores_baked_cells_across_slots() {
     let mut ui = Ui::new();

@@ -16,7 +16,7 @@ const bytes = await bakeFontArchive({ font: "assets/fonts/NotoSansCJK-Demo.otf",
   codepoints: Array.from("你好一二丁丂七丄丅丆万丈気迫", c => c.codePointAt(0)!) });
 const [baked] = await bakeAtlases({ slots: [2], codepoints: [65, 0xfffd] });
 async function harness(capacity: number, resident = "你好", maxBytes?: number,
-  fixture = { bytes, slot: 2, baked: baked.bytes }) {
+  fixture = { bytes, slot: 2, baked: baked.bytes }, drawDemand = false) {
   const dir = mkdtempSync(join(tmpdir(), "pocket-font-"));
   const path = join(dir, "font.pjfa"); writeFileSync(path, fixture.bytes);
   const provider = createFontArchiveProvider({ "font.pjfa": path });
@@ -26,7 +26,7 @@ async function harness(capacity: number, resident = "你好", maxBytes?: number,
   let session = 1, fail = false, corrupt = false;
   const client = createOffloadClient({ session: () => session, take: () => replies.shift(),
     submit: raw => { queue.push(JSON.parse(raw)); return true; } });
-  const archive = createFontArchive({ path: "font.pjfa", slots: [fixture.slot], capacity, maxBytes, resident: [{ slot: fixture.slot, text: resident }] }, wasm.ops, client);
+  const archive = createFontArchive({ path: "font.pjfa", slots: [fixture.slot], capacity, maxBytes, resident: [{ slot: fixture.slot, text: resident }], drawDemand }, wasm.ops, client);
   return { archive, seen, wasm, reconnect: () => session++, fail: (v: boolean) => fail = v, corrupt: () => corrupt = true,
     step(count = 1) {
       for (let f = 0; f < count; f++) {
@@ -241,3 +241,46 @@ test("1000 runtime titles survive eviction beside a pinned player title at five 
     } finally { h.close(); }
   }
 }, 60000);
+
+test("drawDemand fetches on-screen glyphs no lease covers and stays idle without it", async () => {
+  // With drawDemand, drawing a glyph the archive holds but no lease covers
+  // records demand in the core; the scheduler fetches it with no active batch.
+  const h = await harness(4, "你好", undefined, undefined, true);
+  try {
+    h.step(40); // resident 你好 ready
+    expect(h.archive.stats().resident).toBe(2);
+    const node = h.wasm.ops.createNode(NODE_TYPE.text);
+    h.wasm.ops.setProp(node, PROP.fontSlot, 2);
+    h.wasm.ops.insertBefore(1, node, 0);
+    h.wasm.ops.setText(node, "万丈");
+    h.wasm.tick(); h.wasm.render(); // layout resolves 万丈 to tofu -> demand
+    h.step(80);
+    const fetched = () => h.seen.filter(q => q.method === "font.glyphs")
+      .flatMap(q => JSON.parse(q.payload).scalars as number[]);
+    expect(fetched()).toContain(0x4e07); // 万
+    expect(fetched()).toContain(0x4e08); // 丈
+    expect(h.archive.stats().resident).toBe(4);
+    // Once resident, redrawing submits nothing new.
+    const before = h.seen.length;
+    h.wasm.ops.setText(node, "万丈");
+    h.wasm.tick(); h.wasm.render();
+    h.step(40);
+    expect(h.seen.length).toBe(before);
+  } finally { h.close(); }
+  // Without drawDemand the same draw never reaches the provider.
+  const g = await harness(4);
+  try {
+    g.step(40);
+    const node = g.wasm.ops.createNode(NODE_TYPE.text);
+    g.wasm.ops.setProp(node, PROP.fontSlot, 2);
+    g.wasm.ops.insertBefore(1, node, 0);
+    g.wasm.ops.setText(node, "万丈");
+    g.wasm.tick(); g.wasm.render();
+    g.step(80);
+    const fetched = g.seen.filter(q => q.method === "font.glyphs")
+      .flatMap(q => JSON.parse(q.payload).scalars as number[]);
+    expect(fetched).not.toContain(0x4e07);
+    expect(fetched).not.toContain(0x4e08);
+    expect(g.archive.stats().resident).toBe(2);
+  } finally { g.close(); }
+});
