@@ -55,3 +55,77 @@ test("browser net adapter enforces response maxBytes while reading", async () =>
     delete globalThis.net;
   }
 });
+
+test("browser net adapter refuses scheme-changing redirects and long URLs", async () => {
+  const host = createNetHost(async (url) =>
+    url.endsWith("/hop")
+      ? new Response(null, { status: 302, headers: { location: "/ok" } })
+      : url.endsWith("/ok")
+        ? new Response("ok")
+        : new Response(null, { status: 301, headers: { location: "http://example.test/ok" } }));
+  globalThis.net = host.ns;
+  try {
+    const same = pocketFetch("https://example.test/hop");
+    const downgrade = pocketFetch("https://example.test/downgrade").then(() => null, (error) => error);
+    for (let i = 0; i < 4; i++) {
+      await Bun.sleep(0);
+      host.beginFrame();
+      runServicePumps();
+    }
+    expect(await (await same).text()).toBe("ok");
+    expect(await downgrade).toMatchObject({ code: "redirect", message: "redirect_scheme" });
+    const long = `https://example.test/${"a".repeat(2048)}`;
+    await expect(pocketFetch(long)).rejects.toMatchObject({ code: "invalid_request" });
+    expect(host.ns.start(JSON.stringify({ url: long, method: "GET", headers: {}, timeoutMs: 1000, maxBytes: 16 }), new ArrayBuffer(0))).toBe(-1);
+  } finally {
+    host.reset();
+    delete globalThis.net;
+  }
+});
+
+test("browser net adapter fails a redirect to a URL over the limit", async () => {
+  const calls = [];
+  const long = `https://example.test/${"x".repeat(3000)}`;
+  const host = createNetHost(async (url) => {
+    calls.push(url);
+    return url === "https://example.test/start"
+      ? new Response(null, { status: 302, headers: { location: long } })
+      : new Response("ok");
+  });
+  globalThis.net = host.ns;
+  try {
+    const outcome = pocketFetch("https://example.test/start").then(() => "done", (error) => error);
+    for (let i = 0; i < 4; i++) {
+      await Bun.sleep(0);
+      host.beginFrame();
+      runServicePumps();
+    }
+    expect(new TextEncoder().encode(long).byteLength).toBe(3021);
+    expect(await outcome).toMatchObject({ code: "redirect", message: "redirect URL too long" });
+    expect(calls).toEqual(["https://example.test/start"]);
+  } finally {
+    host.reset();
+    delete globalThis.net;
+  }
+});
+
+test("browser net adapter fails a final response URL over the limit", async () => {
+  const host = createNetHost(async () => {
+    const response = new Response("ok");
+    Object.defineProperty(response, "url", { value: `https://example.test/${"y".repeat(2048)}` });
+    return response;
+  });
+  globalThis.net = host.ns;
+  try {
+    const outcome = pocketFetch("https://example.test/short").then(() => "done", (error) => error);
+    for (let i = 0; i < 4; i++) {
+      await Bun.sleep(0);
+      host.beginFrame();
+      runServicePumps();
+    }
+    expect(await outcome).toMatchObject({ code: "redirect", message: "response URL too long" });
+  } finally {
+    host.reset();
+    delete globalThis.net;
+  }
+});

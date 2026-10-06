@@ -15,6 +15,7 @@ struct AppInstance {
     audio: audio::AudioSurface,
     /// The per-app fs module mounted as the instance's `globalThis.fs`.
     _fs: fs::FsMount,
+    network: network::Network,
     buttons: u32,
     visible: bool,
     focused: bool,
@@ -162,6 +163,7 @@ impl AppSupervisor {
         );
         let audio = audio::AudioSurface::new(entry.audio.clone());
         audio.mount(&guest)?;
+        let network = network::Network::mount(&guest)?;
         guest.eval(output, &bundle)?;
         if !guest.has_frame() {
             return Err(anyhow!("{output} evaluated but installed no frame()"));
@@ -180,6 +182,7 @@ impl AppSupervisor {
             offload,
             audio,
             _fs: fs_mount,
+            network,
             buttons: 0,
             visible: false,
             focused: false,
@@ -328,6 +331,7 @@ impl AppSupervisor {
             let instance = &mut self.instances[index];
             instance.audio.begin_tick();
             instance.offload.begin_frame();
+            instance.network.begin_tick();
             if let Err(error) = instance.guest.frame(instance.buttons) {
                 instance.audio.reset();
                 instance.state = AppInstanceState::Failed;

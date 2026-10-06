@@ -398,6 +398,11 @@ fn parse_args() -> Result<Args> {
                 ));
             }
             "--quit-after" => args.quit_after_ticks = Some(val("--quit-after")?.parse()?),
+            // Read by headless.rs; listed here so the parser accepts them.
+            "--headless" => {}
+            "--screenshot" => {
+                val("--screenshot")?;
+            }
             "--announce-ready" => args.announce_ready = true,
             "--trace-frames" => args.trace_frames = true,
             "--press" => {

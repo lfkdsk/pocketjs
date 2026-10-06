@@ -427,6 +427,9 @@ fn invalid(message: impl Into<String>) -> NetFailure {
 }
 
 fn is_http_url(url: &str) -> bool {
+    if url.len() > spec::MAX_URL_BYTES {
+        return false;
+    }
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"));
@@ -472,7 +475,10 @@ fn valid_headers(headers: &BTreeMap<String, String>) -> bool {
 
 fn validate_meta(meta: &RequestMeta, body: &[u8]) -> std::result::Result<(), NetFailure> {
     if !is_http_url(&meta.url) {
-        return Err(invalid("url must be absolute http:// or https://"));
+        return Err(invalid(format!(
+            "url must be absolute http:// or https:// of at most {} bytes",
+            spec::MAX_URL_BYTES
+        )));
     }
     if !spec::METHODS.contains(&meta.method.as_str()) {
         return Err(invalid(format!("unsupported method {}", meta.method)));
@@ -613,6 +619,17 @@ mod tests {
         assert!(core.start(&meta(16), &[]) > 0);
         assert_eq!(core.start(&meta(16), &[]), -1);
         assert!(core.last_error().starts_with(spec::ERROR_BUSY));
+    }
+
+    #[test]
+    fn refuses_urls_beyond_the_portable_length() {
+        let mut core = NetCore::new(FixtureTransport::default());
+        let long = format!("https://example.test/{}", "a".repeat(spec::MAX_URL_BYTES));
+        let meta = format!(
+            r#"{{"url":"{long}","method":"GET","headers":{{}},"timeoutMs":30000,"maxBytes":16}}"#
+        );
+        assert_eq!(core.start(&meta, &[]), -1);
+        assert!(core.last_error().starts_with(spec::ERROR_INVALID_REQUEST));
     }
 
     #[test]

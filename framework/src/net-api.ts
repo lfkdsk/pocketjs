@@ -11,6 +11,7 @@ import {
   NET_MAX_REQUEST_BYTES,
   NET_MAX_RESPONSE_BYTES,
   NET_MAX_TIMEOUT_MS,
+  NET_MAX_URL_BYTES,
   NET_METHODS,
   type NetErrorCode,
   type NetMethod,
@@ -24,6 +25,7 @@ export {
   NET_MAX_REQUEST_BYTES,
   NET_MAX_RESPONSE_BYTES,
   NET_MAX_TIMEOUT_MS,
+  NET_MAX_URL_BYTES,
   NET_METHODS,
 };
 export type { NetErrorCode, NetMethod };
@@ -285,6 +287,9 @@ export function __requestNet(url:string, options:FetchOptions,
   try {
     if (typeof url !== "string" || !/^https?:\/\/[^\s/]+(?:\/|$)/.test(url)) {
       throw new NetError(NET_ERROR.invalidRequest, "net: url must be absolute http:// or https://");
+    }
+    if (stringToUtf8(url).byteLength > NET_MAX_URL_BYTES) {
+      throw new NetError(NET_ERROR.invalidRequest, `net: url exceeds ${NET_MAX_URL_BYTES} bytes`);
     }
     const method = options.method ?? "GET";
     if (!(NET_METHODS as readonly string[]).includes(method)) {

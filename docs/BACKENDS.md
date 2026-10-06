@@ -189,6 +189,18 @@ framebuffer and the incremental tracker stay as they were.
 Pocket3D game's browser tab uses the three to lay its interface over a WebGPU
 scene ([`devices/web/pocket-web-wgpu`](../devices/web/pocket-web-wgpu/README.md)).
 
+The `web-app` profile advertises `input.buttons`, `display.viewport.live`,
+`text.glyphs.baked`, `io.offload`, `text.layout.offload`, `net.http` and
+`net.socket`; the System-UI role adds `ui.compositor-surfaces`.
+**`createPackageNetwork()` installs one `hosts/web/net.js` host and one
+`hosts/web/socket.js` host into each package Realm before its bundle runs**,
+as `globalThis.net` and `globalThis.socket`, over the System page's `fetch`
+and `WebSocket`. Each package has its own handle space and its own limits
+(2 requests, 4 sockets), and its network facts become visible at that
+package's tick, before its `frame()`. Removing an AppInstance aborts its
+requests and closes its sockets. See [NET.md](./NET.md),
+[SOCKET.md](./SOCKET.md) and [status.md](./status.md).
+
 ## System UI companion input
 
 The host speaks the `system-ui` svc dialect when the resolved System UI plan

@@ -103,6 +103,9 @@ export const NET_DEFAULT_TIMEOUT_MS = 30_000;
 export const NET_MAX_TIMEOUT_MS = 120_000;
 export const NET_MAX_REDIRECTS = 3;
 
+/** Request and final response URLs, in UTF-8 bytes. */
+export const NET_MAX_URL_BYTES = 2048;
+
 /** Portable errors. A transport maps platform/library failures into these
  * codes before crossing the module boundary. */
 export const NET_ERROR = {

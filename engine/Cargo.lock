@@ -1824,6 +1824,17 @@ name = "pocket-sim"
 version = "0.1.0"
 
 [[package]]
+name = "pocket-socket"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pocket-mod",
+ "pocketjs-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pocket-stage"
 version = "0.1.0"
 dependencies = [

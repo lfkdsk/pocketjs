@@ -263,7 +263,7 @@ GPU**, and its interface is a PocketJS app drawn over the scene:
 ```text
 TypeScript application → guest bundle, one frame at a time
   ui       tree, layout, draw, input, focus
-  net      poll batches
+  net      fetch, websocket; poll batches
   audio    pcm mixer
   strike   bsp, bots, hits
   voxel    chunks, meshing
@@ -440,6 +440,7 @@ bun run site:preview          # build, then serve the site at http://127.0.0.1:4
 | Runtime internals | [Architecture](https://pocketjs.pocket.nexus/docs/architecture/) · [Native contract](https://pocketjs.pocket.nexus/docs/native-contract/) |
 | Targets and packaging | [Platform contracts](https://pocketjs.pocket.nexus/docs/platform-contracts/) · [The `.pocket` platform](./docs/PLATFORM.md) |
 | Debugging and verification | [DevTools](./docs/DEVTOOLS.md) · [Determinism](./docs/DETERMINISM.md) |
+| Feature status per host | [Status](./docs/status.md) |
 | Runtimes beyond 2D UI | [The runtime family](./docs/RUNTIMES.md) · [Pocket3D](./pocket3d/README.md) |
 | Ahead-of-time compilation | [MicroTS](./microts/README.md) · [TypeScript support](./site/content/docs/typescript-support.md) |
 | Complete examples | [`apps/`](./apps/) · [Blog](https://pocketjs.pocket.nexus/blog/) |

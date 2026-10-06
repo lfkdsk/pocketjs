@@ -132,6 +132,7 @@ export const SUBPATHS: Record<string, SubpathDecl> = {
   manifest: { file: "framework/src/manifest/index.ts" },
   "idf-host": { file: "framework/src/manifest/idf-host.ts" },
   net: { file: "framework/src/net-api.ts", aliases: TWINS },
+  socket: { file: "framework/src/socket-api.ts", aliases: TWINS },
   osk: { file: { solid: "framework/src/osk.tsx" } },
   package: { file: "contracts/spec/pocket-package.ts" },
   "service-client": { file: "framework/src/service-client.ts" },
