@@ -19,5 +19,7 @@ beforeAll(() => {
 test("PSP GC trigger policy", () => {
   const result = Bun.spawnSync([binary], { cwd: root, stdout: "pipe", stderr: "pipe" });
   expect(result.exitCode, `${result.stdout}${result.stderr}`).toBe(0);
-  expect(result.stdout.toString()).toContain("6 passed; 0 failed");
+  const summary = result.stdout.toString().match(/test result: ok\. (\d+) passed; 0 failed/);
+  expect(summary, result.stdout.toString()).not.toBeNull();
+  expect(Number(summary![1])).toBeGreaterThanOrEqual(8);
 });
