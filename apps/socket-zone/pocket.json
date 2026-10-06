@@ -1,0 +1,31 @@
+{
+  "$schema": "https://pocketjs.dev/schema/pocket-2.json",
+  "pocket": 2,
+  "id": "dev.pocket-nexus.socket-zone",
+  "name": "pocketjs-socket-zone",
+  "title": "Socket Zone",
+  "version": "0.1.0",
+  "engine": {
+    "capabilities": {
+      "requires": [
+        "input.buttons",
+        "text.glyphs.baked",
+        "net.socket"
+      ]
+    }
+  },
+  "app": {
+    "entry": "apps/socket-zone/main.tsx",
+    "output": "socket-zone-main",
+    "framework": "solid",
+    "viewport": {
+      "fixed": {
+        "logical": [
+          480,
+          272
+        ],
+        "presentation": "integer-fit"
+      }
+    }
+  }
+}
