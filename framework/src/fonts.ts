@@ -24,6 +24,10 @@ export interface FontArchiveOptions {
   resident?: readonly PreparedText[];
   /** Both providers use the same archive protocol and batch scheduler. */
   provider?: "companion" | "local";
+  /** Also fetch glyphs the layout resolves to tofu because no lease covers
+   *  them (the core's draw-demand queue). Lets a guest render text it never
+   *  explicitly leased, at the cost of a few tofu frames on first use. */
+  drawDemand?: boolean;
   onChange?: () => void;
 }
 export interface FontArchiveStatus {
@@ -34,10 +38,11 @@ export interface FontArchiveStatus {
   loaded: number;
   paused: boolean;
 }
-const config = (s: ArchiveStrike, generation: number, capacity: number) => {
+const config = (s: ArchiveStrike, generation: number, capacity: number, drawDemand: boolean) => {
   const b = new Uint8Array(20), v = new DataView(b.buffer);
   v.setUint32(0, F.configMagic, true); v.setUint32(4, generation, true);
   b.set([s.slot, s.width, s.height, s.baseline, s.lineHeight, s.advance, s.density], 8);
+  if (drawDemand) b[15] = 1;
   v.setUint16(16, capacity, true);
   return b;
 };
@@ -175,7 +180,7 @@ export function createFontArchive(options: FontArchiveOptions, host: HostOps, cl
         if (strikes.reduce((n, s) => n + s.width * s.height * capacity, 0) > maxBytes)
           throw new Error("Font source bitmap budget exceeded");
         for (const s of strikes) {
-          if (!host.fontStreamConfigure!(config(s, value.generation, capacity)))
+          if (!host.fontStreamConfigure!(config(s, value.generation, capacity, options.drawDemand === true)))
             throw new Error(`Font slot ${s.slot} incompatible or exceeds residency budget`);
           configured.push(s);
         }
@@ -205,7 +210,10 @@ export function createFontArchive(options: FontArchiveOptions, host: HostOps, cl
       if (status.state === "ready") admit(b);
       loading ||= b.admitted && b.state.status === "pending";
     }
-    if (!loading || status.paused || requests.size >= 2 || status.state === "error") return;
+    // With draw-demand the core queues on-screen glyphs no lease covers; poll
+    // for them even when every batch is ready.
+    const drawDemand = options.drawDemand === true && status.state === "ready";
+    if ((!loading && !drawDemand) || status.paused || requests.size >= 2 || status.state === "error") return;
     const demand = JSON.parse(host.fontStreamRequests!()) as number[][];
     const available = demand.filter(([g, s, cp]) => g === face!.generation && slots.includes(s) &&
       !inflight.has(`${s}:${cp}`) && (retries.get(`${s}:${cp}`)?.frame ?? 0) <= frame);

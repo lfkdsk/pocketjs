@@ -4561,6 +4561,61 @@ fn streamed_batches_validate_bounds_and_share_request_slots() {
 }
 
 #[test]
+fn draw_demand_queues_missing_glyphs_and_drains() {
+    fn stream_config_demand(generation: u32, capacity: u16) -> [u8; 20] {
+        let mut b = stream_config(generation, capacity);
+        b[15] = 1; // draw-demand flag
+        b
+    }
+    let mut ui = Ui::new();
+    assert!(ui.set_tick_rate(60));
+    assert!(ui.load_font_atlas(&encode_atlas(
+        2,
+        8,
+        8,
+        7,
+        10,
+        2,
+        &[(65, 1, 6), (0xfffd, 0, 8)]
+    )));
+    assert!(ui.font_stream_configure(&stream_config_demand(1, 4)));
+    let text = ui.create_node(1);
+    ui.insert_before(spec::ROOT_ID, text, 0);
+    ui.set_prop(text, spec::prop::FONT_SLOT, 2.0);
+    // Without a lease, drawing the missing CJK glyphs records them as demand.
+    ui.set_text(text, "你好");
+    ui.tick();
+    ui.draw();
+    let requests = ui.font_stream_requests();
+    assert!(requests.contains("20320"), "你 demanded: {requests}");
+    assert!(requests.contains("22909"), "好 demanded: {requests}");
+    // The queue drains: a second poll has nothing left.
+    assert_eq!(ui.font_stream_requests(), "[]");
+    // A glyph already resident is not demanded again.
+    assert_eq!(ui.font_stream_commit(&stream_batch(1, '你' as u32, 255)), 1);
+    assert_eq!(ui.font_stream_commit(&stream_batch(1, '好' as u32, 255)), 1);
+    ui.tick();
+    ui.draw();
+    assert_eq!(ui.font_stream_requests(), "[]");
+    // A new missing glyph re-demands on the next draw.
+    ui.set_text(text, "你世");
+    ui.tick();
+    ui.draw();
+    assert!(ui.font_stream_requests().contains("19990")); // 世
+    // Detaching the stream drops the demand queue.
+    assert!(ui.font_stream_configure(&stream_config(0, 0)));
+    assert_eq!(ui.font_stream_requests(), "[]");
+}
+
+#[test]
+fn draw_demand_stays_off_without_the_flag() {
+    // The lease-only default must not create draw demand (the text-lab
+    // invariant): the same draw submits an empty request set.
+    let (mut ui, _) = streamed_ui(4);
+    assert_eq!(ui.font_stream_requests(), "[]");
+}
+
+#[test]
 fn streamed_detach_reclaims_capacity_and_restores_baked_cells_across_slots() {
     let mut ui = Ui::new();
     for slot in 0..4 {
