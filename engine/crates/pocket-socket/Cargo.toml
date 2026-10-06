@@ -1,0 +1,20 @@
+[package]
+name = "pocket-socket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transport-neutral bounded WebSocket core and PocketJS socket module surface"
+
+[features]
+# `mount` brings pocket-mod (and its QuickJS embedding) for the one-line
+# globalThis.socket install; the pocket-net feature split, same reason.
+default = ["mount"]
+mount = ["dep:pocket-mod", "dep:anyhow"]
+
+[dependencies]
+pocket-mod = { workspace = true, optional = true }
+pocketjs-core = { workspace = true }
+anyhow = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
