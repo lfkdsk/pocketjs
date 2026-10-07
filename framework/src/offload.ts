@@ -88,7 +88,14 @@ export function offload(provider: "companion" | "local" = "companion") {
   if (provider === "companion" && client) return client;
   const root = (globalThis as unknown as { offload?: OffloadOps }).offload;
   const ops = provider === "local" ? root?.local : root;
-  if (!ops) throw new Error("Host does not implement io.offload");
+  // A host may publish the root object for just one provider: the PSP host
+  // always carries the device-local provider but installs the companion
+  // methods only while the USB companion is enabled. An incomplete provider
+  // must fail loudly here instead of handing back a client whose first
+  // session/submit/take call throws a raw TypeError.
+  if (!ops || typeof ops.session !== "function" || typeof ops.submit !== "function"
+    || typeof ops.take !== "function")
+    throw new Error(`Host does not implement the ${provider} offload provider`);
   const next = createOffloadClient(ops);
   if (provider === "local") localClient = next; else client = next;
   registerServicePump(() => next.step());
