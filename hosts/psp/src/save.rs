@@ -1,39 +1,54 @@
-//! Save bridge: bounded, atomic saves under `ms0:/PSP/COMMON/pocketjs/save/`.
+//! Crash-safe save bridge under `ms0:/PSP/COMMON/pocketjs/save/`.
 //!
-//! The guest calls the `__pspSave` FFI synchronously. Memstick I/O on the
-//! main thread is the same trade-off pak_external.rs makes for asset reads:
-//! a save is a rare, bounded operation (the guest menu refuses one past the
-//! cap), and a synchronous contract lets the save menu report a failed write
-//! immediately instead of queueing work whose failure it could not observe.
+//! The guest calls the `__pspSave` FFI synchronously. Each new physical file
+//! has a fixed length/checksum header. Reads validate live first and fall back
+//! to a validated `.bak`; pre-header JSON saves remain readable for migration.
 //!
-//! Writes are atomic: the bytes land in `<name>.tmp` first, then a rename
-//! swaps the live file. The previous live file is parked as `<name>.bak`
-//! across the swap, so a crash between the two renames loses at most the
-//! write in progress; [`read`] falls back to the `.bak` when the live file
-//! is absent.
-//!
-//! The pure path validation and `sceIoOpen` error classification live in
-//! `save_core.rs` (no `psp::sys` dependency) so their unit tests run on the
-//! host; this module performs the memstick FFI.
+//! Replacement follows the pure plan in `save_core.rs`: write `.tmp`, flush it,
+//! validate it, then rotate a valid live copy to `.bak` or preserve `.bak` when
+//! it is the only valid old generation. Only then does `.tmp` become live. The
+//! previous generation stays in `.bak`, so a later corrupt live file remains
+//! recoverable. Every mutation order is fault-injected by host-native tests.
 
 use alloc::vec;
 use alloc::vec::Vec;
 use psp::sys::{self, IoOpenFlags, IoWhence, SceUid};
 
-use crate::save_core::{classify_open, resolve, with_suffix, ENOENT, MAX_FILE_BYTES};
+use crate::save_core::{
+    classify_open, delete_plan, record_header, record_span, resolve, select_read, with_suffix,
+    CopyStatus, DeleteStep, ReadSource, WriteStep, ENOENT, MAX_STORED_BYTES,
+};
 
-struct File(SceUid);
+struct File(Option<SceUid>);
+
+impl File {
+    fn new(fd: SceUid) -> Self {
+        Self(Some(fd))
+    }
+
+    fn fd(&self) -> SceUid {
+        self.0.expect("open PSP save file")
+    }
+
+    unsafe fn close(mut self) -> bool {
+        let fd = self.0.take().expect("open PSP save file");
+        sys::sceIoClose(fd) >= 0
+    }
+}
+
 impl Drop for File {
     fn drop(&mut self) {
-        unsafe {
-            sys::sceIoClose(self.0);
+        if let Some(fd) = self.0.take() {
+            unsafe {
+                sys::sceIoClose(fd);
+            }
         }
     }
 }
 
 /// Create the save directory chain (`ms0:/PSP/COMMON/pocketjs/save/`).
 /// sceIoMkdir creates one level at a time and fails on an existing entry, so
-/// every level is best-effort.
+/// every level is best-effort; the following open reports a real failure.
 unsafe fn ensure_save_dir() {
     for dir in [
         b"ms0:/PSP/COMMON/pocketjs\0".as_slice(),
@@ -43,31 +58,31 @@ unsafe fn ensure_save_dir() {
     }
 }
 
-/// Read a whole file. `Ok(None)` means absent (ENOENT); `Err(())` is an
-/// I/O failure (any other open error, or a broken read).
+/// Read a whole physical file. `Ok(None)` means ENOENT; any other open, seek,
+/// read, close, or size failure is `Err(())`.
 unsafe fn read_file(path: *const u8) -> Result<Option<Vec<u8>>, ()> {
     let fd = match classify_open(sys::sceIoOpen(path, IoOpenFlags::RD_ONLY, 0).0) {
         Ok(Some(fd)) => SceUid(fd),
         Ok(None) => return Ok(None),
         Err(()) => return Err(()),
     };
-    let f = File(fd);
-    let len = sys::sceIoLseek32(fd, 0, IoWhence::End);
+    let file = File::new(fd);
+    let len = sys::sceIoLseek32(file.fd(), 0, IoWhence::End);
     if len < 0 {
         return Err(());
     }
     let len = len as usize;
-    if len > MAX_FILE_BYTES {
+    if len > MAX_STORED_BYTES {
         return Err(());
     }
-    if sys::sceIoLseek32(fd, 0, IoWhence::Set) != 0 {
+    if sys::sceIoLseek32(file.fd(), 0, IoWhence::Set) != 0 {
         return Err(());
     }
     let mut buf = vec![0u8; len];
     let mut done = 0;
     while done < len {
         let n = sys::sceIoRead(
-            fd,
+            file.fd(),
             buf.as_mut_ptr().add(done) as *mut _,
             (len - done).min(4096) as u32,
         );
@@ -76,11 +91,54 @@ unsafe fn read_file(path: *const u8) -> Result<Option<Vec<u8>>, ()> {
         }
         done += n as usize;
     }
-    drop(f);
+    if !file.close() {
+        return Err(());
+    }
     Ok(Some(buf))
 }
 
-/// Write the whole buffer, one 4 KiB transfer at a time.
+enum LoadedCopy {
+    Absent,
+    Valid(Vec<u8>),
+    Invalid,
+    IoError,
+}
+
+impl LoadedCopy {
+    fn status(&self) -> CopyStatus {
+        match self {
+            Self::Absent => CopyStatus::Absent,
+            Self::Valid(_) => CopyStatus::Valid,
+            Self::Invalid => CopyStatus::Invalid,
+            Self::IoError => CopyStatus::IoError,
+        }
+    }
+}
+
+/// Load, checksum, and unwrap one physical copy. Framed and legacy saves must
+/// both contain UTF-8 because the FFI returns a JavaScript string.
+unsafe fn load_copy(path: *const u8) -> LoadedCopy {
+    match read_file(path) {
+        Ok(None) => LoadedCopy::Absent,
+        Err(()) => LoadedCopy::IoError,
+        Ok(Some(mut bytes)) => {
+            let (offset, len) = match record_span(&bytes) {
+                Ok(span) => span,
+                Err(()) => return LoadedCopy::Invalid,
+            };
+            if core::str::from_utf8(&bytes[offset..offset + len]).is_err() {
+                return LoadedCopy::Invalid;
+            }
+            if offset != 0 {
+                bytes.copy_within(offset..offset + len, 0);
+                bytes.truncate(len);
+            }
+            LoadedCopy::Valid(bytes)
+        }
+    }
+}
+
+/// Write a whole buffer, one 4 KiB transfer at a time.
 unsafe fn write_all(fd: SceUid, data: &[u8]) -> bool {
     let mut done = 0;
     while done < data.len() {
@@ -97,97 +155,117 @@ unsafe fn write_all(fd: SceUid, data: &[u8]) -> bool {
     true
 }
 
-/// Read a save file as UTF-8 bytes. `Ok(None)` means absent (after the
-/// `.bak` fallback); errors are static strings the FFI throws.
+unsafe fn write_temp(path: *const u8, header: &[u8], data: &[u8]) -> bool {
+    let fd = sys::sceIoOpen(
+        path,
+        IoOpenFlags::WR_ONLY | IoOpenFlags::CREAT | IoOpenFlags::TRUNC,
+        0o777,
+    );
+    if fd.0 < 0 {
+        return false;
+    }
+    let file = File::new(fd);
+    if !write_all(file.fd(), header) || !write_all(file.fd(), data) {
+        return false;
+    }
+    file.close()
+}
+
+unsafe fn sync_memory_stick() -> bool {
+    sys::sceIoSync(b"ms0:\0".as_ptr(), 0) >= 0
+}
+
+unsafe fn remove_file(path: *const u8) -> bool {
+    let result = sys::sceIoRemove(path);
+    result >= 0 || (result as u32) == ENOENT
+}
+
+/// Read a save as guest UTF-8 bytes. A valid live record wins; invalid,
+/// unreadable, or absent live falls back to a valid backup. Only two absent
+/// copies mean an empty slot. Every other no-valid-copy state is corruption.
 pub unsafe fn read(path: &str) -> Result<Option<Vec<u8>>, &'static str> {
     let (full, len) = resolve(path).ok_or("Invalid save path")?;
-    match read_file(full.as_ptr()) {
-        Ok(Some(bytes)) => Ok(Some(bytes)),
-        Ok(None) => {
-            // A crash between the two renames of a write can leave the
-            // backup as the only copy.
-            let bak = with_suffix(&full, len, b".bak");
-            read_file(bak.as_ptr()).map_err(|_| "Save could not be read")
-        }
-        Err(()) => Err("Save could not be read"),
+    let live = load_copy(full.as_ptr());
+    if let LoadedCopy::Valid(bytes) = live {
+        return Ok(Some(bytes));
+    }
+    let live_status = live.status();
+    let bak = with_suffix(&full, len, b".bak");
+    let backup = load_copy(bak.as_ptr());
+    match select_read(live_status, backup.status()) {
+        Ok(Some(ReadSource::Backup)) => match backup {
+            LoadedCopy::Valid(bytes) => Ok(Some(bytes)),
+            _ => unreachable!("read selector chose a non-valid backup"),
+        },
+        Ok(Some(ReadSource::Live)) => unreachable!("valid live returned before fallback"),
+        Ok(None) => Ok(None),
+        Err(()) => Err("Save is damaged or could not be read"),
     }
 }
 
-/// Atomically replace a save file. The bytes land in `<name>.tmp`; the
-/// previous live file (if any) is parked as `<name>.bak` while the tmp is
-/// renamed over it, then the backup is removed.
+/// Replace one logical save according to the pure crash-safe plan. All old
+/// copy probing happens before the temp write; an I/O error aborts without a
+/// mutation. A best-effort temp cleanup after failure never touches live/bak.
 pub unsafe fn write(path: &str, data: &[u8]) -> Result<(), &'static str> {
     let (full, len) = resolve(path).ok_or("Invalid save path")?;
-    if data.len() > MAX_FILE_BYTES {
-        return Err("Save is larger than 1 MiB");
-    }
-    // The save directory is created once per write; EEXIST is expected.
+    let header = record_header(data).ok_or("Save is larger than 1 MiB")?;
     ensure_save_dir();
 
     let tmp = with_suffix(&full, len, b".tmp");
-    {
-        let fd = sys::sceIoOpen(
-            tmp.as_ptr(),
-            IoOpenFlags::WR_ONLY | IoOpenFlags::CREAT | IoOpenFlags::TRUNC,
-            0o777,
-        );
-        if fd.0 < 0 {
-            // A read-only memory stick or a full one refuses the create.
-            return Err("Memory stick could not be written");
-        }
-        let f = File(fd);
-        if !write_all(fd, data) {
-            return Err("Memory stick write failed");
-        }
-        drop(f); // close before rename
-    }
-
     let bak = with_suffix(&full, len, b".bak");
-    // A stale backup from a crashed earlier write is discarded.
-    sys::sceIoRemove(bak.as_ptr());
-    // Park the live file, then swap. sceIoRename refuses an existing
-    // destination on PSP firmware, so the backup has to move first. A
-    // non-ENOENT open failure is a real I/O error: surface it instead of
-    // treating the live file as absent and renaming over it.
-    let had_live = match classify_open(sys::sceIoOpen(full.as_ptr(), IoOpenFlags::RD_ONLY, 0).0) {
-        Ok(Some(fd)) => {
-            sys::sceIoClose(SceUid(fd));
-            true
+    let live_status = load_copy(full.as_ptr()).status();
+    let backup_status = load_copy(bak.as_ptr()).status();
+    let plan = crate::save_core::write_plan(live_status, backup_status)
+        .map_err(|_| "Save copies could not be inspected")?;
+
+    for &step in plan.steps() {
+        let result = match step {
+            WriteStep::WriteTemp => write_temp(tmp.as_ptr(), &header, data),
+            WriteStep::SyncTemp | WriteStep::SyncCommitted => sync_memory_stick(),
+            WriteStep::ValidateTemp => load_copy(tmp.as_ptr()).status() == CopyStatus::Valid,
+            WriteStep::RemoveBackup => remove_file(bak.as_ptr()),
+            WriteStep::MoveLiveToBackup => sys::sceIoRename(full.as_ptr(), bak.as_ptr()) >= 0,
+            WriteStep::RemoveInvalidLive => remove_file(full.as_ptr()),
+            WriteStep::MoveTempToLive => sys::sceIoRename(tmp.as_ptr(), full.as_ptr()) >= 0,
+        };
+        if !result {
+            // If temp already became live this is ENOENT; otherwise cleanup is
+            // safe because the plan preserved a validated old live/backup.
+            let _ = remove_file(tmp.as_ptr());
+            return Err(match step {
+                WriteStep::WriteTemp => "Memory stick write failed",
+                WriteStep::SyncTemp | WriteStep::SyncCommitted => {
+                    "Memory stick could not be synchronized"
+                }
+                WriteStep::ValidateTemp => "Memory stick write was incomplete",
+                WriteStep::RemoveBackup
+                | WriteStep::MoveLiveToBackup
+                | WriteStep::RemoveInvalidLive
+                | WriteStep::MoveTempToLive => "Save could not be replaced",
+            });
         }
-        Ok(None) => false,
-        Err(()) => {
-            sys::sceIoRemove(tmp.as_ptr());
-            return Err("Save could not be read");
-        }
-    };
-    if had_live {
-        if sys::sceIoRename(full.as_ptr(), bak.as_ptr()) < 0 {
-            sys::sceIoRemove(tmp.as_ptr());
-            return Err("Save could not be replaced");
-        }
-    }
-    if sys::sceIoRename(tmp.as_ptr(), full.as_ptr()) < 0 {
-        // Put the parked file back so the failed swap costs nothing.
-        if had_live {
-            let _ = sys::sceIoRename(bak.as_ptr(), full.as_ptr());
-        }
-        return Err("Save could not be replaced");
-    }
-    if had_live {
-        sys::sceIoRemove(bak.as_ptr());
     }
     Ok(())
 }
 
-/// Remove a save file. Absent is success (idempotent, like the fs module's
-/// `rmSync(..., { force: true })`).
+/// Remove both physical generations. The pure plan chooses the order from
+/// their validated states, and every non-ENOENT failure is returned. Therefore
+/// success cannot leave a backup that later reappears as the logical save.
 pub unsafe fn remove(path: &str) -> Result<(), &'static str> {
     let (full, len) = resolve(path).ok_or("Invalid save path")?;
-    let r = sys::sceIoRemove(full.as_ptr());
-    if r < 0 && (r as u32) != ENOENT {
-        return Err("Save could not be removed");
-    }
     let bak = with_suffix(&full, len, b".bak");
-    let _ = sys::sceIoRemove(bak.as_ptr());
+    let live_status = load_copy(full.as_ptr()).status();
+    let backup_status = load_copy(bak.as_ptr()).status();
+    let plan = delete_plan(live_status, backup_status)
+        .map_err(|_| "Save copies could not be inspected")?;
+    for step in plan {
+        let ok = match step {
+            DeleteStep::RemoveLive => remove_file(full.as_ptr()),
+            DeleteStep::RemoveBackup => remove_file(bak.as_ptr()),
+        };
+        if !ok {
+            return Err("Save could not be removed");
+        }
+    }
     Ok(())
 }

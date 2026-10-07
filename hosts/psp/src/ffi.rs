@@ -1130,12 +1130,12 @@ unsafe extern "C" fn js_local_submit(
 
 // --- __pspSave: the memory-stick save bridge (save.rs) ---------------------
 //
-// Three synchronous ops rooted at ms0:/PSP/COMMON/pocketjs/save/: read a file
-// as UTF-8 text (null when absent), atomically replace one (tmp + rename with
-// a .bak parked across the swap), and remove one. Writes are bounded and
-// failures throw, so the guest's save menu can show "SAVE FAILED" instead of
-// dropping the save. The host mounts no fs module on PSP; this is the only
-// writable guest channel.
+// Three synchronous ops rooted at ms0:/PSP/COMMON/pocketjs/save/: read a
+// checksummed UTF-8 record (null when absent), replace one through the
+// crash-safe tmp/live/backup state machine, and remove both generations.
+// Writes are bounded and failures throw, so the guest's save menu can show
+// "SAVE FAILED" instead of dropping the save. The host mounts no fs module on
+// PSP; this is the only writable guest channel.
 
 unsafe fn arg_string(ctx: *mut JSContext, argc: i32, argv: *mut JSValue, i: isize) -> Option<String> {
     if (i as i32) >= argc {
