@@ -16,8 +16,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 use psp::sys::{self, IoOpenFlags, IoWhence, SceUid};
 
-/// Device root every save path resolves under.
-const ROOT: &[u8] = b"ms0:/PSP/COMMON/pocketjs/save/";
+/// Device root every save path resolves under. The guest passes
+/// `save/slot-1.json` (the same relative path the desktop fs store uses);
+/// `resolve` enforces the `save/` prefix so no call can name a file outside
+/// the save directory.
+const ROOT: &[u8] = b"ms0:/PSP/COMMON/pocketjs/";
 /// One save file may not exceed this; the guest menu refuses larger saves.
 const MAX_FILE_BYTES: usize = 1 << 20; // 1 MiB
 /// Longest guest-relative path accepted ("save/" + 48 chars).
@@ -77,26 +80,11 @@ impl Drop for File {
 /// sceIoMkdir creates one level at a time and fails on an existing entry, so
 /// every level is best-effort.
 unsafe fn ensure_save_dir() {
-    let mut dbg = [0u8; 128];
-    let mut n = 0;
     for dir in [
         b"ms0:/PSP/COMMON/pocketjs\0".as_slice(),
         b"ms0:/PSP/COMMON/pocketjs/save\0".as_slice(),
     ] {
-        let r = sys::sceIoMkdir(dir.as_ptr(), 0o777);
-        // Log the mkdir result to a host0: debug file.
-        let msg = if dir[20] == b's' {
-            alloc::format!("mkdir pocketjs -> {}\n", r)
-        } else {
-            alloc::format!("mkdir save -> {}\n", r)
-        };
-        dbg[n..n + msg.len()].copy_from_slice(msg.as_bytes());
-        n += msg.len();
-    }
-    let fd = sys::sceIoOpen(b"host0:/save-debug.txt\0".as_ptr(), IoOpenFlags::WR_ONLY | IoOpenFlags::CREAT | IoOpenFlags::TRUNC, 0o777);
-    if fd.0 >= 0 {
-        sys::sceIoWrite(fd, dbg.as_ptr() as *const _, n);
-        sys::sceIoClose(fd);
+        sys::sceIoMkdir(dir.as_ptr(), 0o777);
     }
 }
 
@@ -187,13 +175,6 @@ pub unsafe fn write(path: &str, data: &[u8]) -> Result<(), &'static str> {
             0o777,
         );
         if fd.0 < 0 {
-            // Log the open error for debugging.
-            let msg = alloc::format!("open tmp -> {} ({})\n", fd.0, core::str::from_utf8(&full[..len]).unwrap_or("?"));
-            let dfd = sys::sceIoOpen(b"host0:/save-debug.txt\0".as_ptr(), IoOpenFlags::WR_ONLY | IoOpenFlags::CREAT | IoOpenFlags::APPEND, 0o777);
-            if dfd.0 >= 0 {
-                sys::sceIoWrite(dfd, msg.as_ptr() as *const _, msg.len());
-                sys::sceIoClose(dfd);
-            }
             // A read-only memory stick or a full one refuses the create.
             return Err("Memory stick could not be written");
         }
