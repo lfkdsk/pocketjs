@@ -12,7 +12,6 @@
 //! write in progress; [`read`] falls back to the `.bak` when the live file
 //! is absent.
 
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use psp::sys::{self, IoOpenFlags, IoWhence, SceUid};
@@ -98,13 +97,14 @@ unsafe fn read_file(path: *const u8) -> Result<Option<Vec<u8>>, ()> {
         let n = sys::sceIoRead(
             fd,
             buf.as_mut_ptr().add(done) as *mut _,
-            (len - done).min(4096) as u32,
+            (len - done).min(4096),
         );
         if n <= 0 {
             return Err(());
         }
         done += n as usize;
     }
+    drop(f);
     Ok(Some(buf))
 }
 
@@ -115,7 +115,7 @@ unsafe fn write_all(fd: SceUid, data: &[u8]) -> bool {
         let n = sys::sceIoWrite(
             fd,
             data.as_ptr().add(done) as *const _,
-            (data.len() - done).min(4096) as u32,
+            (data.len() - done).min(4096),
         );
         if n <= 0 {
             return false;

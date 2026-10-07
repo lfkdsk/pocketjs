@@ -27,6 +27,14 @@ extern "C" {
         len: usize,
         filename: *const core::ffi::c_char,
     ) -> JSValue;
+    // The hand-written libquickjs-sys surface omits the printf-style throw
+    // helpers; the bundled quickjs.c exports them, so declare the one this
+    // bridge uses. A "%s" format keeps the message a plain C string.
+    fn JS_ThrowTypeError(
+        ctx: *mut JSContext,
+        fmt: *const core::ffi::c_char,
+        ...
+    ) -> JSValue;
 }
 use pocketjs_core::Ui;
 
@@ -1165,7 +1173,7 @@ unsafe extern "C" fn js_save_read(
             Ok(text) => JS_NewStringLen(ctx, text.as_ptr() as *const _, text.len()),
             Err(_) => throw_save_error(ctx, "save.read: file is not UTF-8"),
         },
-        Ok(None) => JS_NULL,
+        Ok(None) => JS_UNDEFINED,
         Err(msg) => throw_save_error(ctx, msg),
     }
 }
