@@ -77,11 +77,26 @@ impl Drop for File {
 /// sceIoMkdir creates one level at a time and fails on an existing entry, so
 /// every level is best-effort.
 unsafe fn ensure_save_dir() {
+    let mut dbg = [0u8; 128];
+    let mut n = 0;
     for dir in [
         b"ms0:/PSP/COMMON/pocketjs\0".as_slice(),
         b"ms0:/PSP/COMMON/pocketjs/save\0".as_slice(),
     ] {
-        sys::sceIoMkdir(dir.as_ptr(), 0o777);
+        let r = sys::sceIoMkdir(dir.as_ptr(), 0o777);
+        // Log the mkdir result to a host0: debug file.
+        let msg = if dir[20] == b's' {
+            alloc::format!("mkdir pocketjs -> {}\n", r)
+        } else {
+            alloc::format!("mkdir save -> {}\n", r)
+        };
+        dbg[n..n + msg.len()].copy_from_slice(msg.as_bytes());
+        n += msg.len();
+    }
+    let fd = sys::sceIoOpen(b"host0:/save-debug.txt\0".as_ptr(), IoOpenFlags::WR_ONLY | IoOpenFlags::CREAT | IoOpenFlags::TRUNC, 0o777);
+    if fd.0 >= 0 {
+        sys::sceIoWrite(fd, dbg.as_ptr() as *const _, n);
+        sys::sceIoClose(fd);
     }
 }
 
@@ -172,6 +187,13 @@ pub unsafe fn write(path: &str, data: &[u8]) -> Result<(), &'static str> {
             0o777,
         );
         if fd.0 < 0 {
+            // Log the open error for debugging.
+            let msg = alloc::format!("open tmp -> {} ({})\n", fd.0, core::str::from_utf8(&full[..len]).unwrap_or("?"));
+            let dfd = sys::sceIoOpen(b"host0:/save-debug.txt\0".as_ptr(), IoOpenFlags::WR_ONLY | IoOpenFlags::CREAT | IoOpenFlags::APPEND, 0o777);
+            if dfd.0 >= 0 {
+                sys::sceIoWrite(dfd, msg.as_ptr() as *const _, msg.len());
+                sys::sceIoClose(dfd);
+            }
             // A read-only memory stick or a full one refuses the create.
             return Err("Memory stick could not be written");
         }
