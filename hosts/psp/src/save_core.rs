@@ -446,7 +446,21 @@ mod tests {
         let states = [Absent, Valid, Invalid];
         let mut scenarios = 0;
         let mut injected_failures = 0;
+        let mut injected_post_effect_failures = 0;
         let mut injected_power_cuts = 0;
+        let mut observed_steps = 0u16;
+        let step_bit = |step: WriteStep| -> u16 {
+            1 << match step {
+                WriteStep::WriteTemp => 0,
+                WriteStep::SyncTemp => 1,
+                WriteStep::ValidateTemp => 2,
+                WriteStep::RemoveBackup => 3,
+                WriteStep::MoveLiveToBackup => 4,
+                WriteStep::RemoveInvalidLive => 5,
+                WriteStep::MoveTempToLive => 6,
+                WriteStep::SyncCommitted => 7,
+            }
+        };
         for live in states {
             for backup in states {
                 let initial = Model::from_status(live, backup);
@@ -455,6 +469,9 @@ mod tests {
                 }
                 scenarios += 1;
                 let plan = write_plan(live, backup).unwrap();
+                for &step in plan.steps() {
+                    observed_steps |= step_bit(step);
+                }
 
                 for fail_at in 0..plan.steps().len() {
                     let mut model = initial;
@@ -467,6 +484,22 @@ mod tests {
                         "failure {fail_at} in {live:?}/{backup:?}: {model:?}"
                     );
                     injected_failures += 1;
+                }
+
+                // Some device APIs can report an error after their physical
+                // side effect occurred. Model that separately from a clean
+                // pre-effect failure: either resulting copy must still be
+                // readable even though write() reports failure.
+                for fail_after in 0..plan.steps().len() {
+                    let mut model = initial;
+                    for &step in &plan.steps()[..=fail_after] {
+                        model.apply(step);
+                    }
+                    assert!(
+                        model.readable().is_some(),
+                        "post-effect failure {fail_after} in {live:?}/{backup:?}: {model:?}"
+                    );
+                    injected_post_effect_failures += 1;
                 }
 
                 let mut model = initial;
@@ -483,7 +516,12 @@ mod tests {
         }
         assert_eq!(scenarios, 5);
         assert_eq!(injected_failures, injected_power_cuts);
+        assert_eq!(injected_post_effect_failures, injected_power_cuts);
         assert!(injected_failures >= 27);
+        assert_eq!(
+            observed_steps, 0xff,
+            "every WriteStep must be fault-injected"
+        );
     }
 
     #[test]
