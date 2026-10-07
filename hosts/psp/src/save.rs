@@ -97,7 +97,7 @@ unsafe fn read_file(path: *const u8) -> Result<Option<Vec<u8>>, ()> {
         let n = sys::sceIoRead(
             fd,
             buf.as_mut_ptr().add(done) as *mut _,
-            (len - done).min(4096),
+            (len - done).min(4096) as u32,
         );
         if n <= 0 {
             return Err(());
