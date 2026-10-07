@@ -3,6 +3,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn desktop_keys_map_to_current_psp_buttons() {
+        let cases = [
+            ("up", Some(BTN_UP)),
+            ("down", Some(BTN_DOWN)),
+            ("left", Some(BTN_LEFT)),
+            ("right", Some(BTN_RIGHT)),
+            ("z", Some(BTN_CROSS)),
+            ("enter", Some(BTN_CROSS)),
+            ("x", Some(BTN_CIRCLE)),
+            ("backspace", Some(BTN_CIRCLE)),
+            ("a", Some(BTN_SQUARE)),
+            ("s", Some(BTN_TRIANGLE)),
+            ("q", Some(BTN_LTRIGGER)),
+            ("l", Some(BTN_LTRIGGER)),
+            ("w", Some(BTN_RTRIGGER)),
+            ("r", Some(BTN_RTRIGGER)),
+            ("tab", Some(BTN_SELECT)),
+            ("space", Some(BTN_START)),
+            ("b", None),
+            ("escape", None),
+        ];
+
+        for (key, expected) in cases {
+            assert_eq!(button_for(key), expected, "key: {key}");
+        }
+    }
+
+    #[test]
     fn output_backpressure_reserves_before_gpu_submission() {
         let available = Arc::new(AtomicBool::new(true));
         let permit = OutputPermit::acquire(&available).unwrap();
