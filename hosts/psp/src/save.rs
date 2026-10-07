@@ -73,6 +73,18 @@ impl Drop for File {
     }
 }
 
+/// Create the save directory chain (`ms0:/PSP/COMMON/pocketjs/save/`).
+/// sceIoMkdir creates one level at a time and fails on an existing entry, so
+/// every level is best-effort.
+unsafe fn ensure_save_dir() {
+    for dir in [
+        b"ms0:/PSP/COMMON/pocketjs\0".as_slice(),
+        b"ms0:/PSP/COMMON/pocketjs/save\0".as_slice(),
+    ] {
+        sys::sceIoMkdir(dir.as_ptr(), 0o777);
+    }
+}
+
 /// Read a whole file. `Ok(None)` means absent; `Err(())` is an I/O failure.
 unsafe fn read_file(path: *const u8) -> Result<Option<Vec<u8>>, ()> {
     let fd = sys::sceIoOpen(path, IoOpenFlags::RD_ONLY, 0);
@@ -150,7 +162,7 @@ pub unsafe fn write(path: &str, data: &[u8]) -> Result<(), &'static str> {
         return Err("Save is larger than 1 MiB");
     }
     // The save directory is created once per write; EEXIST is expected.
-    sys::sceIoMkdir(b"ms0:/PSP/COMMON/pocketjs/save\0".as_ptr(), 0o777);
+    ensure_save_dir();
 
     let tmp = with_suffix(&full, len, b".tmp");
     {
