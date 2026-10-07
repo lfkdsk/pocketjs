@@ -1119,6 +1119,89 @@ unsafe extern "C" fn js_local_submit(
     }
     JS_NewBool(ctx, crate::offload_local::submit(r))
 }
+
+// --- __pspSave: the memory-stick save bridge (save.rs) ---------------------
+//
+// Three synchronous ops rooted at ms0:/PSP/COMMON/pocketjs/save/: read a file
+// as UTF-8 text (null when absent), atomically replace one (tmp + rename with
+// a .bak parked across the swap), and remove one. Writes are bounded and
+// failures throw, so the guest's save menu can show "SAVE FAILED" instead of
+// dropping the save. The host mounts no fs module on PSP; this is the only
+// writable guest channel.
+
+unsafe fn arg_string(ctx: *mut JSContext, argc: i32, argv: *mut JSValue, i: isize) -> Option<String> {
+    if (i as i32) >= argc {
+        return None;
+    }
+    let mut len = 0;
+    let p = JS_ToCStringLen2(ctx, &mut len, *argv.offset(i), 0);
+    if p.is_null() {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return None;
+    }
+    let s = String::from_utf8_lossy(core::slice::from_raw_parts(p as *const u8, len)).into_owned();
+    JS_FreeCString(ctx, p);
+    Some(s)
+}
+
+unsafe fn throw_save_error(ctx: *mut JSContext, msg: &str) -> JSValue {
+    let c = alloc::ffi::CString::new(msg).unwrap_or_else(|_| {
+        alloc::ffi::CString::new("save failed").unwrap_or_default()
+    });
+    JS_ThrowTypeError(ctx, b"%s\0".as_ptr() as *const _, c.as_ptr())
+}
+
+unsafe extern "C" fn js_save_read(
+    ctx: *mut JSContext,
+    _: JSValue,
+    argc: i32,
+    argv: *mut JSValue,
+) -> JSValue {
+    let Some(path) = arg_string(ctx, argc, argv, 0) else {
+        return throw_save_error(ctx, "save.read: path must be a string");
+    };
+    match crate::save::read(&path) {
+        Ok(Some(bytes)) => match core::str::from_utf8(&bytes) {
+            Ok(text) => JS_NewStringLen(ctx, text.as_ptr() as *const _, text.len()),
+            Err(_) => throw_save_error(ctx, "save.read: file is not UTF-8"),
+        },
+        Ok(None) => JS_NULL,
+        Err(msg) => throw_save_error(ctx, msg),
+    }
+}
+
+unsafe extern "C" fn js_save_write(
+    ctx: *mut JSContext,
+    _: JSValue,
+    argc: i32,
+    argv: *mut JSValue,
+) -> JSValue {
+    let Some(path) = arg_string(ctx, argc, argv, 0) else {
+        return throw_save_error(ctx, "save.write: path must be a string");
+    };
+    let Some(data) = arg_string(ctx, argc, argv, 1) else {
+        return throw_save_error(ctx, "save.write: data must be a string");
+    };
+    match crate::save::write(&path, data.as_bytes()) {
+        Ok(()) => JS_NewBool(ctx, true),
+        Err(msg) => throw_save_error(ctx, msg),
+    }
+}
+
+unsafe extern "C" fn js_save_remove(
+    ctx: *mut JSContext,
+    _: JSValue,
+    argc: i32,
+    argv: *mut JSValue,
+) -> JSValue {
+    let Some(path) = arg_string(ctx, argc, argv, 0) else {
+        return throw_save_error(ctx, "save.remove: path must be a string");
+    };
+    match crate::save::remove(&path) {
+        Ok(()) => JS_NewBool(ctx, true),
+        Err(msg) => throw_save_error(ctx, msg),
+    }
+}
 unsafe extern "C" fn js_font_stream_configure(
     ctx: *mut JSContext,
     _: JSValue,
@@ -1277,6 +1360,16 @@ pub unsafe fn register(
         add_fn(ctx, local, b"take\0", js_local_take, 0);
         JS_SetPropertyStr(ctx, io, b"local\0".as_ptr() as *const _, local);
         JS_SetPropertyStr(ctx, global, b"offload\0".as_ptr() as *const _, io);
+    }
+    {
+        // The memory-stick save bridge (save.rs). Registered on every build:
+        // it is the guest's only writable channel, and a build without saves
+        // simply never calls it.
+        let save = JS_NewObject(ctx);
+        add_fn(ctx, save, b"read\0", js_save_read, 1);
+        add_fn(ctx, save, b"write\0", js_save_write, 2);
+        add_fn(ctx, save, b"remove\0", js_save_remove, 1);
+        JS_SetPropertyStr(ctx, global, b"__pspSave\0".as_ptr() as *const _, save);
     }
     #[cfg(feature = "bench")]
     {
