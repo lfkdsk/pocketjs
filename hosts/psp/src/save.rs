@@ -11,61 +11,16 @@
 //! across the swap, so a crash between the two renames loses at most the
 //! write in progress; [`read`] falls back to the `.bak` when the live file
 //! is absent.
+//!
+//! The pure path validation and `sceIoOpen` error classification live in
+//! `save_core.rs` (no `psp::sys` dependency) so their unit tests run on the
+//! host; this module performs the memstick FFI.
 
 use alloc::vec;
 use alloc::vec::Vec;
 use psp::sys::{self, IoOpenFlags, IoWhence, SceUid};
 
-/// Device root every save path resolves under. The guest passes
-/// `save/slot-1.json` (the same relative path the desktop fs store uses);
-/// `resolve` enforces the `save/` prefix so no call can name a file outside
-/// the save directory.
-const ROOT: &[u8] = b"ms0:/PSP/COMMON/pocketjs/";
-/// One save file may not exceed this; the guest menu refuses larger saves.
-const MAX_FILE_BYTES: usize = 1 << 20; // 1 MiB
-/// Longest guest-relative path accepted ("save/" + 48 chars).
-const MAX_REL: usize = 53;
-/// SCE_ERROR_ERRNO_ENOENT — the only remove failure that means "absent".
-const ENOENT: u32 = 0x8001_0002;
-
-/// A NUL-terminated device path with room for a 4-byte suffix (.tmp/.bak).
-type DevicePath = [u8; 132];
-
-/// Validate a `save/...`-relative path and resolve it under [`ROOT`]. The
-/// guest passes `save/slot-1.json`; only one path segment is accepted, in
-/// the `[A-Za-z0-9._-]` charset, so no call can name a file outside the
-/// save directory. Returns the path and its length without the NUL.
-fn resolve(path: &str) -> Option<(DevicePath, usize)> {
-    if !path.starts_with("save/") || path.len() > MAX_REL {
-        return None;
-    }
-    let rest = &path["save/".len()..];
-    if rest.is_empty()
-        || rest == "."
-        || rest == ".."
-        || !rest
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return None;
-    }
-    let mut out = [0u8; 132];
-    let total = ROOT.len() + path.len();
-    if total + 4 >= out.len() {
-        return None;
-    }
-    out[..ROOT.len()].copy_from_slice(ROOT);
-    out[ROOT.len()..total].copy_from_slice(path.as_bytes());
-    Some((out, total))
-}
-
-/// Append a suffix (`.tmp`/`.bak`) to a resolved path; the result stays
-/// NUL-terminated because [`DevicePath`] outlives the suffix by one byte.
-fn with_suffix(path: &DevicePath, len: usize, suffix: &[u8]) -> DevicePath {
-    let mut out = *path;
-    out[len..len + suffix.len()].copy_from_slice(suffix);
-    out
-}
+use crate::save_core::{classify_open, resolve, with_suffix, ENOENT, MAX_FILE_BYTES};
 
 struct File(SceUid);
 impl Drop for File {
@@ -88,12 +43,14 @@ unsafe fn ensure_save_dir() {
     }
 }
 
-/// Read a whole file. `Ok(None)` means absent; `Err(())` is an I/O failure.
+/// Read a whole file. `Ok(None)` means absent (ENOENT); `Err(())` is an
+/// I/O failure (any other open error, or a broken read).
 unsafe fn read_file(path: *const u8) -> Result<Option<Vec<u8>>, ()> {
-    let fd = sys::sceIoOpen(path, IoOpenFlags::RD_ONLY, 0);
-    if fd.0 < 0 {
-        return Ok(None);
-    }
+    let fd = match classify_open(sys::sceIoOpen(path, IoOpenFlags::RD_ONLY, 0).0) {
+        Ok(Some(fd)) => SceUid(fd),
+        Ok(None) => return Ok(None),
+        Err(()) => return Err(()),
+    };
     let f = File(fd);
     let len = sys::sceIoLseek32(fd, 0, IoWhence::End);
     if len < 0 {
@@ -129,7 +86,7 @@ unsafe fn write_all(fd: SceUid, data: &[u8]) -> bool {
     while done < data.len() {
         let n = sys::sceIoWrite(
             fd,
-            data.as_ptr().add(done) as *const _,
+            data.as_ptr().add(done) as *mut _,
             (data.len() - done).min(4096),
         );
         if n <= 0 {
@@ -189,11 +146,21 @@ pub unsafe fn write(path: &str, data: &[u8]) -> Result<(), &'static str> {
     // A stale backup from a crashed earlier write is discarded.
     sys::sceIoRemove(bak.as_ptr());
     // Park the live file, then swap. sceIoRename refuses an existing
-    // destination on PSP firmware, so the backup has to move first.
-    let probe = sys::sceIoOpen(full.as_ptr(), IoOpenFlags::RD_ONLY, 0);
-    let had_live = probe.0 >= 0;
+    // destination on PSP firmware, so the backup has to move first. A
+    // non-ENOENT open failure is a real I/O error: surface it instead of
+    // treating the live file as absent and renaming over it.
+    let had_live = match classify_open(sys::sceIoOpen(full.as_ptr(), IoOpenFlags::RD_ONLY, 0).0) {
+        Ok(Some(fd)) => {
+            sys::sceIoClose(SceUid(fd));
+            true
+        }
+        Ok(None) => false,
+        Err(()) => {
+            sys::sceIoRemove(tmp.as_ptr());
+            return Err("Save could not be read");
+        }
+    };
     if had_live {
-        sys::sceIoClose(probe);
         if sys::sceIoRename(full.as_ptr(), bak.as_ptr()) < 0 {
             sys::sceIoRemove(tmp.as_ptr());
             return Err("Save could not be replaced");

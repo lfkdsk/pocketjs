@@ -34,6 +34,7 @@ pub mod host;
 pub mod pak;
 pub mod pak_external;
 pub mod qjs_alloc;
+pub mod save_core;
 pub mod save;
 pub mod stats;
 pub mod svc;

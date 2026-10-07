@@ -150,6 +150,7 @@ const SUITE: readonly Stage[] = [
       "tests/psp-arena.test.ts",
       "tests/psp-qjs-allocator.test.ts",
       "tests/psp-gc-policy.test.ts",
+      "tests/psp-save.test.ts",
       "tests/symbian-data.test.ts",
       "tests/symbian-toolchain.test.ts",
       "tests/symbian-device.test.ts",
