@@ -4,6 +4,15 @@ import { fetch as pocketFetch } from "../framework/src/net-api.ts";
 import { runServicePumps } from "../framework/src/services.ts";
 import { createNetHost } from "../hosts/web/net.js";
 
+function browserResponse(url, body = "ok") {
+  const response = new Response(body, { status: 200 });
+  Object.defineProperties(response, {
+    redirected: { value: true },
+    url: { value: url },
+  });
+  return response;
+}
+
 test("browser net adapter uses native fetch but delivers only at beginFrame", async () => {
   const calls = [];
   const host = createNetHost(async (url, options) => {
@@ -34,7 +43,7 @@ test("browser net adapter uses native fetch but delivers only at beginFrame", as
     expect(await response.text()).toBe("web transport");
     expect(calls).toHaveLength(1);
     expect(calls[0].options.credentials).toBe("omit");
-    expect(calls[0].options.redirect).toBe("manual");
+    expect(calls[0].options.redirect).toBe("follow");
   } finally {
     host.reset();
     delete globalThis.net;
@@ -56,24 +65,31 @@ test("browser net adapter enforces response maxBytes while reading", async () =>
   }
 });
 
-test("browser net adapter refuses scheme-changing redirects and long URLs", async () => {
-  const host = createNetHost(async (url) =>
-    url.endsWith("/hop")
-      ? new Response(null, { status: 302, headers: { location: "/ok" } })
-      : url.endsWith("/ok")
-        ? new Response("ok")
-        : new Response(null, { status: 301, headers: { location: "http://example.test/ok" } }));
+test("browser net adapter accepts same-origin redirects and refuses final scheme or origin changes", async () => {
+  const host = createNetHost(async (url) => {
+    if (url.endsWith("/same")) return browserResponse("https://example.test/ok");
+    if (url.endsWith("/scheme")) return browserResponse("http://example.test/ok");
+    return browserResponse("https://other.test/ok");
+  });
   globalThis.net = host.ns;
   try {
-    const same = pocketFetch("https://example.test/hop");
-    const downgrade = pocketFetch("https://example.test/downgrade").then(() => null, (error) => error);
+    const same = pocketFetch("https://example.test/same");
+    const scheme = pocketFetch("https://example.test/scheme").then(() => null, (error) => error);
     for (let i = 0; i < 4; i++) {
       await Bun.sleep(0);
       host.beginFrame();
       runServicePumps();
     }
     expect(await (await same).text()).toBe("ok");
-    expect(await downgrade).toMatchObject({ code: "redirect", message: "redirect_scheme" });
+    expect(await scheme).toMatchObject({ code: "redirect", message: "redirect_scheme" });
+
+    const origin = pocketFetch("https://example.test/origin").then(() => null, (error) => error);
+    for (let i = 0; i < 4; i++) {
+      await Bun.sleep(0);
+      host.beginFrame();
+      runServicePumps();
+    }
+    expect(await origin).toMatchObject({ code: "redirect", message: "redirect_origin" });
     const long = `https://example.test/${"a".repeat(2048)}`;
     await expect(pocketFetch(long)).rejects.toMatchObject({ code: "invalid_request" });
     expect(host.ns.start(JSON.stringify({ url: long, method: "GET", headers: {}, timeoutMs: 1000, maxBytes: 16 }), new ArrayBuffer(0))).toBe(-1);
@@ -88,9 +104,7 @@ test("browser net adapter fails a redirect to a URL over the limit", async () =>
   const long = `https://example.test/${"x".repeat(3000)}`;
   const host = createNetHost(async (url) => {
     calls.push(url);
-    return url === "https://example.test/start"
-      ? new Response(null, { status: 302, headers: { location: long } })
-      : new Response("ok");
+    return browserResponse(long);
   });
   globalThis.net = host.ns;
   try {

@@ -8,7 +8,6 @@ const MAX_RESPONSE_BYTES = 256 * 1024;
 const MAX_HEADERS = 32;
 const MAX_HEADER_BYTES = 8 * 1024;
 const MAX_TIMEOUT_MS = 120_000;
-const MAX_REDIRECTS = 3;
 const MAX_URL_BYTES = 2048;
 const METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]);
 
@@ -80,38 +79,41 @@ async function readBounded(response, maxBytes) {
   return body;
 }
 
-async function followBounded(nativeFetch, request, signal) {
-  let url = request.url;
-  let method = request.method;
-  let body = request.body.byteLength ? request.body : undefined;
-  for (let redirects = 0; ; redirects++) {
-    const response = await nativeFetch(url, {
-      method,
-      headers: request.headers,
-      body: method === "GET" || method === "HEAD" ? undefined : body,
-      credentials: "omit",
-      cache: "no-store",
-      redirect: "manual",
-      signal,
-    });
-    if (response.type === "opaqueredirect") throw new Error("redirect_opaque");
-    if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+async function followBrowserRedirects(nativeFetch, request, signal) {
+  const original = new URL(request.url);
+  const response = await nativeFetch(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: request.method === "GET" || request.method === "HEAD" || !request.body.byteLength
+      ? undefined
+      : request.body,
+    credentials: "omit",
+    cache: "no-store",
+    redirect: "follow",
+    signal,
+  });
+  if (!response.redirected) return response;
+
+  let final;
+  try {
+    final = new URL(response.url);
+  } catch {
     await response.body?.cancel();
-    if (redirects >= MAX_REDIRECTS) throw new Error("redirect_limit");
-    const location = response.headers.get("location");
-    if (!location) throw new Error("redirect_location");
-    const next = new URL(location, url);
-    // Same-scheme hops only: no https -> http downgrade and no http -> https
-    // upgrade the request did not ask for.
-    if (next.protocol !== new URL(url).protocol) throw new Error("redirect_scheme");
-    // Every hop stays within the request URL bound (desktop fetch.rs).
-    if (urlBytes(next.href) > MAX_URL_BYTES) throw netFailure("redirect", "redirect URL too long");
-    url = next.href;
-    if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === "POST")) {
-      method = "GET";
-      body = undefined;
-    }
+    throw new Error("redirect_url");
   }
+  if (final.protocol !== original.protocol) {
+    await response.body?.cancel();
+    throw new Error("redirect_scheme");
+  }
+  if (final.origin !== original.origin) {
+    await response.body?.cancel();
+    throw new Error("redirect_origin");
+  }
+  if (urlBytes(final.href) > MAX_URL_BYTES) {
+    await response.body?.cancel();
+    throw netFailure("redirect", "redirect URL too long");
+  }
+  return response;
 }
 
 export function createNetHost(nativeFetch = globalThis.fetch.bind(globalThis)) {
@@ -168,11 +170,10 @@ export function createNetHost(nativeFetch = globalThis.fetch.bind(globalThis)) {
         controller.abort();
       }, meta.timeoutMs);
       const request = { ...meta, body };
-      void followBounded(nativeFetch, request, controller.signal)
+      void followBrowserRedirects(nativeFetch, request, controller.signal)
         .then(async (response) => {
-          // The done event reports the final URL. meta.url and every followed
-          // hop are within the bound, so a longer response URL is one the
-          // request was moved to.
+          // The done event reports the final URL. The redirect path checks its
+          // final URL; this also bounds an unredirected transport response URL.
           if (response.url && urlBytes(response.url) > MAX_URL_BYTES) {
             await response.body?.cancel();
             throw netFailure("redirect", "response URL too long");

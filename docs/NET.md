@@ -142,25 +142,30 @@ model.
 
 ## Redirects
 
-Transports follow at most three redirects and refuse a hop that changes the
-scheme (`https://` to `http://` or the reverse) with code `redirect`. A 303,
-or a 301/302 answering a `POST`, continues as a bodiless `GET`; 307 and 308
-repeat the method and body. The desktop transport drops `authorization`,
-`cookie` and `proxy-authorization` headers when a hop changes origin.
+Desktop and simulation transports follow at most three redirects and refuse a
+hop that changes the scheme (`https://` to `http://` or the reverse) with code
+`redirect`. A 303, or a 301/302 answering a `POST`, continues as a bodiless
+`GET`; 307 and 308 repeat the method and body. The desktop transport drops
+`authorization`, `cookie` and `proxy-authorization` headers when a hop changes
+origin. Every inspected redirect target and the final response URL stay within
+the 2048-byte URL bound.
 
-**Every redirect target and the final response URL stay within the 2048-byte
-URL bound**; a longer one fails the request with `redirect` on the desktop and
-browser hosts. The browser host requests with `redirect: "manual"`. **Inside a
-browser page that mode returns an opaque redirect without `Location`, so every
-3xx answer rejects with `redirect`**; the hop-following path runs where the
-platform `fetch` exposes `Location`, as Bun's does.
+Browser hosts request with `redirect: "follow"`, because manual redirects are
+opaque in browser Fetch and expose neither status nor `Location`. **Acceptance
+of a redirected response requires a final URL with the request's scheme and
+origin and within the 2048-byte bound.** A violation rejects with code
+`redirect`. Browser Fetch does not expose intermediate hops, so the web host
+cannot enforce the three-hop limit or inspect an intermediate URL; the
+browser's redirect limit, CORS and mixed-content policy apply to the whole
+exchange. A chain that leaves and returns to the original origin is not visible
+to the host. `credentials: "omit"` applies to every browser request.
 
 ## Host status
 
 | Host | Transport | Capability |
 | --- | --- | --- |
 | desktop (`linux-app`, `macos-app`) | `hosts/desktop/src/fetch.rs`: HTTP/1.1 client with rustls (ring, webpki roots), one thread per request, at most 8 worker threads including cancelled requests still ending and abandoned DNS lookups | `net.http` advertised |
-| web dev host | `hosts/web/net.js`: browser `fetch` with `credentials: "omit"` and manual redirects | mounted as `globalThis.net` |
+| web dev host | `hosts/web/net.js`: browser `fetch` with `credentials: "omit"`; final redirect URL constrained to the request scheme and origin | mounted as `globalThis.net` |
 | web System host (`web-app`) | `hosts/web/system-engine.js`: one `hosts/web/net.js` host per package Realm over the System page's `fetch`; removing an AppInstance aborts its requests | `net.http` advertised |
 | sim | `hosts/sim/net.ts`: fixture routes, virtual-tick completions | deterministic tests |
 | psp, vita, 3ds, pocketbook, other device hosts | not mounted | not advertised; `fetch` rejects with `unavailable` |

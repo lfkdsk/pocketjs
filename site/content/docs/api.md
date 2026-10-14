@@ -1214,7 +1214,7 @@ and holds it — so the omitted surface is streams, cookies, cache, `Request`,
 | Response body | 128 KiB default, 256 KiB maximum |
 | Headers | 32 fields / 8 KiB |
 | Timeout | 30 s default, 120 s maximum |
-| Redirects | 3, same scheme |
+| Redirects | 3, same scheme (browser: final URL keeps scheme and origin; browser controls hop limit) |
 | URL | 2048 bytes |
 
 A fetch settles at a tick boundary and never inside a native callback: the
