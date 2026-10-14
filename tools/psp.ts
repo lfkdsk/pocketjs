@@ -338,7 +338,9 @@ const env = {
     ? `-march=allegrex -mabi=32 -msingle-float -EL -mno-abicalls -fno-pic -G0 -mno-check-zero-division ` +
       `-fno-stack-protector -fomit-frame-pointer -O3 -fno-gcse -std=gnu11 -fwrapv -fno-strict-aliasing ` +
       `-Wno-error=incompatible-pointer-types -I${sdk}/psp/include -I${sdk}/psp/sdk/include`
-    : `-target mipsel-sony-psp -mcpu=mips2 -msingle-float -mlittle-endian -mno-abicalls -fno-pic -G0 -mno-check-zero-division ` +
+    // PSP is a freestanding target. Without this, Linux Clang's built-in
+    // limits.h includes the host glibc limits.h after the PSP SDK headers.
+    : `-ffreestanding -target mipsel-sony-psp -mcpu=mips2 -msingle-float -mlittle-endian -mno-abicalls -fno-pic -G0 -mno-check-zero-division ` +
     `-fno-stack-protector -O2 -I${sdk}/psp/include -I${sdk}/psp/sdk/include`,
   // CRITICAL: archive MIPS objects with llvm-ar (Apple ar drops them -> undefined JS_*).
   AR_mipsel_sony_psp: `${toolchain.llvmBin}/llvm-ar`,

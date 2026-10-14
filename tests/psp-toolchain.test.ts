@@ -277,6 +277,13 @@ describe("canonical PSP toolchain", () => {
     }
   });
 
+  test("the PSP Clang path is freestanding", async () => {
+    const source = await Bun.file(join(root, "tools/psp.ts")).text();
+    expect(source).toContain(
+      ": `-ffreestanding -target mipsel-sony-psp -mcpu=mips2",
+    );
+  });
+
   test("Cargo manifests use the exact revisions from the canonical manifest", async () => {
     const pspManifests = ["hosts/psp/Cargo.toml"];
     for (const file of pspManifests) {
