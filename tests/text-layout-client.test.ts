@@ -1,6 +1,12 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
+import { __resetOffloadClients } from "../framework/src/offload.ts";
 import { createTextLayout } from "../framework/src/text-layout.ts";
 import { runServicePumps } from "../framework/src/services.ts";
+
+afterEach(() => {
+  __resetOffloadClients();
+  delete (globalThis as { offload?: unknown }).offload;
+});
 
 test("resident edits use one bounded job and canceled mutations force a fresh snapshot", () => {
   let generation = 1;
