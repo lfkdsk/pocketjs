@@ -41,7 +41,15 @@ export function check(){const frames=[text(root)];globalThis.frame(16384,0,[],[]
   const build = await Bun.build({ entrypoints: [oracle], target: "bun", format: "esm", conditions: ["browser"], plugins: [jsxPlugin(framework)] });
   expect(build.success, build.logs.join("\n")).toBe(true);
   const bundle = resolve(run, "oracle.mjs"); await Bun.write(bundle, build.outputs[0]!);
-  const javascript = (await import(bundle)).check();
+  // Generated Vue bundles share framework source identities when imported
+  // into one Bun test realm. Execute the oracle in its own realm so an
+  // earlier generated bundle cannot lend it a host-less component module.
+  const oracleRun = Bun.spawnSync(
+    [process.execPath, "-e", `const oracle=await import(${JSON.stringify(bundle)});process.stdout.write(JSON.stringify(oracle.check()));`],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  expect(oracleRun.exitCode, oracleRun.stderr.toString()).toBe(0);
+  const javascript = JSON.parse(oracleRun.stdout.toString()) as string[];
   expect(javascript).toEqual(["-2147483648|1|-2147483647|-2147483648|16777216|0", "2|1|-1|-2147483648|16777216|0"]);
   await Bun.write(resolve(run, "Cargo.toml"), `[package]\nname="model-view-numbers"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[dependencies]\nmicrots={path=${JSON.stringify(resolve("engine/crates/microts"))}}\nserde_json="1"\n`);
   await Bun.write(resolve(run, "src/main.rs"), `mod gen;use gen::*;use microts::{Host,Ui,Input};struct Native(Ui);impl Host for Native{fn ui(&self)->&Ui{&self.0}fn ui_mut(&mut self)->&mut Ui{&mut self.0}fn into_ui(self)->Ui{self.0}}impl<const B:u32>microts::HasButton<B> for Native{}fn text(ui:&Ui,id:i32)->String{let mut s=ui.core().node_text(id).unwrap_or("").to_owned();for child in ui.core().node_children(id){s.push_str(&text(ui,*child));}s}fn main(){let mut ui=Ui::new();ui.load_styles(include_bytes!("gen/styles.bin"));let mut app=AppApp::new(Native(ui),AppProps{},AppModel::default());let mut frames=vec![text(app.ui(),1)];app.frame(&Input::buttons(16384));frames.push(text(app.ui(),1));app.unmount();println!("{}",serde_json::json!(frames));}`);
