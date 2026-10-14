@@ -1,9 +1,11 @@
-import { expect, test } from "bun:test";
-import { offload } from "../framework/src/offload.ts";
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { __resetOffloadClients, offload } from "../framework/src/offload.ts";
 
-// The framework caches one client per provider per realm, so these tests are
-// order-dependent: the companion-rejection test must run before any
-// companion client is created in this file.
+beforeEach(__resetOffloadClients);
+afterEach(() => {
+  __resetOffloadClients();
+  delete (globalThis as unknown as { offload?: unknown }).offload;
+});
 
 // The PSP host publishes globalThis.offload on every build so the
 // device-local provider (the memory-stick font archive) is always available,

@@ -82,6 +82,19 @@ export function createOffloadClient(ops: OffloadOps) {
 
 let client: ReturnType<typeof createOffloadClient> | undefined;
 let localClient: ReturnType<typeof createOffloadClient> | undefined;
+let stopClientPump: (() => void) | undefined;
+let stopLocalClientPump: (() => void) | undefined;
+
+/** Test/realm teardown for the cached provider clients and their frame pumps. */
+export function __resetOffloadClients() {
+  client?.dispose();
+  localClient?.dispose();
+  stopClientPump?.();
+  stopLocalClientPump?.();
+  client = localClient = undefined;
+  stopClientPump = stopLocalClientPump = undefined;
+}
+
 /** No synchronous FS, DB, DNS or socket operation is exposed to the guest. */
 export function offload(provider: "companion" | "local" = "companion") {
   if (provider === "local" && localClient) return localClient;
@@ -97,7 +110,13 @@ export function offload(provider: "companion" | "local" = "companion") {
     || typeof ops.take !== "function")
     throw new Error(`Host does not implement the ${provider} offload provider`);
   const next = createOffloadClient(ops);
-  if (provider === "local") localClient = next; else client = next;
-  registerServicePump(() => next.step());
+  const stopPump = registerServicePump(() => next.step());
+  if (provider === "local") {
+    localClient = next;
+    stopLocalClientPump = stopPump;
+  } else {
+    client = next;
+    stopClientPump = stopPump;
+  }
   return next;
 }
