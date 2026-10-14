@@ -24,8 +24,8 @@ pub fn options() -> Option<Options> {
     Some(Options { screenshot })
 }
 
-pub fn run(args: Args, options: Options) -> Result<()> {
-    let mut runtime = Runtime::boot(args)?;
+pub fn run(args: Args, assets: GuestAssets, options: Options) -> Result<()> {
+    let mut runtime = Runtime::boot(args, assets)?;
     let mut deadline = Instant::now();
     loop {
         let work = Instant::now();
