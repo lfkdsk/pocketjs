@@ -162,6 +162,9 @@ describe("published npm artifacts", () => {
       "engine/pocket3d/crates/pocket3d-anim/Cargo.toml",
       "engine/pocket3d/crates/pocket3d-mesh/src",
       "engine/pocket3d/crates/pocket3d-mesh/Cargo.toml",
+      "engine/pocket3d/crates/pocket3d-packs/src",
+      "engine/pocket3d/crates/pocket3d-packs/Cargo.toml",
+      "engine/pocket3d/crates/pocket3d-packs/pocket3d_packs.h",
       "engine/pocket3d/crates/pocket3d/src",
       "engine/pocket3d/crates/pocket3d/Cargo.toml",
       "engine/pocket3d/examples/handheld/src",
@@ -216,6 +219,9 @@ describe("published npm artifacts", () => {
       "engine/pocket3d/crates/pocket3d-mesh/src/p3m.rs",
       "engine/pocket3d/crates/pocket3d-mesh/src/colored.rs",
       "engine/pocket3d/crates/pocket3d-mesh/src/rigid.rs",
+      "engine/pocket3d/crates/pocket3d-packs/Cargo.toml",
+      "engine/pocket3d/crates/pocket3d-packs/src/lib.rs",
+      "engine/pocket3d/crates/pocket3d-packs/pocket3d_packs.h",
       "tools/3ds-toolchain.ts",
       "tools/vita-dev.ts",
       "tools/vita-dev-client.ts",
@@ -363,6 +369,7 @@ describe("published npm artifacts", () => {
       expect(packages).toContain("pocket3d-world");
       expect(packages).toContain("pocket3d-anim");
       expect(packages).toContain("pocket3d-mesh");
+      expect(packages).toContain("pocket3d-packs");
       expect(existsSync(join(scratch, "package/engine/core/Cargo.toml"))).toBe(true);
     } finally {
       rmSync(scratch, { recursive: true, force: true });

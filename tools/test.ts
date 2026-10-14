@@ -75,6 +75,8 @@ const SUITE: readonly Stage[] = [
       "tests/pocket3d-icon.test.ts",
       "tests/pocket3d-interface.test.ts",
       "tests/pocket3d-license.test.ts",
+      "tests/pocket3d-packs.test.ts",
+      "tests/pocket3d-delivery.test.ts",
       "tests/pocket3d-web.test.ts",
       "tests/runtime-glyphs.test.ts",
       "tests/media-service.test.ts",
