@@ -85,14 +85,14 @@ function engineAbi(
 export const PSP_QUICKJS_ENGINE_ABI = engineAbi("psp", ["psp"], {
   schema: "pocketjs.quickjs-engine-abi/v1",
   binding: {
-    name: "pocket-nexus/quickjs-rs:libquickjs-sys",
+    name: "lfkdsk/quickjs-rs:libquickjs-sys",
     version: "0.9.0",
-    revision: "ba5bdd0dc013518768e76cd9e05cd30ed53dd35b",
+    revision: "2af09e8f18b0b810a7f1b0699762c0f08bcc0f85",
   },
   engine: {
     family: "quickjs",
-    repository: "https://github.com/pocket-nexus/quickjs-rs.git",
-    revision: "ba5bdd0dc013518768e76cd9e05cd30ed53dd35b",
+    repository: "https://github.com/lfkdsk/quickjs-rs.git",
+    revision: "2af09e8f18b0b810a7f1b0699762c0f08bcc0f85",
     version: "2026-06-04",
     bytecodeVersion: 5,
   },

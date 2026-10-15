@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
@@ -28,11 +29,19 @@ const TEST_BUILD_ROOT = join(ROOT, ".pocket-build/quickjs-bytecode-tests");
 
 test("QuickJS engine ABI descriptors pin serialization and target identity", () => {
   expect(QUICKJS_BYTECODE_FILENAME).toBe("app.js");
+  expect(PSP_QUICKJS_ENGINE_ABI.descriptor.binding).toMatchObject({
+    name: "lfkdsk/quickjs-rs:libquickjs-sys",
+    revision: "2af09e8f18b0b810a7f1b0699762c0f08bcc0f85",
+  });
   expect(PSP_QUICKJS_ENGINE_ABI.descriptor.engine).toMatchObject({
-    revision: "ba5bdd0dc013518768e76cd9e05cd30ed53dd35b",
+    repository: "https://github.com/lfkdsk/quickjs-rs.git",
+    revision: "2af09e8f18b0b810a7f1b0699762c0f08bcc0f85",
     version: "2026-06-04",
     bytecodeVersion: 5,
   });
+  expect(PSP_QUICKJS_ENGINE_ABI.sha256).toBe(
+    "sha256:58b9adf09c223efd9a84bffb4637312075ebb0ed1729b7d352282a01f7e8b73d",
+  );
   expect(PSP_QUICKJS_ENGINE_ABI.descriptor.serialization).toEqual({
     filename: "app.js",
     evalType: "global",
@@ -172,6 +181,10 @@ test.skipIf(!cachedPspSource)("pinned PSP QuickJS produces stable BC v5 bytecode
     compilerSource: cachedPspSource!,
   });
   expect(first.bytecode[0]).toBe(5);
+  // Compared byte-for-byte with the ba5bdd0 base: the 2af09e8f GC-only
+  // extension does not change JS_WriteObject output for this fixture.
+  expect(createHash("sha256").update(first.bytecode).digest("hex"))
+    .toBe("4001637ac49418fb4b82e8acbddcd432ff8cb62d9e04809a9da4acdd2966d1cf");
   expect(first.section).toEqual(second.section);
   expect(decodeBytecodeEnvelope(first.section).engineAbi).toBe(PSP_QUICKJS_ENGINE_ABI.sha256);
 }, 30_000);

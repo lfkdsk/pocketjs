@@ -199,11 +199,19 @@ remains present and NUL-terminated.
 
 The engine-ABI descriptor covers the QuickJS family, source revision and
 version, bytecode format version, serialization flags, bytecode-affecting
-defines, value representation, endianness, and pointer width. PSP uses its
-`quickjs-rs` pin and desktop uses the `rquickjs-sys` source from the desktop
-lockfile, so one package can carry target variants with different bytecode.
+defines, value representation, endianness, and pointer width. PSP uses
+`lfkdsk/quickjs-rs` at `2af09e8f` (Bellard QuickJS from `ba5bdd0` plus the
+host-driven generational GC API), and desktop uses the `rquickjs-sys` source
+from the desktop lockfile, so one package can carry target variants with
+different bytecode.
 The canonical source filename is `app.js`; identical source and ABI inputs
 produce identical section bytes.
+
+The PSP fork changes collection bookkeeping and adds GC entry points. It does
+not change the bytecode version or the `JS_ReadObject`/`JS_WriteObject`
+implementation. The exact fork commit participates in the engine-ABI
+digest, and package admission requires a digest match with the compiler
+engine.
 
 **PSP and the macOS/Linux desktop host read bytecode after package admission
 and an exact engine-ABI match.** They call `JS_ReadObject` followed by
