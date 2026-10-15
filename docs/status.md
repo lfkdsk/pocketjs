@@ -40,6 +40,12 @@ throws with code `unavailable`.
 | PSP, 3DS | **Planned** | The capability is absent: the profiles advertise `io.offload` and not `net.socket`. The plan routes game traffic through `io.offload` to a paired provider on a PC that holds the socket; no socket relay exists in the provider yet. | [OFFLOAD.md](./OFFLOAD.md) |
 | PS Vita (`vita`) | **Planned** | The `vita` profile advertises neither `net.socket` nor `io.offload`; `openSocket` throws `unavailable`. | `contracts/spec/platforms.ts` |
 
+## Package execution
+
+| Item | Status | What works now, and its limits | Reference |
+| --- | --- | --- | --- |
+| Target-specific QuickJS bytecode | **Done** | Native packages may add a `QJBC` section bound to the exact target engine ABI while retaining the mandatory source section. Linux/macOS and PSP execute compatible bytecode and fall back to source when the section is absent, malformed, unreadable or ABI-incompatible; Web and other hosts continue to use source. PSP's descriptor follows the actually embedded `lfkdsk/quickjs-rs` revision, including its collector extensions, rather than assuming upstream ABI identity. | [Platform and package contract](./PLATFORM.md#bytecode-the-eval-wall), `tests/quickjs-bytecode.test.ts`, `engine/crates/pocket-mod/src/lib.rs` |
+
 ## Desktop host
 
 | Item | Status | What works now, and its limits | Reference |
