@@ -279,8 +279,9 @@ mod tests {
         std::fs::write(&js, FIRST_FRAME_PROBE).unwrap();
         std::fs::write(&pak, b"").unwrap();
 
-        let args = Args {
+        let mut args = Args {
             app: app.to_string(),
+            pocket: None,
             js: Some(js),
             pak: Some(pak),
             file: None,
@@ -301,7 +302,8 @@ mod tests {
             announce_ready: false,
             trace_frames: false,
         };
-        let mut runtime = Runtime::boot(args).unwrap();
+        let assets = GuestAssets::load(&mut args).unwrap();
+        let mut runtime = Runtime::boot(args, assets).unwrap();
         let before = runtime.guest.heap_bytes().unwrap();
         let err = runtime.tick().unwrap_err();
         assert!(
