@@ -47,19 +47,9 @@ const MULTI_APP_SIM_HZ: u32 = 20;
 static POCKETJS_APP_NAME: &str = env!("POCKETJS_APP");
 static POCKETJS_TRACE: &str = env!("POCKETJS_TRACE");
 
-// libquickjs-sys omits these APIs; the linked QuickJS C library provides them
-// (local-extern pattern, same as host.rs JS_ExecutePendingJob).
+// libquickjs-sys omits the bytecode reader/evaluator from its public bindings;
+// the linked QuickJS C library provides them.
 extern "C" {
-    fn JS_RunGC(rt: *mut JSRuntime);
-    // The generational collector (pocket-nexus/quickjs-rs).
-    fn JS_RunGCMinor(rt: *mut JSRuntime);
-    fn JS_PromoteGCObjects(rt: *mut JSRuntime);
-    fn JS_SetGCYoungLimit(
-        rt: *mut JSRuntime,
-        limit: u32,
-        hook: Option<unsafe extern "C" fn(*mut JSRuntime, i32)>,
-    );
-    fn JS_FreePendingObjects(rt: *mut JSRuntime, max_count: i32) -> i32;
     fn JS_ReadObject(ctx: *mut JSContext, buf: *const u8, len: usize, flags: i32) -> JSValue;
     fn JS_EvalFunction(ctx: *mut JSContext, object: JSValue) -> JSValue;
 }
