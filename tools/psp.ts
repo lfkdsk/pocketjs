@@ -19,10 +19,11 @@
 // --runtime builds the generic runtime instead of an app's EBOOT (cargo
 // feature `runtime`, POCKETJS_EMBED_APP=0): no app is built or embedded, and
 // the EBOOT reads app.pocket from its own folder at boot. tools/runtime/psp.ts
-// runs this and collects the output.
+// runs this and collects the output. `--runtime --plan=<verified plan>` keeps
+// product host inputs, the io.offload slot and XMB metadata without embedding
+// the plan's app.
 
 import { $ } from "bun";
-import { createHash } from "node:crypto";
 import { existsSync, statSync, unlinkSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -38,6 +39,7 @@ import {
 } from "../framework/src/manifest/host-build-inputs.ts";
 import { verifyPlanHash, type ResolvedBuildPlan } from "../framework/src/manifest/plan.ts";
 import { resolvePspBuildToolchain } from "./psp-toolchain.ts";
+import { pspBuildMode, pspOffloadSlot } from "./psp-build-mode.ts";
 
 const pspUiDir = new URL("..", import.meta.url).pathname; // PocketJS/
 const nativeDir = pspUiDir + "hosts/psp/";
@@ -95,8 +97,11 @@ for (const a of argv) {
 }
 const features = [capture ? "capture" : "", bench ? "bench" : "", runtime ? "runtime" : ""].filter(Boolean);
 if (features.length > 0) cargoArgs.push("--features", features.join(","));
-if (runtime && (appArg || planPath || launcherRegistry)) {
-  console.error("PocketJS psp: --runtime builds an EBOOT without an app; give no app, --plan or --launcher-registry");
+let buildMode: ReturnType<typeof pspBuildMode>;
+try {
+  buildMode = pspBuildMode({ runtime, appArgument: appArg, planPath, launcherRegistry });
+} catch (error) {
+  console.error(`PocketJS psp: ${(error as Error).message}`);
   process.exit(1);
 }
 if (!appArg && !planPath && !runtime) {
@@ -196,7 +201,9 @@ const frameworkFragmentHome = `${fragmentBase}/${framework}`;
 const fragmentHome = existsSync(`${frameworkFragmentHome}/Psp.toml`)
   ? frameworkFragmentHome
   : fragmentBase;
-const xmbFragment = runtime ? `${pspUiDir}hosts/psp/runtime/Psp.toml` : `${fragmentHome}/Psp.toml`;
+const xmbFragment = buildMode.useGenericRuntimeMetadata
+  ? `${pspUiDir}hosts/psp/runtime/Psp.toml`
+  : `${fragmentHome}/Psp.toml`;
 const xmbFragmentLabel = xmbFragment.startsWith(pspUiDir)
   ? xmbFragment.slice(pspUiDir.length)
   : xmbFragment;
@@ -303,7 +310,7 @@ const rustflags = [
 const hostEnvironment = buildPlan
   ? hostBuildEnvironment(extractHostBuildInputs(buildPlan, { expectedTarget: "psp" }), {
       outputDirectory: outputDir,
-      embedApp: true,
+      embedApp: buildMode.embedApp,
     })
   : {
       POCKETJS_APP_OUTPUT: runtime ? "" : outputApp,
@@ -321,7 +328,7 @@ const hostEnvironment = buildPlan
 
 const gcc = process.env.POCKETJS_PSP_C_COMPILER === "gcc";
 const env = {
-  POCKETJS_OFFLOAD_SLOT: buildPlan?.features["io.offload"] ? createHash("sha256").update(buildPlan.app.id).digest("hex").slice(0, 16) : "",
+  POCKETJS_OFFLOAD_SLOT: pspOffloadSlot(buildPlan),
   ...toolchain.environment,
   RUSTFLAGS: rustflags,
   CRATE_CC_NO_DEFAULTS: "1",

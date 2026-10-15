@@ -17,6 +17,7 @@ import {
   resolvePspSdk,
   withArtifactLock,
 } from "../tools/psp-toolchain.ts";
+import { pspBuildMode, pspOffloadSlot } from "../tools/psp-build-mode.ts";
 
 const root = new URL("..", import.meta.url).pathname;
 const temporary: string[] = [];
@@ -37,6 +38,49 @@ const VITA_QUICKJS_RS = {
 } as const;
 
 describe("canonical PSP toolchain", () => {
+  test("a plan can configure a generic runtime without embedding its app", () => {
+    expect(pspBuildMode({
+      runtime: true,
+      appArgument: "",
+      planPath: "/game/psp.plan.json",
+      launcherRegistry: "",
+    })).toEqual({ embedApp: false, useGenericRuntimeMetadata: false });
+    expect(pspBuildMode({
+      runtime: true,
+      appArgument: "",
+      launcherRegistry: "",
+    })).toEqual({ embedApp: false, useGenericRuntimeMetadata: true });
+    expect(pspBuildMode({
+      runtime: false,
+      appArgument: "",
+      planPath: "/game/psp.plan.json",
+      launcherRegistry: "",
+    })).toEqual({ embedApp: true, useGenericRuntimeMetadata: false });
+    expect(pspOffloadSlot({
+      app: { id: "dev.pocket-nexus.game" },
+      features: { "io.offload": true },
+    })).toMatch(/^[0-9a-f]{16}$/);
+    expect(pspOffloadSlot({
+      app: { id: "dev.pocket-nexus.game" },
+      features: { "io.offload": false },
+    })).toBe("");
+  });
+
+  test("generic runtimes reject embedded app and launcher selections", () => {
+    expect(() => pspBuildMode({
+      runtime: true,
+      appArgument: "hero",
+      planPath: "/game/psp.plan.json",
+      launcherRegistry: "",
+    })).toThrow("--runtime cannot be combined with an app argument");
+    expect(() => pspBuildMode({
+      runtime: true,
+      appArgument: "",
+      planPath: "/game/psp.plan.json",
+      launcherRegistry: "/game/launcher.tsv",
+    })).toThrow("--runtime cannot be combined with --launcher-registry");
+  });
+
   test("pins the source and binary inputs", () => {
     expect(PSP_TOOLCHAIN).toMatchObject({
       schemaVersion: 1,
