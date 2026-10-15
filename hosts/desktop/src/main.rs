@@ -151,6 +151,7 @@ fn apply_package_plan(
         ));
     }
     args.app = plan.app.output.clone();
+    args.app_id = Some(plan.app.id.clone());
     args.title = plan.app.title.clone();
     args.viewport = (plan.viewport.logical[0], plan.viewport.logical[1]);
     args.fixed = plan.viewport.policy == "fixed";
@@ -1119,6 +1120,7 @@ mod package_loader_tests {
 
         apply_package_plan(&mut args, "dev.pocket-nexus.packaged", &plan).unwrap();
         assert_eq!(args.app, "packaged-main");
+        assert_eq!(args.app_id.as_deref(), Some("dev.pocket-nexus.packaged"));
         assert_eq!(args.title, "Packaged App");
         assert_eq!(args.viewport, (480, 272));
         assert_eq!(args.density, 2);
