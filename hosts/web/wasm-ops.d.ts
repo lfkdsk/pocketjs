@@ -6,6 +6,15 @@ import type { HostOps } from "../../framework/src/host.ts";
 export declare const FB_W: number;
 export declare const FB_H: number;
 
+export interface WasmDamage {
+  /** Reused logical half-open rectangles ordered [x0, y0, x1, y1, ...]. */
+  readonly rects: Int32Array;
+  /** Number of valid rectangles in rects. Zero means no changed pixels. */
+  readonly count: number;
+  /** Physical samples per logical pixel used by the corresponding render. */
+  readonly scale: number;
+}
+
 export interface WasmUi {
   ops: HostOps;
   exports: WebAssembly.Exports & { memory: WebAssembly.Memory };
@@ -48,6 +57,8 @@ export interface WasmUi {
   renderIncremental(): Uint8Array;
   /** Repaint only changed regions at an integer physical scale. */
   renderScaledIncremental(scale: number): Uint8Array;
+  /** Damage from the most recent primary render; null for an older wasm. */
+  damageRects(scale?: number): WasmDamage | null;
 }
 
 export declare function createWasmUi(

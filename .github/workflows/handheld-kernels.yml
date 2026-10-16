@@ -1,10 +1,10 @@
 name: Handheld device kernels
 on:
   pull_request:
-    paths: ['devices/psp/**', 'hosts/psp/**', 'tests/psp-toolchain.test.ts', 'engine/pocket3d/crates/pocket3d-title/**', 'tests/pocket3d-title.test.ts', 'tests/fixtures/pocket3d-title/**', 'tools/pocket3d-title.ts', 'devices/web/**', 'tests/pocket3d-web.test.ts', 'tests/fixtures/pocket3d-web/**', 'tests/wasm-premultiplied.test.ts', 'tools/pocket3d-web.ts', 'hosts/web/app-instance.js', 'hosts/web/wasm-ops.js', 'engine/wasm/**', 'engine/core/src/raster.rs', '.github/workflows/handheld-kernels.yml']
+    paths: ['devices/psp/**', 'hosts/psp/**', 'tests/psp-toolchain.test.ts', 'engine/pocket3d/crates/pocket3d-title/**', 'tests/pocket3d-title.test.ts', 'tests/fixtures/pocket3d-title/**', 'tools/pocket3d-title.ts', 'devices/web/**', 'tests/pocket3d-web.test.ts', 'tests/fixtures/pocket3d-web/**', 'tests/wasm-premultiplied.test.ts', 'tests/web-dirty-presentation.test.ts', 'tools/pocket3d-web.ts', 'hosts/web/app-instance.js', 'hosts/web/wasm-ops.js', 'hosts/web/canvas-presenter.js', 'engine/wasm/**', 'engine/core/src/raster.rs', '.github/workflows/handheld-kernels.yml']
   push:
     branches: [main]
-    paths: ['devices/psp/**', 'hosts/psp/**', 'tests/psp-toolchain.test.ts', 'engine/pocket3d/crates/pocket3d-title/**', 'tests/pocket3d-title.test.ts', 'tests/fixtures/pocket3d-title/**', 'tools/pocket3d-title.ts', 'devices/web/**', 'tests/pocket3d-web.test.ts', 'tests/fixtures/pocket3d-web/**', 'tests/wasm-premultiplied.test.ts', 'tools/pocket3d-web.ts', 'hosts/web/app-instance.js', 'hosts/web/wasm-ops.js', 'engine/wasm/**', 'engine/core/src/raster.rs', '.github/workflows/handheld-kernels.yml']
+    paths: ['devices/psp/**', 'hosts/psp/**', 'tests/psp-toolchain.test.ts', 'engine/pocket3d/crates/pocket3d-title/**', 'tests/pocket3d-title.test.ts', 'tests/fixtures/pocket3d-title/**', 'tools/pocket3d-title.ts', 'devices/web/**', 'tests/pocket3d-web.test.ts', 'tests/fixtures/pocket3d-web/**', 'tests/wasm-premultiplied.test.ts', 'tests/web-dirty-presentation.test.ts', 'tools/pocket3d-web.ts', 'hosts/web/app-instance.js', 'hosts/web/wasm-ops.js', 'hosts/web/canvas-presenter.js', 'engine/wasm/**', 'engine/core/src/raster.rs', '.github/workflows/handheld-kernels.yml']
 permissions:
   contents: read
 jobs:
@@ -47,4 +47,4 @@ jobs:
       - run: cargo test --locked --manifest-path devices/web/pocket-web-wgpu/Cargo.toml
       - run: cargo check --locked --manifest-path devices/web/pocket-web-wgpu/Cargo.toml --target wasm32-unknown-unknown
       - run: bun tools/wasm.ts
-      - run: bun test tests/pocket3d-web.test.ts tests/wasm-premultiplied.test.ts
+      - run: bun test tests/pocket3d-web.test.ts tests/wasm-premultiplied.test.ts tests/web-dirty-presentation.test.ts

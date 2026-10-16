@@ -14,7 +14,9 @@
 //!   - `ui_render[_scaled]()` performs a compatibility full render.
 //!     `ui_render_incremental[_scaled]()` retains the same RGBA8 framebuffer
 //!     and repaints only changed regions. The returned pointer stays valid
-//!     until the next render or init call on this instance.
+//!     until the next render or init call on this instance. The additive
+//!     `ui_damage_rect_*` exports stage the logical half-open rectangles that
+//!     changed during the most recent primary render.
 //!   - `ui_render_premultiplied_scaled(scale)` rasterizes the same DrawList
 //!     into a buffer of its own that keeps coverage: premultiplied R,G,B and
 //!     the alpha the ops accumulated, for a host that lays the interface over
@@ -28,7 +30,7 @@
 // safety IS the ABI contract (ui_alloc/ui_free above), not a Rust signature.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use pocketjs_core::damage::{DamagePolicy, DamageTracker, DEFAULT_DAMAGE_REGIONS};
+use pocketjs_core::damage::{DamagePolicy, DamageRect, DamageTracker, DEFAULT_DAMAGE_REGIONS};
 use pocketjs_core::Ui;
 
 use pocketjs_core::raster;
@@ -50,6 +52,12 @@ static mut COMPOSITOR_RASTERS: Vec<Option<CompositorRaster>> = Vec::new();
 static mut COMPOSITOR_FRAMES: Vec<u32> = Vec::new();
 static mut ANIMATION_COMPLETIONS: Vec<i32> = Vec::new();
 static mut DAMAGE_TRACKER: DamageTracker<DEFAULT_DAMAGE_REGIONS> = DamageTracker::new();
+/// Logical half-open rectangles changed by the most recent primary render.
+/// The fixed staging array keeps the Web hot path allocation-free. A browser
+/// reads `DAMAGE_RECT_COUNT * 4` i32 values from `ui_damage_rects_ptr()` before
+/// the next render or init call.
+static mut DAMAGE_RECTS: [i32; DEFAULT_DAMAGE_REGIONS * 4] = [0; DEFAULT_DAMAGE_REGIONS * 4];
+static mut DAMAGE_RECT_COUNT: u32 = 0;
 /// wrapText result staging (same lifetime contract as FRAMEBUFFER: the
 /// pointer from `ui_wrap_text_ptr` stays valid until the next wrapText or
 /// init call on this instance).
@@ -91,6 +99,7 @@ pub extern "C" fn ui_init(raster_density: u32) {
         COMPOSITOR_RASTERS.clear();
         COMPOSITOR_FRAMES.clear();
         DAMAGE_TRACKER = DamageTracker::new();
+        DAMAGE_RECT_COUNT = 0;
     }
 }
 
@@ -577,6 +586,25 @@ fn render_composited_words(ui: &Ui, words: &[u32], framebuffer: &mut [u8], scale
     }
 }
 
+fn encode_damage_rects(regions: &[DamageRect], out: &mut [i32; DEFAULT_DAMAGE_REGIONS * 4]) -> u32 {
+    let count = regions.len().min(DEFAULT_DAMAGE_REGIONS);
+    for (index, rect) in regions.iter().take(count).enumerate() {
+        let at = index * 4;
+        out[at..at + 4].copy_from_slice(&[rect.x0, rect.y0, rect.x1, rect.y1]);
+    }
+    count as u32
+}
+
+fn remember_damage(regions: &[DamageRect]) {
+    unsafe {
+        DAMAGE_RECT_COUNT = encode_damage_rects(regions, &mut DAMAGE_RECTS);
+    }
+}
+
+fn remember_full_damage(width: usize, height: usize) {
+    remember_damage(&[DamageRect::new(0, 0, width as i32, height as i32)]);
+}
+
 // ---- DevTools ops (spec ops 18..22, docs/DEVTOOLS.md) -----------------------------
 
 #[no_mangle]
@@ -640,6 +668,7 @@ fn render_at_scale(scale: u32) -> *const u8 {
         // A compatibility full render changed the retained framebuffer
         // outside the incremental tracker's plan/commit transaction.
         DAMAGE_TRACKER.invalidate();
+        remember_full_damage(logical_width, logical_height);
         FRAMEBUFFER.as_ptr()
     }
 }
@@ -667,6 +696,7 @@ fn render_composited_at_scale(scale: u32) -> *const u8 {
         FRAMEBUFFER.resize(bytes, 0);
         render_composited_words(u_ref, &(*dl).words, &mut FRAMEBUFFER, scale);
         DAMAGE_TRACKER.invalidate();
+        remember_full_damage(viewport_w as usize, viewport_h as usize);
         FRAMEBUFFER.as_ptr()
     }
 }
@@ -695,18 +725,20 @@ fn render_incremental_at_scale(scale: u32) -> *const u8 {
     let u_ref: &Ui = unsafe { &*(u as *const Ui) };
     unsafe {
         FRAMEBUFFER.resize(bytes, 0);
-        if raster::render_scaled_incremental(
+        match raster::render_scaled_incremental(
             u_ref,
             &(*dl).words,
             &mut FRAMEBUFFER,
             scale,
             &mut DAMAGE_TRACKER,
             DamagePolicy::default(),
-        )
-        .is_err()
-        {
-            raster::render_scaled(u_ref, &(*dl).words, &mut FRAMEBUFFER, scale);
-            DAMAGE_TRACKER.invalidate();
+        ) {
+            Ok(plan) => remember_damage(plan.regions()),
+            Err(_) => {
+                raster::render_scaled(u_ref, &(*dl).words, &mut FRAMEBUFFER, scale);
+                DAMAGE_TRACKER.invalidate();
+                remember_full_damage(logical_width, logical_height);
+            }
         }
         FRAMEBUFFER.as_ptr()
     }
@@ -791,12 +823,27 @@ pub extern "C" fn ui_render_incremental_scaled(scale: u32) -> *const u8 {
     render_incremental_at_scale(scale)
 }
 
+/// Number of logical half-open rectangles changed by the most recent primary
+/// render. Zero means that an incremental render changed no pixels.
+#[no_mangle]
+pub extern "C" fn ui_damage_rect_count() -> u32 {
+    unsafe { DAMAGE_RECT_COUNT }
+}
+
+/// Pointer to `ui_damage_rect_count() * 4` i32 values ordered
+/// `[x0, y0, x1, y1, ...]`. Valid until the next primary render or init call.
+#[no_mangle]
+pub extern "C" fn ui_damage_rects_ptr() -> *const i32 {
+    unsafe { DAMAGE_RECTS.as_ptr() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        draw_hash, packed_wh, packed_xy, render_composited_words, CompositorRaster,
-        COMPOSITOR_RASTERS,
+        draw_hash, encode_damage_rects, packed_wh, packed_xy, render_composited_words,
+        CompositorRaster, COMPOSITOR_RASTERS,
     };
+    use pocketjs_core::damage::{DamageRect, DEFAULT_DAMAGE_REGIONS};
     use pocketjs_core::{spec, Ui};
 
     #[test]
@@ -805,6 +852,15 @@ mod tests {
         assert_eq!(draw_hash(&words), draw_hash(&words));
         assert_ne!(draw_hash(&words), draw_hash(&[0x0102_0304, 0x0506_0709]));
         assert_ne!(draw_hash(&[]), draw_hash(&words));
+    }
+
+    #[test]
+    fn web_damage_rect_staging_keeps_half_open_region_order() {
+        let regions = [DamageRect::new(1, 2, 8, 9), DamageRect::new(20, 4, 24, 12)];
+        let mut encoded = [0; DEFAULT_DAMAGE_REGIONS * 4];
+        assert_eq!(encode_damage_rects(&regions, &mut encoded), 2);
+        assert_eq!(&encoded[..8], &[1, 2, 8, 9, 20, 4, 24, 12]);
+        assert!(encoded[8..].iter().all(|value| *value == 0));
     }
 
     #[test]

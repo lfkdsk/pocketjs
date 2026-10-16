@@ -163,6 +163,7 @@ const SUITE: readonly Stage[] = [
       "tests/socket-web.test.ts",
       "tests/socket-docs.test.ts",
       "tests/web-system-host.test.ts",
+      "tests/web-dirty-presentation.test.ts",
       "tests/wasm-auxiliary.test.ts",
       "tests/wasm-premultiplied.test.ts",
       "tests/physics.test.ts",

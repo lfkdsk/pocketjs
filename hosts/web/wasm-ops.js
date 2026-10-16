@@ -12,6 +12,7 @@
 
 export const FB_W = 480;
 export const FB_H = 272;
+const MAX_DAMAGE_RECTS = 8;
 
 const encoder = new TextEncoder();
 
@@ -207,6 +208,29 @@ export async function createWasmUi(wasm, options = {}) {
     );
   }
 
+  // Reused view/state: the presentation hot path must not allocate once per
+  // frame. A memory growth detaches the old view, so rebuild it only then.
+  let damageBuffer = null;
+  let damageView = null;
+  const damageState = { rects: null, count: 0, scale: 1 };
+
+  function damageRects(scale = 1) {
+    scale = integerInRange(scale, "render scale", 1, 4);
+    if (!ex.ui_damage_rect_count || !ex.ui_damage_rects_ptr) return null;
+    const count = ex.ui_damage_rect_count();
+    if (count > MAX_DAMAGE_RECTS) {
+      throw new Error(`pocketjs.wasm reported ${count} damage rectangles; maximum is ${MAX_DAMAGE_RECTS}`);
+    }
+    if (damageBuffer !== ex.memory.buffer) {
+      damageBuffer = ex.memory.buffer;
+      damageView = new Int32Array(damageBuffer, ex.ui_damage_rects_ptr(), MAX_DAMAGE_RECTS * 4);
+      damageState.rects = damageView;
+    }
+    damageState.count = count;
+    damageState.scale = scale;
+    return damageState;
+  }
+
   return {
     ops,
     exports: ex,
@@ -339,6 +363,8 @@ export async function createWasmUi(wasm, options = {}) {
         : ex.ui_render_scaled(scale);
       return framebufferView(ptr, scale);
     },
+    /** Logical damage from the most recent primary render; null for older wasm. */
+    damageRects,
   };
 }
 

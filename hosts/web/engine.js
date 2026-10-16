@@ -15,6 +15,7 @@
 //   A = SQUARE         S = TRIANGLE        Shift = SELECT   Space = START
 
 import { createWasmUi, FB_W as DEFAULT_FB_W, FB_H as DEFAULT_FB_H } from "./wasm-ops.js";
+import { createCanvasPresenter } from "./canvas-presenter.js";
 import { drawHud, wasmMemoryBytes } from "./hud.js";
 import { createAudioHost } from "./audio.js";
 import { createNetHost } from "./net.js";
@@ -31,6 +32,10 @@ const RENDER_SCALE = positiveIntParam("scale", 1, 4);
 const RASTER_DENSITY = positiveIntParam("density", RENDER_SCALE, 255);
 const FB_W = LOGICAL_W * RENDER_SCALE;
 const FB_H = LOGICAL_H * RENDER_SCALE;
+const UPLOAD_MODE = query.get("upload") === "full" ? "full" : "dirty";
+// drawHud paints after framebuffer upload. Restore its small backing band on
+// otherwise-dirty frames so repeated translucent pills cannot accumulate.
+const HUD_DAMAGE = { rects: new Int32Array([0, 0, FB_W, 20]), count: 1, scale: 1 };
 const CUSTOM_VIEWPORT =
   LOGICAL_W !== DEFAULT_FB_W || LOGICAL_H !== DEFAULT_FB_H || RENDER_SCALE !== 1;
 
@@ -99,7 +104,7 @@ function packedAnalog() {
 let wasm = null; // createWasmUi result
 let canvas = null;
 let ctx = null;
-let imageData = null;
+let presenter = null;
 let held = 0;
 let rafId = 0;
 let acc = 0;
@@ -234,10 +239,10 @@ function safeFrame() {
 }
 
 function blit() {
-  if (!wasm || !ctx) return;
+  if (!wasm || !ctx || !presenter) return;
   const pixels = wasm.renderScaledIncremental(RENDER_SCALE);
-  imageData.data.set(pixels);
-  ctx.putImageData(imageData, 0, 0);
+  const uploaded = presenter.present(pixels, wasm.damageRects(RENDER_SCALE));
+  if (uploaded !== -1) presenter.present(pixels, HUD_DAMAGE);
   drawHud(ctx, FB_W, FB_H, hudFps, hudMem); // built-in on-canvas overlay
 }
 
@@ -325,7 +330,17 @@ export async function mount(theCanvas, opts = {}) {
   }
   ctx = canvas.getContext("2d");
   ctx.imageSmoothingEnabled = false;
-  imageData = ctx.createImageData(FB_W, FB_H);
+  presenter = createCanvasPresenter(ctx, FB_W, FB_H, { mode: UPLOAD_MODE });
+  canvas.addEventListener("contextlost", (event) => {
+    event.preventDefault();
+    presenter.invalidate();
+  });
+  canvas.addEventListener("contextrestored", () => {
+    ctx = canvas.getContext("2d");
+    ctx.imageSmoothingEnabled = false;
+    presenter.reset(ctx, FB_W, FB_H);
+    blit();
+  });
   window.addEventListener("keydown", onKey(true));
   window.addEventListener("keyup", onKey(false));
   window.addEventListener("blur", () => {
