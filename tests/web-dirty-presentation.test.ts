@@ -94,6 +94,21 @@ test("full and dirty canvas uploads stay pixel-identical for one mutation tape",
   setBoth("node", PROP.bgColor, abgr(68, 210, 132));
   expect(present()).toBeGreaterThan(0);
 
+  // A non-full dirty region may end exactly at the half-open right/bottom
+  // canvas bounds. Its final physical pixel must be copied and uploaded;
+  // clamping x1/y1 to width-1/height-1 would leave this corner stale.
+  const edgeOffset = (subjectCanvas.width * subjectCanvas.height - 1) * 4;
+  const edgePixel = () => Array.from(pixels(subjectCanvas).slice(edgeOffset, edgeOffset + 4));
+  const edgeBefore = edgePixel();
+  setBoth("node", PROP.insetL, width - 4);
+  setBoth("node", PROP.insetT, height - 1);
+  setBoth("node", PROP.bgColor, abgr(230, 190, 40));
+  const callsBeforeEdge = subjectContext.calls.length;
+  expect(present()).toBeGreaterThan(0);
+  expect(subjectContext.calls.slice(callsBeforeEdge).every((count) => count === 7)).toBe(true);
+  expect(edgePixel()).not.toEqual(edgeBefore);
+  expect(edgePixel()).toEqual([230, 190, 40, 255]);
+
   // A root background mutation covers more than the 75% damage policy and
   // must take the explicit full-upload overload, not a whole-screen dirty call.
   setBoth("root", PROP.bgColor, abgr(34, 48, 82));
