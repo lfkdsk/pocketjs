@@ -141,6 +141,7 @@ fn fill_opaque_span<const ARGB: bool>(span: &mut [u8], r: u32, g: u32, b: u32) {
 /// concrete targets differ only in storage format.
 trait RenderTarget {
     fn pixel_len(&self) -> usize;
+    fn write_opaque(&mut self, offset: usize, r: u32, g: u32, b: u32);
     fn blend(&mut self, offset: usize, r: u32, g: u32, b: u32, a: u32);
     fn fill_opaque(&mut self, start: usize, len: usize, r: u32, g: u32, b: u32);
 
@@ -167,19 +168,26 @@ impl<const ARGB: bool> RenderTarget for RgbaTarget<'_, ARGB> {
     }
 
     #[inline]
-    fn blend(&mut self, offset: usize, r: u32, g: u32, b: u32, a: u32) {
+    fn write_opaque(&mut self, offset: usize, r: u32, g: u32, b: u32) {
         let o = offset * 4;
         let (ri, gi, bi, ai) = if ARGB { (2, 1, 0, 3) } else { (0, 1, 2, 3) };
+        self.bytes[o + ri] = r as u8;
+        self.bytes[o + gi] = g as u8;
+        self.bytes[o + bi] = b as u8;
+        self.bytes[o + ai] = 255;
+    }
+
+    #[inline]
+    fn blend(&mut self, offset: usize, r: u32, g: u32, b: u32, a: u32) {
         if a >= 255 {
-            self.bytes[o + ri] = r as u8;
-            self.bytes[o + gi] = g as u8;
-            self.bytes[o + bi] = b as u8;
-            self.bytes[o + ai] = 255;
+            self.write_opaque(offset, r, g, b);
             return;
         }
         if a == 0 {
             return;
         }
+        let o = offset * 4;
+        let (ri, gi, bi, ai) = if ARGB { (2, 1, 0, 3) } else { (0, 1, 2, 3) };
         let ia = 255 - a;
         let mix = |s: u32, d: u8| ((s * a + d as u32 * ia + 127) / 255) as u8;
         self.bytes[o + ri] = mix(r, self.bytes[o + ri]);
@@ -215,18 +223,24 @@ impl RenderTarget for PremultipliedTarget<'_> {
     }
 
     #[inline]
-    fn blend(&mut self, offset: usize, r: u32, g: u32, b: u32, a: u32) {
+    fn write_opaque(&mut self, offset: usize, r: u32, g: u32, b: u32) {
         let o = offset * 4;
+        self.bytes[o] = r as u8;
+        self.bytes[o + 1] = g as u8;
+        self.bytes[o + 2] = b as u8;
+        self.bytes[o + 3] = 255;
+    }
+
+    #[inline]
+    fn blend(&mut self, offset: usize, r: u32, g: u32, b: u32, a: u32) {
         if a >= 255 {
-            self.bytes[o] = r as u8;
-            self.bytes[o + 1] = g as u8;
-            self.bytes[o + 2] = b as u8;
-            self.bytes[o + 3] = 255;
+            self.write_opaque(offset, r, g, b);
             return;
         }
         if a == 0 {
             return;
         }
+        let o = offset * 4;
         let ia = 255 - a;
         let mix = |s: u32, d: u8| ((s * a + d as u32 * ia + 127) / 255) as u8;
         self.bytes[o] = mix(r, self.bytes[o]);
@@ -308,6 +322,11 @@ impl RenderTarget for Rgb565Target<'_> {
     }
 
     #[inline]
+    fn write_opaque(&mut self, offset: usize, r: u32, g: u32, b: u32) {
+        self.pixels[offset] = pack_rgb565(r, g, b);
+    }
+
+    #[inline]
     fn blend(&mut self, offset: usize, r: u32, g: u32, b: u32, a: u32) {
         blend_rgb565_pixel(&mut self.pixels[offset], r, g, b, a);
     }
@@ -341,6 +360,12 @@ impl RenderTarget for Rgb565WindowTarget<'_> {
         // calculations. The actual compact slice is validated by the window
         // entry point below.
         self.full_pixel_len
+    }
+
+    #[inline]
+    fn write_opaque(&mut self, offset: usize, r: u32, g: u32, b: u32) {
+        let offset = self.local_offset(offset);
+        self.pixels[offset] = pack_rgb565(r, g, b);
     }
 
     #[inline]
@@ -1330,7 +1355,243 @@ fn tex_tri<T: RenderTarget>(
 // ---- TEX_QUAD: textured rect (nearest, or integer bilinear when the texture
 //      carries the linear flag) --------------------------------------------------------
 
-fn tex_quad<T: RenderTarget>(
+// The stock viewport's widest supported output is 480 logical pixels at 4x.
+// Wider custom viewports retain the general path rather than allocating in a
+// per-quad hot loop.
+const TEX_QUAD_COLUMN_CAPACITY: usize = spec::SCREEN_W as usize * MAX_RENDER_SCALE as usize;
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn raster_nearest_identity_alpha<T, F>(
+    target: &mut T,
+    stride: i32,
+    view: &TexView<'_>,
+    columns: &[u16],
+    x0: i32,
+    y0: i32,
+    y1: i32,
+    quad_y: i32,
+    quad_h: i32,
+    v0: f32,
+    v1: f32,
+    sample: F,
+) where
+    T: RenderTarget,
+    F: Fn(usize) -> (u32, u32, u32, u32),
+{
+    let thf = view.h as f32;
+    let th_max = view.h as i32 - 1;
+    let inv_h = 1.0f32 / quad_h as f32;
+    for py in y0..y1 {
+        let v = v0 + (v1 - v0) * ((py - quad_y) as f32 + 0.5) * inv_h;
+        let ty = ((v * thf) as i32).clamp(0, th_max);
+        let texture_row = ty as usize * view.w as usize;
+        let mut offset = (py * stride + x0) as usize;
+        for &tx in columns {
+            let (r, g, b, a) = sample(texture_row + tx as usize);
+            if a >= 255 {
+                target.write_opaque(offset, r, g, b);
+            } else if a != 0 {
+                target.blend(offset, r, g, b, a);
+            }
+            offset += 1;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn raster_nearest_identity_opaque<T, F>(
+    target: &mut T,
+    stride: i32,
+    view: &TexView<'_>,
+    columns: &[u16],
+    x0: i32,
+    y0: i32,
+    y1: i32,
+    quad_y: i32,
+    quad_h: i32,
+    v0: f32,
+    v1: f32,
+    sample: F,
+) where
+    T: RenderTarget,
+    F: Fn(usize) -> (u32, u32, u32),
+{
+    let thf = view.h as f32;
+    let th_max = view.h as i32 - 1;
+    let inv_h = 1.0f32 / quad_h as f32;
+    for py in y0..y1 {
+        let v = v0 + (v1 - v0) * ((py - quad_y) as f32 + 0.5) * inv_h;
+        let ty = ((v * thf) as i32).clamp(0, th_max);
+        let texture_row = ty as usize * view.w as usize;
+        let mut offset = (py * stride + x0) as usize;
+        for &tx in columns {
+            let (r, g, b) = sample(texture_row + tx as usize);
+            target.write_opaque(offset, r, g, b);
+            offset += 1;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tex_quad_nearest_identity<T: RenderTarget>(
+    target: &mut T,
+    stride: i32,
+    view: TexView<'_>,
+    clip: Clip,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+) -> bool {
+    let column_count = (clip.x1 - clip.x0) as usize;
+    if column_count > TEX_QUAD_COLUMN_CAPACITY
+        || view.w == 0
+        || view.h == 0
+        || view.w > u16::MAX as u32
+    {
+        return false;
+    }
+
+    // Only the prefix `column_count` is read below. MaybeUninit avoids
+    // clearing all 1,920 entries for every small sprite while keeping the hot
+    // path allocation-free on wasm, PSP, and desktop hosts.
+    let mut column_storage = [core::mem::MaybeUninit::<u16>::uninit(); TEX_QUAD_COLUMN_CAPACITY];
+    let twf = view.w as f32;
+    let tw_max = view.w as i32 - 1;
+    let inv_w = 1.0f32 / w as f32;
+    for (index, px) in (clip.x0..clip.x1).enumerate() {
+        // Keep the reference expression and operation order. Replacing this
+        // with an accumulated fixed/floating step changes boundary samples.
+        let u = u0 + (u1 - u0) * ((px - x) as f32 + 0.5) * inv_w;
+        let tx = ((u * twf) as i32).clamp(0, tw_max);
+        column_storage[index].write(tx as u16);
+    }
+    // SAFETY: the loop above initializes precisely `column_count` consecutive
+    // entries, and MaybeUninit<u16> has the same layout as u16.
+    let columns =
+        unsafe { core::slice::from_raw_parts(column_storage.as_ptr().cast::<u16>(), column_count) };
+
+    match view.psm {
+        spec::psm::PSM_5650 => {
+            let pixels = view.pixels;
+            raster_nearest_identity_opaque(
+                target,
+                stride,
+                &view,
+                columns,
+                clip.x0,
+                clip.y0,
+                clip.y1,
+                y,
+                h,
+                v0,
+                v1,
+                |index| {
+                    let offset = index * 2;
+                    let pixel = pixels[offset] as u32 | ((pixels[offset + 1] as u32) << 8);
+                    let r5 = pixel & 0x1f;
+                    let g6 = (pixel >> 5) & 0x3f;
+                    let b5 = (pixel >> 11) & 0x1f;
+                    (
+                        (r5 << 3) | (r5 >> 2),
+                        (g6 << 2) | (g6 >> 4),
+                        (b5 << 3) | (b5 >> 2),
+                    )
+                },
+            );
+        }
+        spec::psm::PSM_8888 => {
+            let pixels = view.pixels;
+            raster_nearest_identity_alpha(
+                target,
+                stride,
+                &view,
+                columns,
+                clip.x0,
+                clip.y0,
+                clip.y1,
+                y,
+                h,
+                v0,
+                v1,
+                |index| {
+                    let offset = index * 4;
+                    (
+                        pixels[offset] as u32,
+                        pixels[offset + 1] as u32,
+                        pixels[offset + 2] as u32,
+                        pixels[offset + 3] as u32,
+                    )
+                },
+            );
+        }
+        spec::psm::PSM_4444 => {
+            let pixels = view.pixels;
+            raster_nearest_identity_alpha(
+                target,
+                stride,
+                &view,
+                columns,
+                clip.x0,
+                clip.y0,
+                clip.y1,
+                y,
+                h,
+                v0,
+                v1,
+                |index| {
+                    let offset = index * 2;
+                    let pixel = pixels[offset] as u32 | ((pixels[offset + 1] as u32) << 8);
+                    (
+                        (pixel & 0xf) * 17,
+                        ((pixel >> 4) & 0xf) * 17,
+                        ((pixel >> 8) & 0xf) * 17,
+                        ((pixel >> 12) & 0xf) * 17,
+                    )
+                },
+            );
+        }
+        spec::psm::PSM_T8 => {
+            let Some(palette) = view.palette else {
+                // The reference sampler aborts this op before its first write.
+                return true;
+            };
+            let pixels = view.pixels;
+            raster_nearest_identity_alpha(
+                target,
+                stride,
+                &view,
+                columns,
+                clip.x0,
+                clip.y0,
+                clip.y1,
+                y,
+                h,
+                v0,
+                v1,
+                |index| {
+                    let offset = pixels[index] as usize * 4;
+                    (
+                        palette[offset] as u32,
+                        palette[offset + 1] as u32,
+                        palette[offset + 2] as u32,
+                        palette[offset + 3] as u32,
+                    )
+                },
+            );
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn tex_quad_impl<T: RenderTarget, const FAST: bool>(
     ui: &impl RenderResources,
     target: &mut T,
     stride: i32,
@@ -1361,8 +1622,16 @@ fn tex_quad<T: RenderTarget>(
     if c.x0 >= c.x1 || c.y0 >= c.y1 {
         return;
     }
-    let (mr, mg, mb, ma) = channels(modulate);
     let identity = modulate == 0xffff_ffff;
+    if FAST
+        && identity
+        && !view.linear
+        && tex_quad_nearest_identity(target, stride, view, c, x, y, w, h, u0, v0, u1, v1)
+    {
+        return;
+    }
+
+    let (mr, mg, mb, ma) = channels(modulate);
     let (twf, thf) = (view.w as f32, view.h as f32);
     let (tw_max, th_max) = (view.w as i32 - 1, view.h as i32 - 1);
     let inv_w = 1.0f32 / w as f32;
@@ -1393,6 +1662,17 @@ fn tex_quad<T: RenderTarget>(
             target.blend((py * stride + px) as usize, r, g, b, a);
         }
     }
+}
+
+fn tex_quad<T: RenderTarget>(
+    ui: &impl RenderResources,
+    target: &mut T,
+    stride: i32,
+    scale: i32,
+    clip: Clip,
+    p: &[u32],
+) {
+    tex_quad_impl::<T, true>(ui, target, stride, scale, clip, p);
 }
 
 #[cfg(test)]
@@ -2113,6 +2393,304 @@ mod tests {
         for y in 0..4 {
             for x in 0..4 {
                 assert_eq!(rgba(&fb, 2, 6 + x, y)[0], coverage[y * 4 + x]);
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u32 {
+            let mut value = self.0;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            self.0 = value;
+            value as u32
+        }
+
+        fn below(&mut self, limit: u32) -> u32 {
+            self.next() % limit
+        }
+    }
+
+    fn differential_texture(psm: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if psm == spec::psm::PSM_T8 {
+            for index in 0..256u32 {
+                let alpha = match index & 3 {
+                    0 => 0,
+                    1 => 255,
+                    2 => 119,
+                    _ => 238,
+                };
+                bytes.extend_from_slice(&[
+                    index as u8,
+                    index.wrapping_mul(29) as u8,
+                    index.wrapping_mul(73) as u8,
+                    alpha,
+                ]);
+            }
+            bytes.extend((0..64u8).map(|index| index.wrapping_mul(37)));
+            return bytes;
+        }
+        for index in 0..64u32 {
+            let r = index.wrapping_mul(47) as u8;
+            let g = index.wrapping_mul(83) as u8;
+            let b = index.wrapping_mul(131) as u8;
+            match psm {
+                spec::psm::PSM_5650 => {
+                    let pixel = (r as u16 >> 3)
+                        | ((g as u16 >> 2) << 5)
+                        | ((b as u16 >> 3) << 11);
+                    bytes.extend_from_slice(&pixel.to_le_bytes());
+                }
+                spec::psm::PSM_8888 => {
+                    let alpha = [0, 255, 127, 238][index as usize & 3];
+                    bytes.extend_from_slice(&[r, g, b, alpha]);
+                }
+                spec::psm::PSM_4444 => {
+                    let alpha = [0u16, 15, 7, 14][index as usize & 3];
+                    let pixel = (r as u16 >> 4)
+                        | ((g as u16 >> 4) << 4)
+                        | ((b as u16 >> 4) << 8)
+                        | (alpha << 12);
+                    bytes.extend_from_slice(&pixel.to_le_bytes());
+                }
+                _ => unreachable!(),
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn nearest_identity_fast_path_matches_reference_randomized_streams() {
+        const LOGICAL_WIDTH: i32 = 19;
+        const LOGICAL_HEIGHT: i32 = 13;
+        const UVS: [f32; 10] = [-0.75, -0.125, 0.0, 0.0625, 0.25, 0.5, 0.9375, 1.0, 1.125, 1.75];
+        const MODULATIONS: [u32; 5] = [
+            0xffff_ffff,
+            0xffff_ffff,
+            0x80ff_ffff,
+            0xff7f_bf3f,
+            0x00ff_ffff,
+        ];
+
+        let mut ui = Ui::new();
+        ui.set_viewport(LOGICAL_WIDTH as f32, LOGICAL_HEIGHT as f32);
+        let mut handles = Vec::new();
+        for psm in [
+            spec::psm::PSM_5650,
+            spec::psm::PSM_8888,
+            spec::psm::PSM_4444,
+            spec::psm::PSM_T8,
+        ] {
+            let bytes = differential_texture(psm);
+            for flags in [0, spec::img::FLAG_LINEAR] {
+                let handle = ui.upload_texture_flags(&bytes, 8, 8, psm, flags);
+                assert!(handle >= 0);
+                handles.push(handle);
+            }
+        }
+
+        let mut rng = TestRng(0xd1ff_e2e7_1a1c_5eed);
+        for scale in [1, 2, 3] {
+            let stride = LOGICAL_WIDTH * scale;
+            let height = LOGICAL_HEIGHT * scale;
+            let pixel_count = (stride * height) as usize;
+            let random_bytes = |rng: &mut TestRng| {
+                (0..pixel_count * 4)
+                    .map(|_| rng.next() as u8)
+                    .collect::<Vec<_>>()
+            };
+            let rgba_initial = random_bytes(&mut rng);
+            let argb_initial = random_bytes(&mut rng);
+            let premultiplied_initial = random_bytes(&mut rng);
+            let rgb565_initial = (0..pixel_count)
+                .map(|_| rng.next() as u16)
+                .collect::<Vec<_>>();
+
+            let mut rgba_fast = rgba_initial.clone();
+            let mut rgba_reference = rgba_initial;
+            let mut argb_fast = argb_initial.clone();
+            let mut argb_reference = argb_initial;
+            let mut premultiplied_fast = premultiplied_initial.clone();
+            let mut premultiplied_reference = premultiplied_initial;
+            let mut rgb565_fast = rgb565_initial.clone();
+            let mut rgb565_reference = rgb565_initial;
+
+            let window = Clip {
+                x0: 2 * scale,
+                y0: scale,
+                x1: (LOGICAL_WIDTH - 2) * scale,
+                y1: (LOGICAL_HEIGHT - 1) * scale,
+            };
+            let window_width = (window.x1 - window.x0) as usize;
+            let window_height = (window.y1 - window.y0) as usize;
+            let window_initial = (0..window_width * window_height)
+                .map(|_| rng.next() as u16)
+                .collect::<Vec<_>>();
+            let mut window_fast = window_initial.clone();
+            let mut window_reference = window_initial;
+
+            for iteration in 0..384usize {
+                let x = rng.below((LOGICAL_WIDTH + 17) as u32) as i32 - 8;
+                let y = rng.below((LOGICAL_HEIGHT + 13) as u32) as i32 - 6;
+                let width = if iteration % 31 == 0 { 0 } else { rng.below(27) + 1 };
+                let quad_height = if iteration % 37 == 0 { 0 } else { rng.below(21) + 1 };
+                let u0 = UVS[rng.below(UVS.len() as u32) as usize];
+                let v0 = UVS[rng.below(UVS.len() as u32) as usize];
+                let u1 = UVS[rng.below(UVS.len() as u32) as usize];
+                let v1 = UVS[rng.below(UVS.len() as u32) as usize];
+                let p = [
+                    handles[iteration % handles.len()] as u32,
+                    xy_word(x as i16, y as i16),
+                    wh_word(width as u16, quad_height as u16),
+                    u0.to_bits(),
+                    v0.to_bits(),
+                    u1.to_bits(),
+                    v1.to_bits(),
+                    MODULATIONS[iteration % MODULATIONS.len()],
+                ];
+
+                let screen = Clip { x0: 0, y0: 0, x1: stride, y1: height };
+                let clip = match iteration % 5 {
+                    0 => screen,
+                    1 => Clip {
+                        x0: rng.below(stride as u32) as i32,
+                        y0: 0,
+                        x1: stride,
+                        y1: height,
+                    },
+                    2 => Clip {
+                        x0: 0,
+                        y0: rng.below(height as u32) as i32,
+                        x1: stride,
+                        y1: height,
+                    },
+                    _ => {
+                        let x0 = rng.below(stride as u32) as i32;
+                        let y0 = rng.below(height as u32) as i32;
+                        Clip {
+                            x0,
+                            y0,
+                            x1: x0 + 1 + rng.below((stride - x0) as u32) as i32,
+                            y1: y0 + 1 + rng.below((height - y0) as u32) as i32,
+                        }
+                    }
+                };
+
+                tex_quad_impl::<_, true>(
+                    &ui,
+                    &mut RgbaTarget::<false> { bytes: &mut rgba_fast },
+                    stride,
+                    scale,
+                    clip,
+                    &p,
+                );
+                tex_quad_impl::<_, false>(
+                    &ui,
+                    &mut RgbaTarget::<false> { bytes: &mut rgba_reference },
+                    stride,
+                    scale,
+                    clip,
+                    &p,
+                );
+                tex_quad_impl::<_, true>(
+                    &ui,
+                    &mut RgbaTarget::<true> { bytes: &mut argb_fast },
+                    stride,
+                    scale,
+                    clip,
+                    &p,
+                );
+                tex_quad_impl::<_, false>(
+                    &ui,
+                    &mut RgbaTarget::<true> { bytes: &mut argb_reference },
+                    stride,
+                    scale,
+                    clip,
+                    &p,
+                );
+                tex_quad_impl::<_, true>(
+                    &ui,
+                    &mut PremultipliedTarget { bytes: &mut premultiplied_fast },
+                    stride,
+                    scale,
+                    clip,
+                    &p,
+                );
+                tex_quad_impl::<_, false>(
+                    &ui,
+                    &mut PremultipliedTarget { bytes: &mut premultiplied_reference },
+                    stride,
+                    scale,
+                    clip,
+                    &p,
+                );
+                tex_quad_impl::<_, true>(
+                    &ui,
+                    &mut Rgb565Target { pixels: &mut rgb565_fast },
+                    stride,
+                    scale,
+                    clip,
+                    &p,
+                );
+                tex_quad_impl::<_, false>(
+                    &ui,
+                    &mut Rgb565Target { pixels: &mut rgb565_reference },
+                    stride,
+                    scale,
+                    clip,
+                    &p,
+                );
+
+                let window_clip = clip.intersect(window);
+                let mut fast_target = Rgb565WindowTarget {
+                    pixels: &mut window_fast,
+                    full_stride: stride as usize,
+                    full_pixel_len: pixel_count,
+                    origin_x: window.x0 as usize,
+                    origin_y: window.y0 as usize,
+                    width: window_width,
+                    height: window_height,
+                };
+                let mut reference_target = Rgb565WindowTarget {
+                    pixels: &mut window_reference,
+                    full_stride: stride as usize,
+                    full_pixel_len: pixel_count,
+                    origin_x: window.x0 as usize,
+                    origin_y: window.y0 as usize,
+                    width: window_width,
+                    height: window_height,
+                };
+                tex_quad_impl::<_, true>(
+                    &ui,
+                    &mut fast_target,
+                    stride,
+                    scale,
+                    window_clip,
+                    &p,
+                );
+                tex_quad_impl::<_, false>(
+                    &ui,
+                    &mut reference_target,
+                    stride,
+                    scale,
+                    window_clip,
+                    &p,
+                );
+
+                let context = format!("scale {scale}, instruction {iteration}, words {p:?}");
+                assert_eq!(rgba_fast, rgba_reference, "RGBA {context}");
+                assert_eq!(argb_fast, argb_reference, "ARGB {context}");
+                assert_eq!(
+                    premultiplied_fast, premultiplied_reference,
+                    "premultiplied {context}"
+                );
+                assert_eq!(rgb565_fast, rgb565_reference, "RGB565 {context}");
+                assert_eq!(window_fast, window_reference, "RGB565 window {context}");
             }
         }
     }
