@@ -48,7 +48,7 @@ use crate::damage::{
 };
 use crate::resources::RenderResources;
 use crate::spec::{self, draw_op};
-use crate::TexView;
+use crate::{TexView, TEX_ALPHA_MIXED, TEX_ALPHA_OPAQUE, TEX_ALPHA_TRANSPARENT};
 #[cfg(test)]
 use crate::Ui;
 
@@ -1614,6 +1614,89 @@ fn raster_nearest_identity_alpha<T, S>(
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
+fn raster_nearest_identity_opaque_sampled<T, S>(
+    target: &mut T,
+    stride: i32,
+    view: &TexView<'_>,
+    columns: &[u16],
+    x0: i32,
+    y0: i32,
+    y1: i32,
+    quad_y: i32,
+    quad_h: i32,
+    v0: f32,
+    v1: f32,
+) where
+    T: RenderTarget,
+    S: NearestAlphaSampler,
+{
+    let thf = view.h as f32;
+    let th_max = view.h as i32 - 1;
+    let inv_h = 1.0f32 / quad_h as f32;
+    let palette = view.palette.unwrap_or(&[]);
+    let mut previous_ty = i32::MIN;
+    for py in y0..y1 {
+        let v = v0 + (v1 - v0) * ((py - quad_y) as f32 + 0.5) * inv_h;
+        let ty = ((v * thf) as i32).clamp(0, th_max);
+        let texture_row = ty as usize * view.w as usize;
+        let row_offset = (py * stride + x0) as usize;
+        if ty == previous_ty {
+            target.copy_opaque(
+                row_offset - stride as usize,
+                row_offset,
+                columns.len(),
+            );
+            note_tex_quad_row_copy(columns.len());
+            continue;
+        }
+        let mut start = 0;
+        while start < columns.len() {
+            let tx = columns[start];
+            let mut end = start + 1;
+            while end < columns.len() && columns[end] == tx {
+                end += 1;
+            }
+            let (r, g, b, a) = S::sample(view.pixels, palette, texture_row + tx as usize);
+            debug_assert_eq!(a, 255);
+            write_opaque_run(target, row_offset + start, end - start, r, g, b);
+            start = end;
+        }
+        previous_ty = ty;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn raster_nearest_identity_classified<T, S>(
+    target: &mut T,
+    stride: i32,
+    view: &TexView<'_>,
+    columns: &[u16],
+    x0: i32,
+    y0: i32,
+    y1: i32,
+    quad_y: i32,
+    quad_h: i32,
+    v0: f32,
+    v1: f32,
+) where
+    T: RenderTarget,
+    S: NearestAlphaSampler,
+{
+    match view.alpha_class {
+        TEX_ALPHA_TRANSPARENT => {}
+        TEX_ALPHA_OPAQUE => raster_nearest_identity_opaque_sampled::<T, S>(
+            target, stride, view, columns, x0, y0, y1, quad_y, quad_h, v0, v1,
+        ),
+        TEX_ALPHA_MIXED => raster_nearest_identity_alpha::<T, S>(
+            target, stride, view, columns, x0, y0, y1, quad_y, quad_h, v0, v1,
+        ),
+        _ => unreachable!(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn raster_nearest_identity_5650<T: RenderTarget>(
     target: &mut T,
     stride: i32,
@@ -1720,13 +1803,13 @@ fn tex_quad_nearest_identity<T: RenderTarget>(
         }
         spec::psm::PSM_8888 => {
             note_tex_quad_format(1);
-            raster_nearest_identity_alpha::<T, Psm8888Sampler>(
+            raster_nearest_identity_classified::<T, Psm8888Sampler>(
                 target, stride, &view, columns, clip.x0, clip.y0, clip.y1, y, h, v0, v1,
             );
         }
         spec::psm::PSM_4444 => {
             note_tex_quad_format(2);
-            raster_nearest_identity_alpha::<T, Psm4444Sampler>(
+            raster_nearest_identity_classified::<T, Psm4444Sampler>(
                 target, stride, &view, columns, clip.x0, clip.y0, clip.y1, y, h, v0, v1,
             );
         }
@@ -1736,7 +1819,7 @@ fn tex_quad_nearest_identity<T: RenderTarget>(
                 return true;
             }
             note_tex_quad_format(3);
-            raster_nearest_identity_alpha::<T, PsmT8Sampler>(
+            raster_nearest_identity_classified::<T, PsmT8Sampler>(
                 target, stride, &view, columns, clip.x0, clip.y0, clip.y1, y, h, v0, v1,
             );
         }
@@ -2616,6 +2699,79 @@ mod tests {
             }
         }
         bytes
+    }
+
+    #[test]
+    fn texture_alpha_metadata_preserves_opaque_and_transparent_fast_paths() {
+        let mut ui = Ui::new();
+        ui.set_viewport(6.0, 5.0);
+        let opaque_rgba = [
+            10, 20, 30, 255, 40, 50, 60, 255,
+            70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        let opaque = ui.upload_texture(&opaque_rgba, 2, 2, spec::psm::PSM_8888);
+        assert_eq!(ui.texture(opaque).unwrap().alpha_class, TEX_ALPHA_OPAQUE);
+
+        let mut palette = vec![0u8; 1024];
+        for index in 0..256 {
+            palette[index * 4] = index as u8;
+            palette[index * 4 + 1] = (index as u8).wrapping_mul(17);
+            palette[index * 4 + 2] = (index as u8).wrapping_mul(29);
+        }
+        let indices = [0, 1, 2, 3];
+        let mut transparent_t8 = palette.clone();
+        transparent_t8.extend_from_slice(&indices);
+        let transparent = ui.upload_texture(&transparent_t8, 2, 2, spec::psm::PSM_T8);
+        assert_eq!(
+            ui.texture(transparent).unwrap().alpha_class,
+            TEX_ALPHA_TRANSPARENT
+        );
+
+        for handle in [opaque, transparent] {
+            for scale in [1, 2, 3] {
+                let stride = 6 * scale;
+                let height = 5 * scale;
+                let initial = (0..(stride * height * 4) as usize)
+                    .map(|index| (index as u8).wrapping_mul(43).wrapping_add(5))
+                    .collect::<Vec<_>>();
+                let mut fast = initial.clone();
+                let mut reference = initial;
+                let p = [
+                    handle as u32,
+                    xy_word(-1, -1),
+                    wh_word(7, 6),
+                    0.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    0xffff_ffff,
+                ];
+                let clip = Clip { x0: 1, y0: 1, x1: stride - 1, y1: height - 1 };
+                tex_quad_impl::<_, true>(
+                    &ui,
+                    &mut RgbaTarget::<false> { bytes: &mut fast },
+                    stride,
+                    scale,
+                    clip,
+                    &p,
+                );
+                tex_quad_impl::<_, false>(
+                    &ui,
+                    &mut RgbaTarget::<false> { bytes: &mut reference },
+                    stride,
+                    scale,
+                    clip,
+                    &p,
+                );
+                assert_eq!(fast, reference, "handle {handle}, scale {scale}");
+            }
+        }
+
+        for entry in palette.chunks_exact_mut(4) {
+            entry[3] = 255;
+        }
+        assert!(ui.update_texture_t8(transparent, &palette, &indices));
+        assert_eq!(ui.texture(transparent).unwrap().alpha_class, TEX_ALPHA_OPAQUE);
     }
 
     #[test]

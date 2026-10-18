@@ -576,7 +576,7 @@ pub(crate) fn glyph_page(
         for (a, color) in colors.iter_mut().enumerate() { *color = 0x00ff_ffff | ((a as u32) << 24); }
         let handle = crate::tex_alloc(textures, free, crate::Texture {
             data, byte_len, w: width, h: height, psm: spec::psm::PSM_T8,
-            palette: Some(palette), linear: true, revision: 0,
+            palette: Some(palette), linear: true, alpha_class: crate::TEX_ALPHA_MIXED, revision: 0,
         });
         if handle < 0 { return None; }
         cache.glyphs.push(GlyphPage { slot: atlas.slot, revision, page, handle, width, height });
@@ -674,6 +674,7 @@ fn disc_texture(
             // collapses to the nearest texel, so golden-pinned output is
             // byte-identical.
             linear: true,
+            alpha_class: crate::TEX_ALPHA_MIXED,
             revision: 0,
         },
     );
@@ -2214,7 +2215,8 @@ impl<'a> Walker<'a> {
         }
         let handle = crate::tex_alloc(self.textures, self.tex_free, crate::Texture {
             data, byte_len: (tw * th * 4) as usize, w: tw, h: th,
-            psm: spec::psm::PSM_8888, palette: None, linear: true, revision: 0,
+            psm: spec::psm::PSM_8888, palette: None, linear: true,
+            alpha_class: crate::TEX_ALPHA_MIXED, revision: 0,
         });
         if handle < 0 { return None; }
         self.paint_cache.borders.push((key, handle));

@@ -1054,6 +1054,7 @@ mod tests {
             psm,
             palette,
             linear: false,
+            alpha_class: pocketjs_core::TEX_ALPHA_MIXED,
         }
     }
 

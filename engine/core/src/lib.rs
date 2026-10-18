@@ -103,6 +103,10 @@ pub struct Texture {
     /// Sample with bilinear filtering (spec::img::FLAG_LINEAR). Pure sampling
     /// hint for backends — the pixel bytes are identical either way.
     pub linear: bool,
+    /// Whole-texture alpha classification, computed when pixels change.
+    /// The software nearest sampler uses this to skip transparent textures
+    /// and avoid per-pixel alpha classification for opaque textures.
+    alpha_class: u8,
     /// Changes only when this live texture's bytes are overwritten in place.
     ///
     /// Generation-tagged handles catch free/reuse, while this revision lets
@@ -134,8 +138,51 @@ impl Texture {
             psm: self.psm,
             palette: self.palette(),
             linear: self.linear,
+            alpha_class: self.alpha_class,
         }
     }
+}
+
+pub const TEX_ALPHA_TRANSPARENT: u8 = 0;
+pub const TEX_ALPHA_MIXED: u8 = 1;
+pub const TEX_ALPHA_OPAQUE: u8 = 2;
+
+fn texture_alpha_class(psm: u32, pixels: &[u8], palette: Option<&[u8]>) -> u8 {
+    if psm == spec::psm::PSM_5650 {
+        return TEX_ALPHA_OPAQUE;
+    }
+    let mut saw_transparent = false;
+    let mut saw_opaque = false;
+    for index in 0..pixels.len() / match psm {
+        spec::psm::PSM_8888 => 4,
+        spec::psm::PSM_4444 => 2,
+        spec::psm::PSM_T8 => 1,
+        _ => return TEX_ALPHA_MIXED,
+    } {
+        let alpha = match psm {
+            spec::psm::PSM_8888 => pixels[index * 4 + 3] as u32,
+            spec::psm::PSM_4444 => {
+                let offset = index * 2;
+                ((pixels[offset + 1] >> 4) as u32) * 17
+            }
+            spec::psm::PSM_T8 => {
+                let Some(palette) = palette else { return TEX_ALPHA_MIXED };
+                palette[pixels[index] as usize * 4 + 3] as u32
+            }
+            _ => unreachable!(),
+        };
+        if alpha == 0 {
+            saw_transparent = true;
+        } else if alpha == 255 {
+            saw_opaque = true;
+        } else {
+            return TEX_ALPHA_MIXED;
+        }
+        if saw_transparent && saw_opaque {
+            return TEX_ALPHA_MIXED;
+        }
+    }
+    if saw_opaque { TEX_ALPHA_OPAQUE } else { TEX_ALPHA_TRANSPARENT }
 }
 
 /// Borrowed view of one live texture (what backends sample — see
@@ -151,6 +198,8 @@ pub struct TexView<'a> {
     pub palette: Option<&'a [u8]>,
     /// Bilinear sampling hint (spec::img::FLAG_LINEAR); nearest otherwise.
     pub linear: bool,
+    /// One of TEX_ALPHA_{TRANSPARENT,MIXED,OPAQUE}.
+    pub alpha_class: u8,
 }
 
 /// One texture slot. `gen` tags outstanding handles (bumped on free, so a
@@ -1000,6 +1049,13 @@ impl Ui {
             }
             copy_aligned(stream, byte_len)
         };
+        let pixels = unsafe {
+            core::slice::from_raw_parts(chunks.as_ptr() as *const u8, byte_len)
+        };
+        let palette_bytes = palette.as_ref().map(|value| unsafe {
+            core::slice::from_raw_parts(value.as_ptr() as *const u8, TEX_PALETTE_BYTES)
+        });
+        let alpha_class = texture_alpha_class(psm, pixels, palette_bytes);
         let tex = Texture {
             data: chunks,
             byte_len,
@@ -1008,6 +1064,7 @@ impl Ui {
             psm,
             palette,
             linear: flags & spec::img::FLAG_LINEAR != 0,
+            alpha_class,
             revision: 0,
         };
         let handle = tex_alloc(&mut self.textures, &mut self.tex_free, tex);
@@ -1098,6 +1155,7 @@ impl Ui {
                 tex.byte_len,
             );
         }
+        tex.alpha_class = texture_alpha_class(tex.psm, tex.pixels(), tex.palette());
         tex.revision = tex.revision.wrapping_add(1);
         self.bump_raster_revision();
         true
