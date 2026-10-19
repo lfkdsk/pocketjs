@@ -79,6 +79,11 @@ pub const STYLE_PROPS: &[(&str, u8, &str)] = &[
     ("arcWidth", 142, "f32"),
     ("skewX", 143, "f32"),
     ("spriteClock", 144, "i32"),
+    ("blendMode", 145, "i32"),
+    ("toneR", 146, "i32"),
+    ("toneG", 147, "i32"),
+    ("toneB", 148, "i32"),
+    ("toneGray", 149, "i32"),
 ];
 pub const HOST_ATTRIBUTES: &[(&str, &[&str])] = &[
     ("View", &["class", "style", "focusable", "debug-name"]),

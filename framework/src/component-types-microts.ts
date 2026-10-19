@@ -74,6 +74,11 @@ export interface MicroTsStyleProps {
   arcWidth?: Px | MicroTsIntegerInput;
   skewX?: Deg | MicroTsIntegerInput;
   spriteClock?: i32;
+  blendMode?: i32;
+  toneR?: i32;
+  toneG?: i32;
+  toneB?: i32;
+  toneGray?: i32;
 }
 export interface MicroTsViewBaseProps {
   "class"?: MicroTsValue<string>;

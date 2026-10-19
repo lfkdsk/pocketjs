@@ -313,6 +313,9 @@ pub struct Resolved {
     /// Explicit animated-sprite reference clock for this subtree. u32::MAX
     /// means inherit, or use the legacy host-vblank clock at the root.
     pub sprite_clock: u32,
+    /// Image-only effects; default values leave the historical paint path untouched.
+    pub blend_mode: u32,
+    pub tone: [i32; 4],
 }
 
 impl Default for Resolved {
@@ -379,6 +382,8 @@ impl Default for Resolved {
             arc_width: 0.0,
             skew_x: 0.0,
             sprite_clock: u32::MAX,
+            blend_mode: 0,
+            tone: [0; 4],
         }
     }
 }
@@ -475,6 +480,11 @@ impl Resolved {
             p::ARC_WIDTH => self.arc_width = f,
             p::SKEW_X => self.skew_x = f,
             p::SPRITE_CLOCK => self.sprite_clock = bits,
+            p::BLEND_MODE => self.blend_mode = bits.min(3),
+            p::TONE_R => self.tone[0] = (bits as i32).clamp(-255, 255),
+            p::TONE_G => self.tone[1] = (bits as i32).clamp(-255, 255),
+            p::TONE_B => self.tone[2] = (bits as i32).clamp(-255, 255),
+            p::TONE_GRAY => self.tone[3] = (bits as i32).clamp(0, 255),
             _ => {}
         }
     }
@@ -554,6 +564,11 @@ impl Resolved {
             p::ARC_WIDTH => self.arc_width.to_bits(),
             p::SKEW_X => self.skew_x.to_bits(),
             p::SPRITE_CLOCK => self.sprite_clock,
+            p::BLEND_MODE => self.blend_mode,
+            p::TONE_R => self.tone[0] as u32,
+            p::TONE_G => self.tone[1] as u32,
+            p::TONE_B => self.tone[2] as u32,
+            p::TONE_GRAY => self.tone[3] as u32,
             _ => 0,
         }
     }

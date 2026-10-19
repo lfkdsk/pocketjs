@@ -143,6 +143,24 @@ trait RenderTarget {
     fn pixel_len(&self) -> usize;
     fn write_opaque(&mut self, offset: usize, r: u32, g: u32, b: u32);
     fn blend(&mut self, offset: usize, r: u32, g: u32, b: u32, a: u32);
+    /// Destination in straight 8-bit colour, for optional textured effects.
+    fn read_rgb(&self, offset: usize) -> (u32, u32, u32);
+    #[inline]
+    fn blend_effect(&mut self, offset: usize, rgb: (u32, u32, u32), a: u32, mode: u32) {
+        let (r, g, b) = rgb;
+        if mode == 0 {
+            self.blend(offset, r, g, b, a);
+            return;
+        }
+        let (dr, dg, db) = self.read_rgb(offset);
+        let channel = |s: u32, d: u32| match mode {
+            1 => (s + d).min(255),
+            2 => (s * d + 127) / 255,
+            3 => 255 - ((255 - s) * (255 - d) + 127) / 255,
+            _ => s,
+        };
+        self.blend(offset, channel(r, dr), channel(g, dg), channel(b, db), a);
+    }
     fn fill_opaque(&mut self, start: usize, len: usize, r: u32, g: u32, b: u32);
     fn copy_opaque(&mut self, source: usize, destination: usize, len: usize);
 
@@ -158,6 +176,15 @@ struct RgbaTarget<'a, const ARGB: bool> {
 }
 
 impl<const ARGB: bool> RenderTarget for RgbaTarget<'_, ARGB> {
+    #[inline]
+    fn read_rgb(&self, offset: usize) -> (u32, u32, u32) {
+        let o = offset * 4;
+        if ARGB {
+            (self.bytes[o + 2] as u32, self.bytes[o + 1] as u32, self.bytes[o] as u32)
+        } else {
+            (self.bytes[o] as u32, self.bytes[o + 1] as u32, self.bytes[o + 2] as u32)
+        }
+    }
     #[inline]
     fn pixel_len(&self) -> usize {
         assert_eq!(
@@ -219,6 +246,13 @@ struct PremultipliedTarget<'a> {
 }
 
 impl RenderTarget for PremultipliedTarget<'_> {
+    #[inline]
+    fn read_rgb(&self, offset: usize) -> (u32, u32, u32) {
+        let o = offset * 4;
+        let a = self.bytes[o + 3] as u32;
+        let straight = |c: u8| if a == 0 { 0 } else { (c as u32 * 255 + a / 2) / a };
+        (straight(self.bytes[o]).min(255), straight(self.bytes[o + 1]).min(255), straight(self.bytes[o + 2]).min(255))
+    }
     #[inline]
     fn pixel_len(&self) -> usize {
         assert_eq!(
@@ -330,6 +364,10 @@ fn blend_rgb565_pixel(pixel: &mut u16, r: u32, g: u32, b: u32, a: u32) {
 
 impl RenderTarget for Rgb565Target<'_> {
     #[inline]
+    fn read_rgb(&self, offset: usize) -> (u32, u32, u32) {
+        unpack_rgb565(self.pixels[offset])
+    }
+    #[inline]
     fn pixel_len(&self) -> usize {
         self.pixels.len()
     }
@@ -372,6 +410,10 @@ impl Rgb565WindowTarget<'_> {
 }
 
 impl RenderTarget for Rgb565WindowTarget<'_> {
+    #[inline]
+    fn read_rgb(&self, offset: usize) -> (u32, u32, u32) {
+        unpack_rgb565(self.pixels[self.local_offset(offset)])
+    }
     #[inline]
     fn pixel_len(&self) -> usize {
         // This is the virtual target length used by full-viewport coordinate
@@ -898,8 +940,16 @@ fn render_scaled_clipped<T: RenderTarget>(
                 if i + 9 > words.len() {
                     return;
                 }
-                tex_quad(ui, target, width, scale, clip, &words[i + 1..i + 9]);
+                tex_quad(ui, target, width, scale, clip, &words[i + 1..i + 9], None);
                 i += 9;
+            }
+            draw_op::TEX_QUAD_EFFECT => {
+                if i + 14 > words.len() {
+                    return;
+                }
+                let effect = &words[i + 9..i + 14];
+                tex_quad(ui, target, width, scale, clip, &words[i + 1..i + 9], Some(effect));
+                i += 14;
             }
             // Native compositor instruction: software surfaces have no
             // application compositor and leave the shell fallback visible.
@@ -1835,6 +1885,7 @@ fn tex_quad_impl<T: RenderTarget, const FAST: bool>(
     scale: i32,
     clip: Clip,
     p: &[u32],
+    effect: Option<&[u32]>,
 ) {
     let handle = p[0] as i32;
     let (x, y) = xy(p[1], scale);
@@ -1896,7 +1947,20 @@ fn tex_quad_impl<T: RenderTarget, const FAST: bool>(
                 b = (b * mb + 127) / 255;
                 a = (a * ma + 127) / 255;
             }
-            target.blend((py * stride + px) as usize, r, g, b, a);
+            let offset = (py * stride + px) as usize;
+            if let Some(e) = effect {
+                // MZ ColorFilter: grayscale uses luminance weights, followed
+                // by signed RGB offsets; clamp before destination blending.
+                let gray = (e[4] as i32).clamp(0, 255) as u32;
+                let lum = (299 * r + 587 * g + 114 * b + 500) / 1000;
+                let tone = |c: u32, signed: u32| -> u32 {
+                    let mixed = (c * (255 - gray) + lum * gray + 127) / 255;
+                    (mixed as i32 + (signed as i32).clamp(-255, 255)).clamp(0, 255) as u32
+                };
+                target.blend_effect(offset, (tone(r, e[1]), tone(g, e[2]), tone(b, e[3])), a, e[0]);
+            } else {
+                target.blend(offset, r, g, b, a);
+            }
         }
     }
 }

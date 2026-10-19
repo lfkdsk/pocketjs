@@ -428,6 +428,11 @@ export const PROP = {
   spriteClock: 144, //  i32 reference-frame clock for animated sprites in this
   //                    subtree. The nearest non-negative value wins; -1
   //                    inherits, or uses host-vblank timing at the root.
+  blendMode: 145, //    i32 image-only: 0 normal, 1 add, 2 multiply, 3 screen
+  toneR: 146, //        i32 image-only signed offset -255..255
+  toneG: 147, //        i32 image-only signed offset -255..255
+  toneB: 148, //        i32 image-only signed offset -255..255
+  toneGray: 149, //     i32 image-only desaturation 0..255
 } as const;
 
 export type PropName = keyof typeof PROP;
@@ -563,6 +568,8 @@ export const PROP_VALUE_KIND: Record<PropName, number> = {
   arcStart: VALUE_KIND.f32, arcSweep: VALUE_KIND.f32, arcWidth: VALUE_KIND.f32,
   skewX: VALUE_KIND.f32,
   spriteClock: VALUE_KIND.int,
+  blendMode: VALUE_KIND.int, toneR: VALUE_KIND.int, toneG: VALUE_KIND.int,
+  toneB: VALUE_KIND.int, toneGray: VALUE_KIND.int,
 };
 
 // ---------------------------------------------------------------------------
@@ -1425,6 +1432,11 @@ export const FONT_FLAG_BOLD = 1 << 0;
 //                                      word: bits 0-15 gid, bits 16-31 reserved(0) }
 //   TEX_QUAD    (9 words):  op, texHandle, xy, wh, u0, v0, u1, v1 (f32 bits,
 //                           normalized 0..1), color (modulate; 0xFFFFFFFF = none)
+//   TEX_QUAD_EFFECT (14 words): the same 8 payload words, then blendMode
+//                           (0 normal, 1 add, 2 multiply, 3 screen), toneR,
+//                           toneG, toneB (signed -255..255), toneGray (0..255).
+//                           Only emitted for images with non-default effects;
+//                           old draw lists and old TEX_QUAD stay unchanged.
 //   SCISSOR     (3 words):  op, xy, wh — push clip rect. The core emits rects
 //                           already intersected with every enclosing scissor,
 //                           so backends just SET the rect (a depth counter,
@@ -1497,6 +1509,7 @@ export const DRAW_OP = {
   texTri: 8,
   textRun: 9,
   surfaceQuad: 10,
+  texQuadEffect: 11,
 } as const;
 
 // ---------------------------------------------------------------------------

@@ -1168,6 +1168,8 @@ pub fn build_root(
             0.0,
             1.0,
             1.0,
+            0,
+            [0; 4],
         );
     }
     (target, drawn, provider_stale)
@@ -1359,7 +1361,7 @@ impl<'a> Walker<'a> {
             } else {
                 (0.0, 0.0, 1.0, 1.0)
             };
-            self.emit_tex_quad(dl, &world, l.w, l.h, node.tex as u32, op, &clip, fu0, fv0, fu1, fv1);
+            self.emit_tex_quad(dl, &world, l.w, l.h, node.tex as u32, op, &clip, fu0, fv0, fu1, fv1, r.blend_mode, r.tone);
         }
 
         // -- installed application surface -----------------------------------
@@ -2283,7 +2285,7 @@ impl<'a> Walker<'a> {
                     self.emit_tex_quad(dl, &world.then(&Affine::translate(x0, y0)), local_w, local_h,
                         texture, 1.0, clip, 0.0, 0.0,
                         local_w * self.raster_density as f32 / tw as f32,
-                        local_h * self.raster_density as f32 / th as f32);
+                        local_h * self.raster_density as f32 / th as f32, 0, [0; 4]);
                     if dl.words.len() > before { *dl.words.last_mut().unwrap() = color; }
                     return;
                 }
@@ -2680,6 +2682,8 @@ impl<'a> Walker<'a> {
         fv0: f32,
         fu1: f32,
         fv1: f32,
+        blend_mode: u32,
+        tone: [i32; 4],
     ) {
         if !world.is_axis_aligned() {
             // Rotated image: transform corners with their UVs, clip, fan into
@@ -2721,7 +2725,8 @@ impl<'a> Walker<'a> {
         let u1 = fu0 + (c.x1 - sx0) / (sx1 - sx0) * du;
         let v0 = fv0 + (c.y0 - sy0) / (sy1 - sy0) * dv;
         let v1 = fv0 + (c.y1 - sy0) / (sy1 - sy0) * dv;
-        dl.words.push(spec::draw_op::TEX_QUAD);
+        let effect = blend_mode != 0 || tone != [0; 4];
+        dl.words.push(if effect { spec::draw_op::TEX_QUAD_EFFECT } else { spec::draw_op::TEX_QUAD });
         dl.words.push(tex);
         dl.words.push(xy_word(c.x0, c.y0));
         dl.words.push(wh_word(c.x1 - c.x0, c.y1 - c.y0));
@@ -2730,6 +2735,10 @@ impl<'a> Walker<'a> {
         dl.words.push(u1.to_bits());
         dl.words.push(v1.to_bits());
         dl.words.push(scale_alpha(0xffff_ffff, op));
+        if effect {
+            dl.words.push(blend_mode);
+            dl.words.extend(tone.map(|v| v as u32));
+        }
     }
 
     /// Emit a native-compositor surface instruction. Unlike TEX_QUAD, full
@@ -2891,7 +2900,7 @@ impl<'a> Walker<'a> {
                 let uv = page.uv(g.gid);
                 let glyph_world = world.then(&Affine::translate(g.x, g.y));
                 let before = dl.words.len();
-                self.emit_tex_quad(dl, &glyph_world, cell_w, cell_h, texture, 1.0, glyph_clip, uv[0], uv[1], uv[2], uv[3]);
+                self.emit_tex_quad(dl, &glyph_world, cell_w, cell_h, texture, 1.0, glyph_clip, uv[0], uv[1], uv[2], uv[3], 0, [0; 4]);
                 if dl.words.len() > before { *dl.words.last_mut().unwrap() = color; }
             }
             self.glyph_scratch = scratch;
