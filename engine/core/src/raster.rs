@@ -153,13 +153,12 @@ trait RenderTarget {
             return;
         }
         let (dr, dg, db) = self.read_rgb(offset);
-        let channel = |s: u32, d: u32| match mode {
-            1 => (s + d).min(255),
-            2 => (s * d + 127) / 255,
-            3 => 255 - ((255 - s) * (255 - d) + 127) / 255,
-            _ => s,
-        };
-        self.blend(offset, channel(r, dr), channel(g, dg), channel(b, db), a);
+        self.write_opaque(
+            offset,
+            effect_blend_channel(r, dr, a, mode),
+            effect_blend_channel(g, dg, a, mode),
+            effect_blend_channel(b, db, a, mode),
+        );
     }
     fn fill_opaque(&mut self, start: usize, len: usize, r: u32, g: u32, b: u32);
     fn copy_opaque(&mut self, source: usize, destination: usize, len: usize);
@@ -169,6 +168,44 @@ trait RenderTarget {
         let len = self.pixel_len();
         self.fill_opaque(0, len, 0, 0, 0);
     }
+}
+
+/// Pixi's premultiplied WebGL factors for RPG Maker's picture modes:
+/// ADD=(ONE,ONE), MULTIPLY=(DST_COLOR,ONE_MINUS_SRC_ALPHA), and
+/// SCREEN=(ONE,ONE_MINUS_SRC_COLOR). Quantize the ideal factor equation once.
+#[inline]
+fn effect_blend_channel(source: u32, destination: u32, alpha: u32, mode: u32) -> u32 {
+    let source_premultiplied = source * alpha;
+    match mode {
+        1 => ((source_premultiplied + destination * 255 + 127) / 255).min(255),
+        2 => {
+            (destination * (source_premultiplied + (255 - alpha) * 255) + 32_512)
+                / 65_025
+        }
+        3 => {
+            (source_premultiplied * 255
+                + destination * (65_025 - source_premultiplied)
+                + 32_512)
+                / 65_025
+        }
+        _ => (source * alpha + destination * (255 - alpha) + 127) / 255,
+    }
+}
+
+/// RPG Maker MZ's ColorFilter keeps HSL hue/lightness and scales saturation
+/// by `1 - gray / 255`, then applies signed RGB offsets. Scaling HSL
+/// saturation is equivalent to moving each channel toward `(min + max) / 2`.
+/// This integer form fixes the framebuffer quantization at round-to-nearest.
+#[inline]
+fn tone_rgb(r: u32, g: u32, b: u32, tone: &[u32]) -> (u32, u32, u32) {
+    let gray = (tone[3] as i32).clamp(0, 255) as u32;
+    let lightness_twice = r.min(g).min(b) + r.max(g).max(b);
+    let channel = |value: u32, signed: u32| {
+        let desaturated =
+            (2 * value * (255 - gray) + lightness_twice * gray + 255) / 510;
+        (desaturated as i32 + (signed as i32).clamp(-255, 255)).clamp(0, 255) as u32
+    };
+    (channel(r, tone[0]), channel(g, tone[1]), channel(b, tone[2]))
 }
 
 struct RgbaTarget<'a, const ARGB: bool> {
@@ -288,6 +325,30 @@ impl RenderTarget for PremultipliedTarget<'_> {
         self.bytes[o + 1] = mix(g, self.bytes[o + 1]);
         self.bytes[o + 2] = mix(b, self.bytes[o + 2]);
         self.bytes[o + 3] = mix(255, self.bytes[o + 3]);
+    }
+
+    #[inline]
+    fn blend_effect(&mut self, offset: usize, rgb: (u32, u32, u32), a: u32, mode: u32) {
+        if mode == 0 {
+            self.blend(offset, rgb.0, rgb.1, rgb.2, a);
+            return;
+        }
+        if a == 0 {
+            return;
+        }
+        let o = offset * 4;
+        let da = self.bytes[o + 3] as u32;
+        let destination = [self.bytes[o] as u32, self.bytes[o + 1] as u32, self.bytes[o + 2] as u32];
+        let source = [rgb.0, rgb.1, rgb.2];
+        for index in 0..3 {
+            self.bytes[o + index] =
+                effect_blend_channel(source[index], destination[index], a, mode) as u8;
+        }
+        self.bytes[o + 3] = if mode == 1 {
+            (a + da).min(255) as u8
+        } else {
+            ((255 * a + da * (255 - a) + 127) / 255) as u8
+        };
     }
 
     #[inline]
@@ -1950,15 +2011,8 @@ fn tex_quad_effect_impl<T: RenderTarget, const FAST: bool>(
             }
             let offset = (py * stride + px) as usize;
             if let Some(e) = effect {
-                // MZ ColorFilter: grayscale uses luminance weights, followed
-                // by signed RGB offsets; clamp before destination blending.
-                let gray = (e[4] as i32).clamp(0, 255) as u32;
-                let lum = (299 * r + 587 * g + 114 * b + 500) / 1000;
-                let tone = |c: u32, signed: u32| -> u32 {
-                    let mixed = (c * (255 - gray) + lum * gray + 127) / 255;
-                    (mixed as i32 + (signed as i32).clamp(-255, 255)).clamp(0, 255) as u32
-                };
-                target.blend_effect(offset, (tone(r, e[1]), tone(g, e[2]), tone(b, e[3])), a, e[0]);
+                let toned = tone_rgb(r, g, b, &e[1..5]);
+                target.blend_effect(offset, toned, a, e[0]);
             } else {
                 target.blend(offset, r, g, b, a);
             }
@@ -2073,9 +2127,231 @@ mod tests {
         assert_eq!(draw(1, [0; 4], 0xffff_ffff), [180, 120, 60, 255]);
         assert_eq!(draw(2, [0; 4], 0xffff_ffff), [28, 13, 3, 255]);
         assert_eq!(draw(3, [0; 4], 0xffff_ffff), [152, 107, 57, 255]);
-        assert_eq!(draw(0, [20, -30, 300, 255], 0xffff_ffff), [107, 57, 255, 255]);
+        // Full gray keeps HSL lightness: (max 120 + min 40) / 2 = 80.
+        assert_eq!(draw(0, [20, -30, 300, 255], 0xffff_ffff), [100, 50, 255, 255]);
+        assert_eq!(draw(0, [0, 0, 0, 128], 0xffff_ffff), [100, 80, 60, 255]);
         assert_eq!(draw(0, [0; 4], 0x80ff_ffff), [90, 60, 30, 255]);
         assert_eq!(draw(1, [0; 4], 0x80ff_ffff), [120, 80, 40, 255]);
+        assert_eq!(draw(2, [0; 4], 0x80ff_ffff), [44, 26, 12, 255]);
+        assert_eq!(draw(3, [0; 4], 0x80ff_ffff), [106, 74, 39, 255]);
+        assert_eq!(effect_blend_channel(200, 200, 128, 1), 255);
+    }
+
+    #[test]
+    fn textured_effect_randomized_reference_covers_clipping_and_targets() {
+        const WIDTH: i32 = 5;
+        const HEIGHT: i32 = 4;
+        let mut rng = TestRng(0xb1e0_d70e_5eed_1234);
+
+        let reference_tone = |rgb: [u32; 3], tone: [i32; 4]| -> [u32; 3] {
+            let gray = tone[3].clamp(0, 255) as u32;
+            let lo = rgb[0].min(rgb[1]).min(rgb[2]);
+            let hi = rgb[0].max(rgb[1]).max(rgb[2]);
+            core::array::from_fn(|index| {
+                let value = ((rgb[index] as f64 * (255 - gray) as f64
+                    + (lo + hi) as f64 * 0.5 * gray as f64)
+                    / 255.0)
+                    .round() as i32;
+                (value + tone[index].clamp(-255, 255)).clamp(0, 255) as u32
+            })
+        };
+        let blend_channel = |source: u32, destination: u32, alpha: u32, mode: u32| -> u32 {
+            let source_premultiplied = source as f64 / 255.0 * alpha as f64 / 255.0;
+            let destination = destination as f64 / 255.0;
+            let value = match mode {
+                1 => source_premultiplied + destination,
+                2 => source_premultiplied * destination
+                    + destination * (1.0 - alpha as f64 / 255.0),
+                3 => source_premultiplied + destination * (1.0 - source_premultiplied),
+                _ => source_premultiplied
+                    + destination * (1.0 - alpha as f64 / 255.0),
+            };
+            (value.clamp(0.0, 1.0) * 255.0).round() as u32
+        };
+        let over_opaque = |source: [u32; 3], destination: [u32; 3], alpha: u32, mode: u32| {
+            core::array::from_fn(|index|
+                blend_channel(source[index], destination[index], alpha, mode))
+        };
+        let over_premultiplied =
+            |source: [u32; 3], destination: [u32; 3], da: u32, alpha: u32, mode: u32| {
+                let rgb = core::array::from_fn(|index|
+                    blend_channel(source[index], destination[index], alpha, mode));
+                let out_alpha = if mode == 1 {
+                    (alpha + da).min(255)
+                } else {
+                    (255 * alpha + da * (255 - alpha) + 127) / 255
+                };
+                (rgb, out_alpha)
+            };
+
+        for iteration in 0..384 {
+            let source = [rng.next() as u8, rng.next() as u8, rng.next() as u8];
+            let texture_alpha = rng.next() as u8;
+            let destination = [rng.next() as u8, rng.next() as u8, rng.next() as u8];
+            let destination_alpha = rng.next() as u8;
+            let opacity = rng.next() as u8;
+            let mode = rng.below(4);
+            let tone = [
+                rng.below(511) as i32 - 255,
+                rng.below(511) as i32 - 255,
+                rng.below(511) as i32 - 255,
+                rng.below(256) as i32,
+            ];
+            let x = rng.below(7) as i32 - 2;
+            let y = rng.below(6) as i32 - 2;
+            let width = rng.below(6) + 1;
+            let height = rng.below(5) + 1;
+            let clip = Clip {
+                x0: rng.below(WIDTH as u32) as i32,
+                y0: rng.below(HEIGHT as u32) as i32,
+                x1: WIDTH,
+                y1: HEIGHT,
+            };
+
+            let mut ui = Ui::new();
+            ui.set_viewport(WIDTH as f32, HEIGHT as f32);
+            let texture = ui.upload_texture(
+                &[source[0], source[1], source[2], texture_alpha],
+                1,
+                1,
+                spec::psm::PSM_8888,
+            );
+            let p = [
+                texture as u32,
+                xy_word(x as i16, y as i16),
+                wh_word(width as u16, height as u16),
+                0.0f32.to_bits(),
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+                1.0f32.to_bits(),
+                (opacity as u32) << 24 | 0x00ff_ffff,
+            ];
+            let effect = [mode, tone[0] as u32, tone[1] as u32, tone[2] as u32, tone[3] as u32];
+            let pixels = (WIDTH * HEIGHT) as usize;
+            let mut rgba = Vec::with_capacity(pixels * 4);
+            let mut argb = Vec::with_capacity(pixels * 4);
+            let premultiplied_destination = destination.map(|channel|
+                ((channel as u32 * destination_alpha as u32 + 127) / 255) as u8);
+            let mut premultiplied = Vec::with_capacity(pixels * 4);
+            let packed_destination = pack_rgb565(
+                destination[0] as u32,
+                destination[1] as u32,
+                destination[2] as u32,
+            );
+            let mut rgb565 = vec![packed_destination; pixels];
+            for _ in 0..pixels {
+                rgba.extend_from_slice(&[destination[0], destination[1], destination[2], 255]);
+                argb.extend_from_slice(&[destination[2], destination[1], destination[0], 255]);
+                premultiplied.extend_from_slice(&[
+                    premultiplied_destination[0],
+                    premultiplied_destination[1],
+                    premultiplied_destination[2],
+                    destination_alpha,
+                ]);
+            }
+
+            tex_quad_effect_impl::<_, true>(
+                &ui,
+                &mut RgbaTarget::<false> { bytes: &mut rgba },
+                WIDTH,
+                1,
+                clip,
+                &p,
+                Some(&effect),
+            );
+            tex_quad_effect_impl::<_, true>(
+                &ui,
+                &mut RgbaTarget::<true> { bytes: &mut argb },
+                WIDTH,
+                1,
+                clip,
+                &p,
+                Some(&effect),
+            );
+            tex_quad_effect_impl::<_, true>(
+                &ui,
+                &mut PremultipliedTarget { bytes: &mut premultiplied },
+                WIDTH,
+                1,
+                clip,
+                &p,
+                Some(&effect),
+            );
+            tex_quad_effect_impl::<_, true>(
+                &ui,
+                &mut Rgb565Target { pixels: &mut rgb565 },
+                WIDTH,
+                1,
+                clip,
+                &p,
+                Some(&effect),
+            );
+
+            let effective_alpha =
+                (texture_alpha as u32 * opacity as u32 + 127) / 255;
+            let toned = reference_tone(source.map(u32::from), tone);
+            let quantized_destination = unpack_rgb565(packed_destination);
+            for py in 0..HEIGHT {
+                for px in 0..WIDTH {
+                    let index = (py * WIDTH + px) as usize;
+                    let affected = px >= x && px < x + width as i32
+                        && py >= y && py < y + height as i32
+                        && px >= clip.x0 && px < clip.x1
+                        && py >= clip.y0 && py < clip.y1;
+                    let opaque_expected = if affected {
+                        over_opaque(toned, destination.map(u32::from), effective_alpha, mode)
+                    } else {
+                        destination.map(u32::from)
+                    };
+                    assert_eq!(
+                        &rgba[index * 4..index * 4 + 4],
+                        &[opaque_expected[0] as u8, opaque_expected[1] as u8, opaque_expected[2] as u8, 255],
+                        "RGBA iteration {iteration}, pixel {px},{py}",
+                    );
+                    assert_eq!(
+                        &argb[index * 4..index * 4 + 4],
+                        &[opaque_expected[2] as u8, opaque_expected[1] as u8, opaque_expected[0] as u8, 255],
+                        "ARGB iteration {iteration}, pixel {px},{py}",
+                    );
+                    let (premultiplied_expected, alpha_expected) = if affected {
+                        over_premultiplied(
+                            toned,
+                            premultiplied_destination.map(u32::from),
+                            destination_alpha as u32,
+                            effective_alpha,
+                            mode,
+                        )
+                    } else {
+                        (premultiplied_destination.map(u32::from), destination_alpha as u32)
+                    };
+                    assert_eq!(
+                        &premultiplied[index * 4..index * 4 + 4],
+                        &[
+                            premultiplied_expected[0] as u8,
+                            premultiplied_expected[1] as u8,
+                            premultiplied_expected[2] as u8,
+                            alpha_expected as u8,
+                        ],
+                        "premultiplied iteration {iteration}, pixel {px},{py}",
+                    );
+                    let rgb565_expected = if affected {
+                        let blended = over_opaque(
+                            toned,
+                            [quantized_destination.0, quantized_destination.1, quantized_destination.2],
+                            effective_alpha,
+                            mode,
+                        );
+                        pack_rgb565(blended[0], blended[1], blended[2])
+                    } else {
+                        packed_destination
+                    };
+                    assert_eq!(
+                        rgb565[index], rgb565_expected,
+                        "RGB565 iteration {iteration}, pixel {px},{py}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
