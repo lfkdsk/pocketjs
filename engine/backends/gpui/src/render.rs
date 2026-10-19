@@ -52,6 +52,34 @@ fn fnv64(words: &[u32]) -> u64 {
     h
 }
 
+/// GPUI rasterizes transformed images into a transparent scratch texture and
+/// then source-over paints that texture into the window. Destination-dependent
+/// blend modes cannot observe the window through that scratch texture, so the
+/// fixed-backend fallback must discard the effect payload before rasterizing.
+fn degrade_triangle_effects(batch: &[u32]) -> Vec<u32> {
+    let mut degraded = Vec::with_capacity(batch.len());
+    let mut i = 0usize;
+    while i < batch.len() {
+        match batch[i] {
+            spec::draw_op::TRI => {
+                degraded.extend_from_slice(&batch[i..i + 7]);
+                i += 7;
+            }
+            spec::draw_op::TEX_TRI => {
+                degraded.extend_from_slice(&batch[i..i + 12]);
+                i += 12;
+            }
+            spec::draw_op::TEX_TRI_EFFECT => {
+                degraded.push(spec::draw_op::TEX_TRI);
+                degraded.extend_from_slice(&batch[i + 1..i + 12]);
+                i += 17;
+            }
+            _ => unreachable!("triangle fallback received a non-triangle opcode"),
+        }
+    }
+    degraded
+}
+
 fn shaped_key(text: &str, slot: u8, color: u32) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |byte: u8| {
@@ -332,9 +360,7 @@ impl GpuiRenderer {
                     *i += 1;
                     return;
                 }
-                spec::draw_op::TRI
-                | spec::draw_op::TEX_TRI
-                | spec::draw_op::TEX_TRI_EFFECT => {
+                spec::draw_op::TRI | spec::draw_op::TEX_TRI | spec::draw_op::TEX_TRI_EFFECT => {
                     self.paint_tri_batch(ui, words, i, origin, window, cx);
                 }
                 spec::draw_op::TEXT_RUN => {
@@ -583,6 +609,7 @@ impl GpuiRenderer {
         let start = *i;
         let mut end = start;
         let mut needs_raster = false;
+        let mut has_effect = false;
         while end < words.len() {
             match words[end] {
                 spec::draw_op::TRI => {
@@ -597,6 +624,7 @@ impl GpuiRenderer {
                 }
                 spec::draw_op::TEX_TRI_EFFECT => {
                     needs_raster = true;
+                    has_effect = true;
                     end += 17;
                 }
                 _ => break,
@@ -617,7 +645,12 @@ impl GpuiRenderer {
             }
             return;
         }
-        self.paint_rastered_batch(ui, batch, origin, window);
+        if has_effect {
+            let degraded = degrade_triangle_effects(batch);
+            self.paint_rastered_batch(ui, &degraded, origin, window);
+        } else {
+            self.paint_rastered_batch(ui, batch, origin, window);
+        }
     }
 
     fn paint_rastered_batch(
@@ -632,9 +665,7 @@ impl GpuiRenderer {
         let mut key_words: Vec<u32> = batch.to_vec();
         let mut j = 0usize;
         while j < batch.len() {
-            if batch[j] == spec::draw_op::TEX_TRI
-                || batch[j] == spec::draw_op::TEX_TRI_EFFECT
-            {
+            if batch[j] == spec::draw_op::TEX_TRI || batch[j] == spec::draw_op::TEX_TRI_EFFECT {
                 let slot = batch[j + 1] & spec::TEX_SLOT_MASK;
                 if let Some((_, revision, _)) = ui.texture_at_versioned(slot) {
                     key_words.push(revision as u32);
@@ -665,8 +696,8 @@ impl GpuiRenderer {
         let (mut min_x, mut min_y, mut max_x, mut max_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         let mut j = 0usize;
         while j < batch.len() {
-            let textured = batch[j] == spec::draw_op::TEX_TRI
-                || batch[j] == spec::draw_op::TEX_TRI_EFFECT;
+            let textured =
+                batch[j] == spec::draw_op::TEX_TRI || batch[j] == spec::draw_op::TEX_TRI_EFFECT;
             let idxs: &[usize] = if textured {
                 &[j + 2, j + 5, j + 8]
             } else {
@@ -788,5 +819,22 @@ fn to_rgba8(view: &pocketjs_core::TexView) -> Option<Vec<u8>> {
             Some(out)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::degrade_triangle_effects;
+    use pocketjs_core::spec;
+
+    #[test]
+    fn transformed_effects_degrade_to_ordinary_textured_triangles() {
+        let mut effect = vec![spec::draw_op::TEX_TRI_EFFECT];
+        effect.extend(1..17);
+
+        let degraded = degrade_triangle_effects(&effect);
+
+        assert_eq!(degraded[0], spec::draw_op::TEX_TRI);
+        assert_eq!(&degraded[1..], &effect[1..12]);
     }
 }
