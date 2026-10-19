@@ -690,14 +690,14 @@ export function jsxPlugin(
       // otherwise identical packages at different paths form two reactive
       // ownership domains and lifecycle hooks silently stop crossing it.
       build.onResolve({ filter: /^solid-js$/ }, () => ({
-        path: SOLID_RUNTIME_PATH,
+        path: bunPluginPath(SOLID_RUNTIME_PATH),
       }));
       build.onResolve({ filter: /^solid-js\/universal$/ }, () => ({
-        path: SOLID_UNIVERSAL_RUNTIME_PATH,
+        path: bunPluginPath(SOLID_UNIVERSAL_RUNTIME_PATH),
       }));
       build.onResolve({ filter: /^@pocketjs\/framework(?:\/.*)?$/ }, (args) => {
         const path = packagePath(args.path, framework);
-        return path ? { path } : undefined;
+        return path ? { path: bunPluginPath(path) } : undefined;
       });
       // The generated styles module is written mid-build: pass 1 resolves the
       // framework's `./styles.generated.ts` import (and a resolver may cache
@@ -712,7 +712,7 @@ export function jsxPlugin(
         const resolved = args.path.startsWith(".")
           ? resolvePath(dirname(args.importer), args.path)
           : args.path;
-        return resolved === GENERATED_STYLES_PATH ? { path: GENERATED_STYLES_PATH } : undefined;
+        return resolved === GENERATED_STYLES_PATH ? { path: bunPluginPath(GENERATED_STYLES_PATH) } : undefined;
       });
       if (framework === "solid") {
         build.onResolve({ filter: /^\.{1,2}\// }, args => {
@@ -734,8 +734,9 @@ export function jsxPlugin(
           if (framework === "vue-vapor") {
             const mock = resolveVueAotMock(args.importer, args.path);
             if (mock !== undefined) {
-              declarationMocks.set(args.importer, mock);
-              return { path: args.importer, namespace: "vue-aot-declarations" };
+              const path = bunPluginPath(args.importer);
+              declarationMocks.set(path, mock);
+              return { path, namespace: "vue-aot-declarations" };
             }
           }
           let resolved: string;
@@ -745,7 +746,9 @@ export function jsxPlugin(
             return undefined;
           }
           const variant = frameworkVariantPath(resolved, framework);
-          return variant !== resolved ? { path: variant } : undefined;
+          return variant !== resolved || process.platform === "win32"
+            ? { path: bunPluginPath(variant) }
+            : undefined;
         });
       }
       if (framework === "octane" && process.env.POCKETJS_OCTANE_PROFILER !== "1") {
@@ -754,11 +757,11 @@ export function jsxPlugin(
         // under the pinned QuickJS's non-ephemeron weak marking (and costs
         // frame time). See framework/src/octane-profiling-stub.ts.
         build.onResolve({ filter: /^octane\/profiling$/ }, () => ({
-          path: OCTANE_PROFILING_STUB_PATH,
+          path: bunPluginPath(OCTANE_PROFILING_STUB_PATH),
         }));
         build.onResolve({ filter: /^\.\/profiling\.js$/ }, (args) =>
           args.importer.replace(/\\/g, "/").includes("/node_modules/octane/dist/")
-            ? { path: OCTANE_PROFILING_STUB_PATH }
+            ? { path: bunPluginPath(OCTANE_PROFILING_STUB_PATH) }
             : undefined,
         );
       }
@@ -768,7 +771,7 @@ export function jsxPlugin(
           loader: "js",
           resolveDir: new URL(".", import.meta.url).pathname,
         }));
-        build.onResolve({ filter: /^vue$/ }, () => ({ path: VUE_VAPOR_RUNTIME_PATH }));
+        build.onResolve({ filter: /^vue$/ }, () => ({ path: bunPluginPath(VUE_VAPOR_RUNTIME_PATH) }));
         build.onLoad({ filter: /vue\.runtime-with-vapor\.esm-browser\.prod\.js$/ }, async args => ({ contents: exposeVaporFrameFlush(await Bun.file(args.path).text()), loader: "js" }));
         build.onResolve({ filter: /^\/vue-jsx-vapor\/(?:props|vdom|vapor|ssr)$/ }, (args) => ({
           path: args.path,
@@ -782,7 +785,7 @@ export function jsxPlugin(
       }
       build.onLoad({ filter: /\.tsx?$/ }, async (args) => {
         if (isNodeModuleFile(args.path) || args.path.endsWith(".d.ts")) return undefined;
-        let src = args.path === GENERATED_STYLES_PATH &&
+        let src = bunPluginPath(args.path) === bunPluginPath(GENERATED_STYLES_PATH) &&
             opts.generatedStyles !== undefined
           ? opts.generatedStyles
           : await Bun.file(args.path).text();
