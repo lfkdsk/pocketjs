@@ -2060,6 +2060,7 @@ mod tests {
         assert_eq!(draw(2, [0; 4], 0xffff_ffff), [28, 13, 3, 255]);
         assert_eq!(draw(3, [0; 4], 0xffff_ffff), [152, 107, 57, 255]);
         assert_eq!(draw(0, [20, -30, 300, 255], 0xffff_ffff), [107, 57, 255, 255]);
+        assert_eq!(draw(0, [0; 4], 0x80ff_ffff), [90, 60, 30, 255]);
         assert_eq!(draw(1, [0; 4], 0x80ff_ffff), [120, 80, 40, 255]);
     }
 
