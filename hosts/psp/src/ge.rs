@@ -596,7 +596,12 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                 }
                 i = next;
             }
-            spec::draw_op::TEX_QUAD if i + 9 <= n => {
+            spec::draw_op::TEX_QUAD | spec::draw_op::TEX_QUAD_EFFECT => {
+                let op = words[i];
+                let op_len = if op == spec::draw_op::TEX_QUAD_EFFECT { 14 } else { 9 };
+                if i + op_len > n {
+                    break;
+                }
                 let handle = words[i + 1] as i32;
                 let (x, y) = xy(words[i + 2]);
                 let (w, h) = wh(words[i + 3]);
@@ -611,13 +616,13 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                 // box; per-quad bind + texture-disable churn cost ~5 ms of GE
                 // tail on real hardware).
                 let mut end = i;
-                while end + 9 <= n
-                    && words[end] == spec::draw_op::TEX_QUAD
+                while end + op_len <= n
+                    && words[end] == op
                     && words[end + 1] == handle as u32
                 {
-                    end += 9;
+                    end += op_len;
                 }
-                let count = (end - i) / 9;
+                let count = (end - i) / op_len;
                 if let Some(view) = ui.texture(handle) {
                     apply_texture(&view);
                     let (tw, th) = (view.w, view.h);
@@ -634,7 +639,7 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                     };
                     let mut sprites = 0usize;
                     for k in 0..count {
-                        let o = i + k * 9;
+                        let o = i + k * op_len;
                         let (qw, qh) = wh(words[o + 3]);
                         sprites += strip_count(texels(o), qw, qh, strip);
                     }
@@ -642,7 +647,7 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                     let verts = pool_alloc(bytes) as *mut VertTC;
                     let mut s = 0usize;
                     for k in 0..count {
-                        let o = i + k * 9;
+                        let o = i + k * op_len;
                         let (qx, qy) = xy(words[o + 2]);
                         let (qw, qh) = wh(words[o + 3]);
                         let (tu0, tv0, tu1, tv1) = texels(o);
@@ -691,23 +696,28 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                 }
                 i = end;
             }
-            spec::draw_op::TEX_TRI if i + 12 <= n => {
+            spec::draw_op::TEX_TRI | spec::draw_op::TEX_TRI_EFFECT => {
+                let op = words[i];
+                let op_len = if op == spec::draw_op::TEX_TRI_EFFECT { 17 } else { 12 };
+                if i + op_len > n {
+                    break;
+                }
                 let handle = words[i + 1] as i32;
                 let mut end = i;
-                while end + 12 <= n
-                    && words[end] == spec::draw_op::TEX_TRI
+                while end + op_len <= n
+                    && words[end] == op
                     && words[end + 1] == handle as u32
                 {
-                    end += 12;
+                    end += op_len;
                 }
-                let count = (end - i) / 12;
+                let count = (end - i) / op_len;
                 if let Some(view) = ui.texture(handle) {
                     apply_texture(&view);
                     let (tw, th) = (view.w, view.h);
                     let bytes = count * 3 * core::mem::size_of::<VertTC>();
                     let verts = pool_alloc(bytes) as *mut VertTC;
                     for t in 0..count {
-                        let o = i + t * 12;
+                        let o = i + t * op_len;
                         let modulate = words[o + 11];
                         for k in 0..3usize {
                             let (x, y) = xy(words[o + 2 + k * 3]);

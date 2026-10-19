@@ -742,7 +742,15 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                 }
                 i = next;
             }
-            spec::draw_op::TEX_QUAD if i + 9 <= words.len() => {
+            spec::draw_op::TEX_QUAD | spec::draw_op::TEX_QUAD_EFFECT => {
+                let len = if words[i] == spec::draw_op::TEX_QUAD_EFFECT {
+                    14
+                } else {
+                    9
+                };
+                if i + len > words.len() {
+                    break;
+                }
                 let handle = words[i + 1] as i32;
                 if let Some(texture) = resolve_texture(ui, handle) {
                     let (x, y) = xy(words[i + 2]);
@@ -768,9 +776,17 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                         );
                     }
                 }
-                i += 9;
+                i += len;
             }
-            spec::draw_op::TEX_TRI if i + 12 <= words.len() => {
+            spec::draw_op::TEX_TRI | spec::draw_op::TEX_TRI_EFFECT => {
+                let len = if words[i] == spec::draw_op::TEX_TRI_EFFECT {
+                    17
+                } else {
+                    12
+                };
+                if i + len > words.len() {
+                    break;
+                }
                 let handle = words[i + 1] as i32;
                 if let Some(texture) = resolve_texture(ui, handle) {
                     let mut vertices = [vita2d_texture_vertex {
@@ -798,7 +814,7 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                         words[i + 11],
                     );
                 }
-                i += 12;
+                i += len;
             }
             spec::draw_op::SCISSOR if i + 3 <= words.len() => {
                 let (x, y) = xy(words[i + 1]);
@@ -852,7 +868,10 @@ fn validate_texture_residency(ui: &Ui, words: &[u32]) -> io::Result<()> {
                 let count = (words[i + 1] >> 16) as usize;
                 i.checked_add(3 + count.saturating_mul(2))
             }
-            spec::draw_op::TEX_QUAD | spec::draw_op::TEX_TRI => {
+            spec::draw_op::TEX_QUAD
+            | spec::draw_op::TEX_QUAD_EFFECT
+            | spec::draw_op::TEX_TRI
+            | spec::draw_op::TEX_TRI_EFFECT => {
                 let op = words[i];
                 let handle = *words.get(i + 1).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "truncated texture draw op")
@@ -869,7 +888,12 @@ fn validate_texture_residency(ui: &Ui, words: &[u32]) -> io::Result<()> {
                         "Vita GPU texture {handle} was not resident after production rendering"
                     )));
                 }
-                i.checked_add(if op == spec::draw_op::TEX_QUAD { 9 } else { 12 })
+                i.checked_add(match op {
+                    spec::draw_op::TEX_QUAD => 9,
+                    spec::draw_op::TEX_QUAD_EFFECT => 14,
+                    spec::draw_op::TEX_TRI => 12,
+                    _ => 17,
+                })
             }
             spec::draw_op::SCISSOR => i.checked_add(3),
             spec::draw_op::SCISSOR_POP => i.checked_add(1),

@@ -323,7 +323,9 @@ impl GpuiRenderer {
                     *i += 1;
                     return;
                 }
-                spec::draw_op::TRI | spec::draw_op::TEX_TRI => {
+                spec::draw_op::TRI
+                | spec::draw_op::TEX_TRI
+                | spec::draw_op::TEX_TRI_EFFECT => {
                     self.paint_tri_batch(ui, words, i, origin, window, cx);
                 }
                 spec::draw_op::TEXT_RUN => {
@@ -584,6 +586,10 @@ impl GpuiRenderer {
                     needs_raster = true;
                     end += 12;
                 }
+                spec::draw_op::TEX_TRI_EFFECT => {
+                    needs_raster = true;
+                    end += 17;
+                }
                 _ => break,
             }
         }
@@ -617,13 +623,19 @@ impl GpuiRenderer {
         let mut key_words: Vec<u32> = batch.to_vec();
         let mut j = 0usize;
         while j < batch.len() {
-            if batch[j] == spec::draw_op::TEX_TRI {
+            if batch[j] == spec::draw_op::TEX_TRI
+                || batch[j] == spec::draw_op::TEX_TRI_EFFECT
+            {
                 let slot = batch[j + 1] & spec::TEX_SLOT_MASK;
                 if let Some((_, revision, _)) = ui.texture_at_versioned(slot) {
                     key_words.push(revision as u32);
                     key_words.push((revision >> 32) as u32);
                 }
-                j += 12;
+                j += if batch[j] == spec::draw_op::TEX_TRI_EFFECT {
+                    17
+                } else {
+                    12
+                };
             } else {
                 j += 7;
             }
@@ -644,7 +656,9 @@ impl GpuiRenderer {
         let (mut min_x, mut min_y, mut max_x, mut max_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         let mut j = 0usize;
         while j < batch.len() {
-            let idxs: &[usize] = if batch[j] == spec::draw_op::TEX_TRI {
+            let textured = batch[j] == spec::draw_op::TEX_TRI
+                || batch[j] == spec::draw_op::TEX_TRI_EFFECT;
+            let idxs: &[usize] = if textured {
                 &[j + 2, j + 5, j + 8]
             } else {
                 &[j + 1, j + 2, j + 3]
@@ -656,7 +670,9 @@ impl GpuiRenderer {
                 max_x = max_x.max(x.ceil() as i32);
                 max_y = max_y.max(y.ceil() as i32);
             }
-            j += if batch[j] == spec::draw_op::TEX_TRI {
+            j += if batch[j] == spec::draw_op::TEX_TRI_EFFECT {
+                17
+            } else if batch[j] == spec::draw_op::TEX_TRI {
                 12
             } else {
                 7

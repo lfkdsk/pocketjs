@@ -1098,8 +1098,23 @@ fn render_scaled_clipped<T: RenderTarget>(
                 if i + 12 > words.len() {
                     return;
                 }
-                tex_tri(ui, target, width, scale, clip, &words[i + 1..i + 12]);
+                tex_tri(ui, target, width, scale, clip, &words[i + 1..i + 12], None);
                 i += 12;
+            }
+            draw_op::TEX_TRI_EFFECT => {
+                if i + 17 > words.len() {
+                    return;
+                }
+                tex_tri(
+                    ui,
+                    target,
+                    width,
+                    scale,
+                    clip,
+                    &words[i + 1..i + 12],
+                    Some(&words[i + 12..i + 17]),
+                );
+                i += 17;
             }
             draw_op::TEXT_RUN => {
                 // Native-text op (host text system shapes the run); the
@@ -1461,7 +1476,9 @@ fn tex_tri<T: RenderTarget>(
     scale: i32,
     clip: Clip,
     p: &[u32],
+    effect: Option<&[u32]>,
 ) {
+    let effect = effect.filter(|values| values.iter().any(|value| *value != 0));
     let handle = p[0] as i32;
     let (x0, y0) = xy(p[1], scale);
     let (u0, v0) = (f32::from_bits(p[2]), f32::from_bits(p[3]));
@@ -1522,16 +1539,26 @@ fn tex_tri<T: RenderTarget>(
                 let ty = ((v * thf) as i32).clamp(0, th_max);
                 texel(&view, (ty * view.w as i32 + tx) as usize)
             };
-            let Some((mut r, mut g, mut b, mut a)) = sample else {
+            let Some((r, g, b, a)) = sample else {
                 return;
             };
-            if !identity {
-                r = (r * mr + 127) / 255;
-                g = (g * mg + 127) / 255;
-                b = (b * mb + 127) / 255;
-                a = (a * ma + 127) / 255;
+            let offset = (py * stride + px) as usize;
+            if let Some(effect) = effect {
+                let source = effect_pixel((r, g, b, a), modulate, &effect[1..5]);
+                target.blend_effect(offset, source, effect[0]);
+            } else {
+                let (r, g, b, a) = if identity {
+                    (r, g, b, a)
+                } else {
+                    (
+                        (r * mr + 127) / 255,
+                        (g * mg + 127) / 255,
+                        (b * mb + 127) / 255,
+                        (a * ma + 127) / 255,
+                    )
+                };
+                target.blend(offset, r, g, b, a);
             }
-            target.blend((py * stride + px) as usize, r, g, b, a);
         }
     }
 }
@@ -2241,6 +2268,58 @@ mod tests {
         // Texture alpha and node opacity remain independent rationals until
         // the final write: pre-quantizing their product gives 108, not 109.
         assert_eq!(render([247, 0, 0, 128], [0; 3], 1, [0; 4], 224), [109, 0, 0, 255]);
+    }
+
+    #[test]
+    fn textured_triangle_effect_matches_identity_and_all_targets() {
+        let mut ui = Ui::new();
+        ui.set_viewport(2.0, 2.0);
+        let texture = ui.upload_texture(&[120, 80, 40, 255], 1, 1, spec::psm::PSM_8888);
+        let triangle = [
+            texture as u32,
+            xy_word(0, 0),
+            0.0f32.to_bits(),
+            0.0f32.to_bits(),
+            xy_word(2, 0),
+            1.0f32.to_bits(),
+            0.0f32.to_bits(),
+            xy_word(0, 2),
+            0.0f32.to_bits(),
+            1.0f32.to_bits(),
+            0xffff_ffff,
+        ];
+        let mut legacy = vec![draw_op::TEX_TRI];
+        legacy.extend_from_slice(&triangle);
+        let mut identity = vec![draw_op::TEX_TRI_EFFECT];
+        identity.extend_from_slice(&triangle);
+        identity.extend_from_slice(&[0; 5]);
+        let mut legacy_pixels = vec![0; 16];
+        let mut identity_pixels = vec![0; 16];
+        render_scaled(&ui, &legacy, &mut legacy_pixels, 1);
+        render_scaled(&ui, &identity, &mut identity_pixels, 1);
+        assert_eq!(identity_pixels, legacy_pixels);
+
+        let mut words = vec![
+            draw_op::RECT,
+            xy_word(0, 0),
+            wh_word(2, 2),
+            0xff14_283c,
+            draw_op::TEX_TRI_EFFECT,
+        ];
+        words.extend_from_slice(&triangle);
+        words.extend_from_slice(&[1, (-20i32) as u32, 10, 0, 0]);
+        let mut rgba = vec![0; 16];
+        render_scaled(&ui, &words, &mut rgba, 1);
+        assert_eq!(&rgba[..4], &[160, 130, 60, 255]);
+        let mut argb = vec![0; 16];
+        render_scaled_argb(&ui, &words, &mut argb, 1);
+        assert_eq!(&argb[..4], &[60, 130, 160, 255]);
+        let mut premultiplied = vec![0; 16];
+        render_scaled_premultiplied(&ui, &words, &mut premultiplied, 1);
+        assert_eq!(&premultiplied[..4], &[160, 130, 60, 255]);
+        let mut rgb565 = vec![0; 4];
+        render_scaled_rgb565(&ui, &words, &mut rgb565, 1);
+        assert_eq!(rgb565[0], pack_rgb565(157, 130, 56));
     }
 
     #[test]
@@ -2969,7 +3048,7 @@ mod tests {
                 0xffff_ffff,
                 spec::GradDir::ToRight as u32,
                 draw_op::SCISSOR_POP,
-                draw_op::TEX_QUAD,
+                draw_op::TEX_QUAD_EFFECT,
                 texture as u32,
                 xy_word(15 + offset, 2),
                 wh_word(5, 5),
@@ -2978,6 +3057,11 @@ mod tests {
                 1.0f32.to_bits(),
                 1.0f32.to_bits(),
                 tint,
+                1,
+                10,
+                0,
+                0,
+                64,
                 draw_op::TRI,
                 xy_word(23 + offset, 2),
                 xy_word(29 + offset, 8),
@@ -2985,7 +3069,7 @@ mod tests {
                 tint,
                 0xff00_ff00,
                 0xffff_0000,
-                draw_op::TEX_TRI,
+                draw_op::TEX_TRI_EFFECT,
                 texture as u32,
                 xy_word(3 + offset, 13),
                 0.0f32.to_bits(),
@@ -2997,6 +3081,11 @@ mod tests {
                 0.0f32.to_bits(),
                 1.0f32.to_bits(),
                 tint,
+                2,
+                0,
+                10,
+                (-10i32) as u32,
+                32,
                 draw_op::GLYPH_RUN,
                 1 << 16,
                 tint,

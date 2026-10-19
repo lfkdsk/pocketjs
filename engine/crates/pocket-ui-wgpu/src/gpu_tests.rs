@@ -198,6 +198,30 @@ fn gpu_drawlist_composition_and_resource_lifecycle() {
             &expected,
             0,
         );
+
+        // Append-only effect opcodes with identity payloads paint the legacy
+        // geometry and must not truncate a following operation on this fixed
+        // GPU pipeline.
+        let mut effect_quad = image(handle, 0, 0, 16, 16).to_vec();
+        effect_quad[0] = op::TEX_QUAD_EFFECT;
+        effect_quad.extend([0; 5]);
+        effect_quad.extend([op::RECT, packed(3, 3), packed(5, 5), 0xff20_e040]);
+        raster::render_scaled(&ui, &effect_quad, &mut expected, scale);
+        close(
+            &draw(&gpu, &mut renderer, &ui, &effect_quad, &out, scale),
+            &expected,
+            0,
+        );
+        let mut effect_tri = w[..12].to_vec();
+        effect_tri[0] = op::TEX_TRI_EFFECT;
+        effect_tri.extend([0; 5]);
+        effect_tri.extend([op::RECT, packed(3, 3), packed(5, 5), 0xff20_e040]);
+        raster::render_scaled(&ui, &effect_tri, &mut expected, scale);
+        close(
+            &draw(&gpu, &mut renderer, &ui, &effect_tri, &out, scale),
+            &expected,
+            0,
+        );
         ui.free_texture(handle);
         // Every image format, then a freed handle followed by a solid rectangle.
         for (psm, data) in [

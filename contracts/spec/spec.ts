@@ -1463,6 +1463,10 @@ export const FONT_FLAG_BOLD = 1 << 0;
 //                           perspective variation (projectively correct UVs
 //                           at every cell corner), so interior texture lines
 //                           do not kink at triangle diagonals.
+//   TEX_TRI_EFFECT (17 words): the same 11 payload words, then blendMode,
+//                           toneR, toneG, toneB, toneGray with the same
+//                           meanings as TEX_QUAD_EFFECT. Only emitted for
+//                           transformed images with non-default effects.
 //   TEXT_RUN    (8 + ceil(n/4) words):
 //                           op,
 //                           word1: bits 0-7 fontSlot,

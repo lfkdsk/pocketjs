@@ -201,7 +201,7 @@ fn decode_wh(word: u32) -> (i32, i32) {
 /// Walk a DrawList asserting the pinned CPU-clip invariant: every coordinate
 /// in [0, SCREEN_W] x [0, SCREEN_H], rect extents in range, scissors
 /// balanced, only known ops. Returns per-op counts (indexed by op code).
-fn validate_drawlist(words: &[u32]) -> [u32; 11] {
+fn validate_drawlist(words: &[u32]) -> [u32; 13] {
     let (sw, sh) = (spec::SCREEN_W as i32, spec::SCREEN_H as i32);
     let xy_ok = |w: u32| {
         let (x, y) = decode_xy(w);
@@ -213,7 +213,7 @@ fn validate_drawlist(words: &[u32]) -> [u32; 11] {
         let (w, h) = decode_wh(whw);
         assert!(x + w <= sw && y + h <= sh, "rect exceeds screen: {x},{y} {w}x{h}");
     };
-    let mut counts = [0u32; 11];
+    let mut counts = [0u32; 13];
     let mut depth = 0i32;
     let mut i = 0usize;
     while i < words.len() {
@@ -245,6 +245,15 @@ fn validate_drawlist(words: &[u32]) -> [u32; 11] {
                     assert!((0.0..=1.0).contains(&f), "UV out of range: {f}");
                 }
                 i += 9;
+            }
+            spec::draw_op::TEX_QUAD_EFFECT => {
+                rect_ok(words[i + 2], words[i + 3]);
+                for uv in 4..8 {
+                    let f = f32::from_bits(words[i + uv]);
+                    assert!((0.0..=1.0).contains(&f), "UV out of range: {f}");
+                }
+                assert!(words[i + 9] <= 3, "bad image blend mode");
+                i += 14;
             }
             spec::draw_op::SURFACE_QUAD => {
                 for word in i + 2..i + 6 {
@@ -279,6 +288,17 @@ fn validate_drawlist(words: &[u32]) -> [u32; 11] {
                     }
                 }
                 i += 12;
+            }
+            spec::draw_op::TEX_TRI_EFFECT => {
+                for vertex in 0..3 {
+                    xy_ok(words[i + 2 + vertex * 3]);
+                    for uv in [i + 3 + vertex * 3, i + 4 + vertex * 3] {
+                        let f = f32::from_bits(words[uv]);
+                        assert!((0.0..=1.0).contains(&f), "UV out of range: {f}");
+                    }
+                }
+                assert!(words[i + 12] <= 3, "bad image blend mode");
+                i += 17;
             }
             spec::draw_op::TEXT_RUN => {
                 // Native-text op: origin is f32 (exempt from the i16 clip
@@ -325,10 +345,21 @@ fn tex_tri_runs(words: &[u32]) -> Vec<(u32, usize)> {
                 i += 3 + 2 * ((words[i + 1] >> 16) as usize);
             }
             spec::draw_op::TEX_QUAD => { previous_was_tex_tri = false; i += 9; }
+            spec::draw_op::TEX_QUAD_EFFECT => { previous_was_tex_tri = false; i += 14; }
             spec::draw_op::SURFACE_QUAD => { previous_was_tex_tri = false; i += 9; }
             spec::draw_op::SCISSOR => { previous_was_tex_tri = false; i += 3; }
             spec::draw_op::SCISSOR_POP => { previous_was_tex_tri = false; i += 1; }
             spec::draw_op::TRI => { previous_was_tex_tri = false; i += 7; }
+            spec::draw_op::TEX_TRI_EFFECT => {
+                let tex = words[i + 1];
+                if previous_was_tex_tri && runs.last().map_or(false, |run| run.0 == tex) {
+                    runs.last_mut().unwrap().1 += 1;
+                } else {
+                    runs.push((tex, 1));
+                }
+                previous_was_tex_tri = true;
+                i += 17;
+            }
             spec::draw_op::TEXT_RUN => {
                 previous_was_tex_tri = false;
                 i += 8 + (words[i + 7] as usize).div_ceil(4);
@@ -337,6 +368,53 @@ fn tex_tri_runs(words: &[u32]) -> Vec<(u32, usize)> {
         }
     }
     runs
+}
+
+#[test]
+fn transformed_images_keep_blend_and_tone_on_textured_triangles() {
+    let mut rotated = Ui::new();
+    let texture = rotated.upload_texture(&[120, 80, 40, 255], 1, 1, spec::psm::PSM_8888);
+    let image = rotated.create_node(spec::NodeType::Image as u8);
+    rotated.set_prop(image, spec::prop::WIDTH, 32.0);
+    rotated.set_prop(image, spec::prop::HEIGHT, 24.0);
+    rotated.set_prop(image, spec::prop::ROTATE, 17.0);
+    rotated.set_prop(image, spec::prop::BLEND_MODE, 2.0);
+    rotated.set_prop(image, spec::prop::TONE_R, -20.0);
+    rotated.set_prop(image, spec::prop::TONE_GRAY, 64.0);
+    rotated.set_image(image, texture);
+    rotated.insert_before(spec::ROOT_ID, image, 0);
+    rotated.tick();
+    let words = rotated.draw().words.clone();
+    let counts = validate_drawlist(&words);
+    assert_eq!(counts[spec::draw_op::TEX_TRI as usize], 0);
+    assert!(counts[spec::draw_op::TEX_TRI_EFFECT as usize] >= 2);
+    let at = words
+        .iter()
+        .position(|word| *word == spec::draw_op::TEX_TRI_EFFECT)
+        .unwrap();
+    assert_eq!(words[at + 12], 2);
+    assert_eq!(words[at + 13] as i32, -20);
+    assert_eq!(words[at + 16], 64);
+
+    let mut perspective = Ui::new();
+    let texture = perspective.upload_texture(&[120, 80, 40, 255], 1, 1, spec::psm::PSM_8888);
+    let world = perspective.create_node(spec::NodeType::View as u8);
+    perspective.set_prop(world, spec::prop::WIDTH, 80.0);
+    perspective.set_prop(world, spec::prop::HEIGHT, 80.0);
+    perspective.set_prop(world, spec::prop::PERSPECTIVE, 300.0);
+    let image = perspective.create_node(spec::NodeType::Image as u8);
+    perspective.set_prop(image, spec::prop::WIDTH, 32.0);
+    perspective.set_prop(image, spec::prop::HEIGHT, 24.0);
+    perspective.set_prop(image, spec::prop::ROTATE_Y, 35.0);
+    perspective.set_prop(image, spec::prop::BLEND_MODE, 3.0);
+    perspective.set_prop(image, spec::prop::TONE_B, 30.0);
+    perspective.set_image(image, texture);
+    perspective.insert_before(spec::ROOT_ID, world, 0);
+    perspective.insert_before(world, image, 0);
+    perspective.tick();
+    let counts = validate_drawlist(&perspective.draw().words);
+    assert_eq!(counts[spec::draw_op::TEX_TRI as usize], 0);
+    assert!(counts[spec::draw_op::TEX_TRI_EFFECT as usize] >= 2);
 }
 
 // ---- tests ---------------------------------------------------------------------

@@ -463,7 +463,9 @@ impl Renderer {
                 spec::draw_op::GRAD_RECT => 6,
                 spec::draw_op::TRI => 7,
                 spec::draw_op::TEX_QUAD | spec::draw_op::SURFACE_QUAD => 9,
+                spec::draw_op::TEX_QUAD_EFFECT => 14,
                 spec::draw_op::TEX_TRI => 12,
+                spec::draw_op::TEX_TRI_EFFECT => 17,
                 spec::draw_op::SCISSOR => 3,
                 spec::draw_op::SCISSOR_POP => 1,
                 _ => break,
@@ -699,10 +701,18 @@ impl Renderer {
                     }
                     index = next;
                 }
-                spec::draw_op::TEX_QUAD if index + 9 <= words.len() => {
+                spec::draw_op::TEX_QUAD | spec::draw_op::TEX_QUAD_EFFECT => {
+                    let len = if words[index] == spec::draw_op::TEX_QUAD_EFFECT {
+                        14
+                    } else {
+                        9
+                    };
+                    if index + len > words.len() {
+                        break;
+                    }
                     let handle = words[index + 1] as i32;
                     let Some(name) = self.image_name(handle) else {
-                        index += 9;
+                        index += len;
                         continue;
                     };
                     if texture != name {
@@ -726,12 +736,20 @@ impl Renderer {
                             [words[index + 8]; 4],
                         );
                     }
-                    index += 9;
+                    index += len;
                 }
-                spec::draw_op::TEX_TRI if index + 12 <= words.len() => {
+                spec::draw_op::TEX_TRI | spec::draw_op::TEX_TRI_EFFECT => {
+                    let len = if words[index] == spec::draw_op::TEX_TRI_EFFECT {
+                        17
+                    } else {
+                        12
+                    };
+                    if index + len > words.len() {
+                        break;
+                    }
                     let handle = words[index + 1] as i32;
                     let Some(name) = self.image_name(handle) else {
-                        index += 12;
+                        index += len;
                         continue;
                     };
                     if texture != name {
@@ -751,7 +769,7 @@ impl Renderer {
                             color,
                         });
                     }
-                    index += 12;
+                    index += len;
                 }
                 spec::draw_op::TRI if index + 7 <= words.len() => {
                     if texture != self.white {

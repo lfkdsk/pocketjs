@@ -1244,10 +1244,12 @@ impl Ui {
                     3 + 2 * ((*meta >> 16) as usize)
                 }
                 x if x == spec::draw_op::TEX_QUAD => 9,
+                x if x == spec::draw_op::TEX_QUAD_EFFECT => 14,
                 x if x == spec::draw_op::SCISSOR => 3,
                 x if x == spec::draw_op::SCISSOR_POP => 1,
                 x if x == spec::draw_op::TRI => 7,
                 x if x == spec::draw_op::TEX_TRI => 12,
+                x if x == spec::draw_op::TEX_TRI_EFFECT => 17,
                 x if x == spec::draw_op::TEXT_RUN => {
                     let Some(bytes) = words.get(i + 7) else { break };
                     8 + (*bytes as usize).div_ceil(4)

@@ -195,7 +195,14 @@ enum Item3 {
     Quad { pts: [(f32, f32); 4], color: u32 },
     /// One image node's projected cells. The mesh is the painter-sort unit so
     /// all TEX_TRIs for its texture remain consecutive for host batching.
-    TexMesh { cell_start: usize, cell_end: usize, tex: u32, modulate: u32 },
+    TexMesh {
+        cell_start: usize,
+        cell_end: usize,
+        tex: u32,
+        modulate: u32,
+        blend_mode: u32,
+        tone: [i32; 4],
+    },
     /// A text node's glyph run, anchored at its projected origin.
     Run { slot: u32, origin: (f32, f32), opacity: f32 },
 }
@@ -1472,13 +1479,33 @@ impl<'a> Walker<'a> {
                     let poly = pts.map(|(x, y)| ClipVert { x, y, color: unpack(color), u: 0.0, v: 0.0 });
                     clip_fan(&poly, clip, |a, b, c| emit_tri(dl, a, b, c, clip, self.screen));
                 }
-                Item3::TexMesh { cell_start, cell_end, tex, modulate } => {
+                Item3::TexMesh {
+                    cell_start,
+                    cell_end,
+                    tex,
+                    modulate,
+                    blend_mode,
+                    tone,
+                } => {
                     for cell in &tex_cells[cell_start..cell_end] {
                         let poly: [ClipVert; 4] = core::array::from_fn(|i| {
                             let ((x, y), (u, v)) = (cell.pts[i], cell.uv[i]);
                             ClipVert { x, y, color: [255.0; 4], u, v }
                         });
-                        clip_fan(&poly, clip, |a, b, c| emit_tex_tri(dl, tex, modulate, a, b, c, clip, self.screen));
+                        clip_fan(&poly, clip, |a, b, c| {
+                            emit_tex_tri(
+                                dl,
+                                tex,
+                                modulate,
+                                blend_mode,
+                                tone,
+                                a,
+                                b,
+                                c,
+                                clip,
+                                self.screen,
+                            )
+                        });
                     }
                 }
                 Item3::Run { slot, origin, opacity } => {
@@ -1682,6 +1709,8 @@ impl<'a> Walker<'a> {
                     cell_end,
                     tex: node.tex as u32,
                     modulate,
+                    blend_mode: r.blend_mode,
+                    tone: r.tone,
                 },
             ));
         }
@@ -2700,7 +2729,20 @@ impl<'a> Walker<'a> {
                 ClipVert { x: sx, y: sy, color: [255.0; 4], u, v }
             });
             let modulate = scale_alpha(0xffff_ffff, op);
-            clip_fan(&poly, clip, |a, b, c| emit_tex_tri(dl, tex, modulate, a, b, c, clip, self.screen));
+            clip_fan(&poly, clip, |a, b, c| {
+                emit_tex_tri(
+                    dl,
+                    tex,
+                    modulate,
+                    blend_mode,
+                    tone,
+                    a,
+                    b,
+                    c,
+                    clip,
+                    self.screen,
+                )
+            });
             return;
         }
         let (sx0, sy0) = world.apply(0.0, 0.0);
@@ -3063,6 +3105,8 @@ fn emit_tex_tri(
     dl: &mut DrawList,
     tex: u32,
     modulate: u32,
+    blend_mode: u32,
+    tone: [i32; 4],
     v0: &ClipVert,
     v1: &ClipVert,
     v2: &ClipVert,
@@ -3082,7 +3126,12 @@ fn emit_tex_tri(
     if area2 == 0.0 {
         return;
     }
-    dl.words.push(spec::draw_op::TEX_TRI);
+    let effect = blend_mode != 0 || tone != [0; 4];
+    dl.words.push(if effect {
+        spec::draw_op::TEX_TRI_EFFECT
+    } else {
+        spec::draw_op::TEX_TRI
+    });
     dl.words.push(tex);
     for (xy, vert) in [((x0, y0), v0), ((x1, y1), v1), ((x2, y2), v2)] {
         dl.words.push(xy_word(xy.0, xy.1));
@@ -3090,6 +3139,10 @@ fn emit_tex_tri(
         dl.words.push(vert.v.to_bits());
     }
     dl.words.push(modulate);
+    if effect {
+        dl.words.push(blend_mode);
+        dl.words.extend(tone.map(|value| value as u32));
+    }
 }
 
 /// Stack capacity for a clipped polygon: a convex quad gains at most one

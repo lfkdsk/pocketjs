@@ -48,6 +48,8 @@
 #define DRAW_SCISSOR_POP 6u
 #define DRAW_TRI 7u
 #define DRAW_TEX_TRI 8u
+#define DRAW_TEX_QUAD_EFFECT 11u
+#define DRAW_TEX_TRI_EFFECT 12u
 
 /* contracts/spec/spec.ts GradDir. ToTop is 0 and ToBottom is 1 — swapping the
  * two inverts every vertical gradient, which the other backends cannot hit
@@ -684,13 +686,15 @@ static void build(
         index = next;
         break;
       }
-      case DRAW_TEX_QUAD: {
-        if (index + 9 > length) return;
+      case DRAW_TEX_QUAD:
+      case DRAW_TEX_QUAD_EFFECT: {
+        size_t op_len = words[index] == DRAW_TEX_QUAD_EFFECT ? 14u : 9u;
+        if (index + op_len > length) return;
         float u_scale = 1.0f;
         float v_scale = 1.0f;
         C3D_Tex *bound = image_texture((int32_t)words[index + 1], &u_scale, &v_scale);
         if (bound == NULL) {
-          index += 9;
+          index += op_len;
           break;
         }
         if (texture != bound) {
@@ -716,16 +720,20 @@ static void build(
             colors
           );
         }
-        index += 9;
+        /* PICA's fixed image path currently draws effect ops as legacy
+         * geometry, but consumes the append-only payload so later ops live. */
+        index += op_len;
         break;
       }
-      case DRAW_TEX_TRI: {
-        if (index + 12 > length) return;
+      case DRAW_TEX_TRI:
+      case DRAW_TEX_TRI_EFFECT: {
+        size_t op_len = words[index] == DRAW_TEX_TRI_EFFECT ? 17u : 12u;
+        if (index + op_len > length) return;
         float u_scale = 1.0f;
         float v_scale = 1.0f;
         C3D_Tex *bound = image_texture((int32_t)words[index + 1], &u_scale, &v_scale);
         if (bound == NULL) {
-          index += 12;
+          index += op_len;
           break;
         }
         if (texture != bound) {
@@ -744,7 +752,7 @@ static void build(
             color
           );
         }
-        index += 12;
+        index += op_len;
         break;
       }
       case DRAW_TRI: {

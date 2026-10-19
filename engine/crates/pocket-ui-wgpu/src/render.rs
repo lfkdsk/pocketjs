@@ -617,8 +617,13 @@ impl UiRenderer {
                     }
                     i += 3 + 2 * n;
                 }
-                spec::draw_op::TEX_QUAD => {
-                    if i + 9 > words.len() {
+                spec::draw_op::TEX_QUAD | spec::draw_op::TEX_QUAD_EFFECT => {
+                    let len = if words[i] == spec::draw_op::TEX_QUAD_EFFECT {
+                        14
+                    } else {
+                        9
+                    };
+                    if i + len > words.len() {
                         break;
                     }
                     let handle = words[i + 1] as i32;
@@ -643,7 +648,10 @@ impl UiRenderer {
                             MODE_IMAGE,
                         );
                     }
-                    i += 9;
+                    // The fixed wgpu image pipeline has no destination-read
+                    // effect pass yet. Paint legacy geometry and, critically,
+                    // consume the appended payload so later ops survive.
+                    i += len;
                 }
                 spec::draw_op::SCISSOR => {
                     if i + 3 > words.len() {
@@ -669,8 +677,13 @@ impl UiRenderer {
                     flush!(cur_tex, restored);
                     i += 1;
                 }
-                spec::draw_op::TEX_TRI => {
-                    if i + 12 > words.len() {
+                spec::draw_op::TEX_TRI | spec::draw_op::TEX_TRI_EFFECT => {
+                    let len = if words[i] == spec::draw_op::TEX_TRI_EFFECT {
+                        17
+                    } else {
+                        12
+                    };
+                    if i + len > words.len() {
                         break;
                     }
                     let handle = words[i + 1] as i32;
@@ -694,7 +707,7 @@ impl UiRenderer {
                         v[k].color = modulate;
                     }
                     self.verts.extend_from_slice(&v);
-                    i += 12;
+                    i += len;
                 }
                 spec::draw_op::TRI => {
                     if i + 7 > words.len() {

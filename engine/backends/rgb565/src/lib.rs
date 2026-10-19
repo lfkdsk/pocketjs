@@ -623,6 +623,13 @@ impl Renderer {
                     }
                     i += 12;
                 }
+                spec::draw_op::TEX_TRI_EFFECT if i + 17 <= words.len() => {
+                    if !triangle_bounds([words[i + 2], words[i + 5], words[i + 8]], clip).is_empty()
+                    {
+                        self.software_op(ui, destination, surface, clip, &words[i..i + 17], stats);
+                    }
+                    i += 17;
+                }
                 spec::draw_op::SURFACE_QUAD if i + 9 <= words.len() => {
                     // No application compositor on the PPA target; preserve the
                     // shell fallback and keep decoding later shell ops.
