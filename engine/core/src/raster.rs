@@ -1878,7 +1878,7 @@ fn tex_quad_nearest_identity<T: RenderTarget>(
     true
 }
 
-fn tex_quad_impl<T: RenderTarget, const FAST: bool>(
+fn tex_quad_effect_impl<T: RenderTarget, const FAST: bool>(
     ui: &impl RenderResources,
     target: &mut T,
     stride: i32,
@@ -1912,6 +1912,7 @@ fn tex_quad_impl<T: RenderTarget, const FAST: bool>(
     }
     let identity = modulate == 0xffff_ffff;
     if FAST
+        && effect.is_none()
         && identity
         && !view.linear
         && tex_quad_nearest_identity(target, stride, view, c, x, y, w, h, u0, v0, u1, v1)
@@ -1965,7 +1966,8 @@ fn tex_quad_impl<T: RenderTarget, const FAST: bool>(
     }
 }
 
-fn tex_quad<T: RenderTarget>(
+#[cfg(test)]
+fn tex_quad_impl<T: RenderTarget, const FAST: bool>(
     ui: &impl RenderResources,
     target: &mut T,
     stride: i32,
@@ -1973,7 +1975,19 @@ fn tex_quad<T: RenderTarget>(
     clip: Clip,
     p: &[u32],
 ) {
-    tex_quad_impl::<T, true>(ui, target, stride, scale, clip, p);
+    tex_quad_effect_impl::<T, FAST>(ui, target, stride, scale, clip, p, None);
+}
+
+fn tex_quad<T: RenderTarget>(
+    ui: &impl RenderResources,
+    target: &mut T,
+    stride: i32,
+    scale: i32,
+    clip: Clip,
+    p: &[u32],
+    effect: Option<&[u32]>,
+) {
+    tex_quad_effect_impl::<T, true>(ui, target, stride, scale, clip, p, effect);
 }
 
 #[cfg(test)]
