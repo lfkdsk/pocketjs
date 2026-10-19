@@ -2037,6 +2037,33 @@ mod tests {
     }
 
     #[test]
+    fn textured_effect_modes_tone_and_alpha_pixels() {
+        let mut ui = Ui::new();
+        ui.set_viewport(4.0, 2.0);
+        let texture = ui.upload_texture(&[120, 80, 40, 255], 1, 1, spec::psm::PSM_8888);
+        let quad = [texture as u32, xy_word(0, 0), wh_word(4, 2),
+            0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits(), 0xffff_ffff];
+        let draw = |mode: u32, tone: [i32; 4], opacity: u32| {
+            let mut words = vec![draw_op::RECT, xy_word(0, 0), wh_word(4, 2), 0xff14_283c,
+                draw_op::TEX_QUAD_EFFECT];
+            words.extend_from_slice(&quad[..7]);
+            words.push(opacity);
+            words.push(mode);
+            words.extend(tone.map(|v| v as u32));
+            let mut fb = vec![0u8; 4 * 2 * 4];
+            render_scaled(&ui, &words, &mut fb, 1);
+            let pixel: [u8; 4] = fb[20..24].try_into().unwrap();
+            pixel
+        };
+        assert_eq!(draw(0, [0; 4], 0xffff_ffff), [120, 80, 40, 255]);
+        assert_eq!(draw(1, [0; 4], 0xffff_ffff), [180, 120, 60, 255]);
+        assert_eq!(draw(2, [0; 4], 0xffff_ffff), [28, 13, 3, 255]);
+        assert_eq!(draw(3, [0; 4], 0xffff_ffff), [152, 107, 57, 255]);
+        assert_eq!(draw(0, [20, -30, 300, 255], 0xffff_ffff), [107, 57, 255, 255]);
+        assert_eq!(draw(1, [0; 4], 0x80ff_ffff), [120, 80, 40, 255]);
+    }
+
+    #[test]
     fn render_scaled_over_composites_without_clearing() {
         // The OVER variant must leave untouched pixels exactly as supplied
         // (a transparent scratch stays transparent outside the ops — the
