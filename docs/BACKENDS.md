@@ -29,6 +29,24 @@ hosts, the PSP GE walker, the ESP32-P4 PPA and Symbian GLES2 ports.
   runtime (system-font rasterization + `loadFontAtlas` reload, note-widget's
   cjk.rs) add `text.glyphs.runtime`.
 
+## Image blend and tone operations
+
+Image nodes accept integer `blendMode` values (`0` normal, `1` add,
+`2` multiply, `3` screen) and signed `toneR`, `toneG`, `toneB` values with a
+`toneGray` desaturation value. The tone channels clamp to `-255..255`; gray
+clamps to `0..255`. A View with nonzero tone channels filters destination
+pixels in its axis-aligned box before its children paint. The DrawList uses
+`TEX_QUAD_EFFECT`, `TEX_TRI_EFFECT`, and `TONE_RECT` only when an effect is
+active. Nodes without effects retain the existing opcodes and pixel path.
+
+**The core software rasterizer and the RGB565 ordered software fallback
+produce the specified pixels for these operations.** The gpui, wgpu, GLES2 C ABI, PSP, Vita,
+and 3DS walkers consume every effect opcode without desynchronizing the word
+stream, but they render image effects as an ordinary image and treat
+`TONE_RECT` as a no-op. Applications that require exact effects on those
+walkers must select a source-color fallback or avoid the native fixed-function
+path.
+
 ## The portable desktop host
 
 `hosts/desktop` uses winit for windows/input and the existing `pocket-ui-wgpu`
