@@ -266,6 +266,16 @@ impl GpuiRenderer {
                     self.paint_tex_quad(ui, &words[*i + 1..*i + 9], origin, window);
                     *i += 9;
                 }
+                spec::draw_op::TEX_QUAD_EFFECT => {
+                    // GPUI's image painter has no destination-read blend/tone
+                    // shader. Preserve the image and subsequent ops rather than
+                    // aborting the entire draw list on this extension.
+                    if *i + 14 > words.len() {
+                        return;
+                    }
+                    self.paint_tex_quad(ui, &words[*i + 1..*i + 9], origin, window);
+                    *i += 14;
+                }
                 spec::draw_op::SURFACE_QUAD => {
                     let full = Bounds::new(
                         point(

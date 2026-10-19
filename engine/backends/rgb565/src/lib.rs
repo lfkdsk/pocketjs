@@ -585,6 +585,12 @@ impl Renderer {
                         i += 9;
                     }
                 }
+                spec::draw_op::TEX_QUAD_EFFECT if i + 14 <= words.len() => {
+                    if !logical_rect(words[i + 2], words[i + 3]).intersect(clip).is_empty() {
+                        self.software_op(ui, destination, surface, clip, &words[i..i + 14], stats);
+                    }
+                    i += 14;
+                }
                 spec::draw_op::SCISSOR if i + 3 <= words.len() => {
                     if depth >= stack.len() {
                         return None;

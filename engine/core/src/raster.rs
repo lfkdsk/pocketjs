@@ -2003,6 +2003,40 @@ mod tests {
     }
 
     #[test]
+    fn textured_effect_pixels_and_legacy_opcode_match_across_targets() {
+        let mut ui = Ui::new();
+        ui.set_viewport(4.0, 2.0);
+        let texture = ui.upload_texture(&[120, 80, 40, 255], 1, 1, spec::psm::PSM_8888);
+        assert!(texture >= 0);
+        let quad = [texture as u32, xy_word(0, 0), wh_word(4, 2),
+            0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits(), 1.0f32.to_bits(), 0xffff_ffff];
+        let mut original = vec![draw_op::TEX_QUAD];
+        original.extend_from_slice(&quad);
+        let mut identity = vec![draw_op::TEX_QUAD_EFFECT];
+        identity.extend_from_slice(&quad);
+        identity.extend_from_slice(&[0, 0, 0, 0, 0]);
+        let mut old_fb = vec![0u8; 4 * 2 * 4];
+        let mut new_fb = old_fb.clone();
+        render_scaled(&ui, &original, &mut old_fb, 1);
+        render_scaled(&ui, &identity, &mut new_fb, 1);
+        assert_eq!(old_fb, new_fb, "identity effect is byte-identical to the old opcode");
+        assert_eq!(&new_fb[20..24], &[120, 80, 40, 255]);
+        let mut effect = vec![draw_op::RECT, xy_word(0, 0), wh_word(4, 2), 0xff14_283c,
+            draw_op::TEX_QUAD_EFFECT];
+        effect.extend_from_slice(&quad);
+        effect.extend_from_slice(&[1, (-20i32) as u32, 10, 0, 0]);
+        let mut fb = vec![0u8; 4 * 2 * 4];
+        render_scaled(&ui, &effect, &mut fb, 1);
+        assert_eq!(&fb[20..24], &[160, 130, 60, 255]);
+        let mut argb = fb.clone();
+        render_scaled_argb(&ui, &effect, &mut argb, 1);
+        assert_eq!(&argb[20..24], &[60, 130, 160, 255]);
+        let mut rgb565 = vec![0u16; 4 * 2];
+        render_scaled_rgb565(&ui, &effect, &mut rgb565, 1);
+        assert_eq!(rgb565[5], pack_rgb565(157, 130, 56));
+    }
+
+    #[test]
     fn render_scaled_over_composites_without_clearing() {
         // The OVER variant must leave untouched pixels exactly as supplied
         // (a transparent scratch stays transparent outside the ops — the
