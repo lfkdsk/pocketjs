@@ -696,6 +696,14 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                 }
                 i = end;
             }
+            spec::draw_op::TONE_RECT => {
+                // The fixed GE path has no destination-read filter. Consume
+                // the extension so later operations remain in painter order.
+                if i + 7 > n {
+                    break;
+                }
+                i += 7;
+            }
             spec::draw_op::TEX_TRI | spec::draw_op::TEX_TRI_EFFECT => {
                 let op = words[i];
                 let op_len = if op == spec::draw_op::TEX_TRI_EFFECT { 17 } else { 12 };

@@ -778,6 +778,14 @@ pub unsafe fn render_over(ui: &Ui, words: &[u32]) {
                 }
                 i += len;
             }
+            spec::draw_op::TONE_RECT => {
+                // Vita2D's fixed path cannot sample the active color target.
+                // Consume the op so subsequent children still render.
+                if i + 7 > words.len() {
+                    break;
+                }
+                i += 7;
+            }
             spec::draw_op::TEX_TRI | spec::draw_op::TEX_TRI_EFFECT => {
                 let len = if words[i] == spec::draw_op::TEX_TRI_EFFECT {
                     17
@@ -850,6 +858,7 @@ fn validate_texture_residency(ui: &Ui, words: &[u32]) -> io::Result<()> {
         let next = match words[i] {
             spec::draw_op::RECT => i.checked_add(4),
             spec::draw_op::GRAD_RECT => i.checked_add(6),
+            spec::draw_op::TONE_RECT => i.checked_add(7),
             spec::draw_op::TRI => i.checked_add(7),
             spec::draw_op::GLYPH_RUN if i + 2 < words.len() => {
                 let slot = (words[i + 1] & 0xff) as u8;

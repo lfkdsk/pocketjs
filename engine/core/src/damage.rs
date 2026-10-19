@@ -432,6 +432,7 @@ impl<'a> DamageDecoder<'a> {
             spec::draw_op::TRI => 7,
             spec::draw_op::TEX_TRI => 12,
             spec::draw_op::TEX_TRI_EFFECT => 17,
+            spec::draw_op::TONE_RECT => 7,
             spec::draw_op::TEXT_RUN => {
                 // 8 header words + ceil(byteLen/4) packed UTF-8 words.
                 let bytes = *self.words.get(start + 7).ok_or(())? as usize;
@@ -445,7 +446,7 @@ impl<'a> DamageDecoder<'a> {
         self.index = end;
 
         let bounds = match code {
-            spec::draw_op::RECT | spec::draw_op::GRAD_RECT => {
+            spec::draw_op::RECT | spec::draw_op::GRAD_RECT | spec::draw_op::TONE_RECT => {
                 logical_rect(words[1], words[2]).intersect(self.clip)
             }
             spec::draw_op::GLYPH_RUN => glyph_run_bounds(ui, words, self.clip),

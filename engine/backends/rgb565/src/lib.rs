@@ -591,6 +591,12 @@ impl Renderer {
                     }
                     i += 14;
                 }
+                spec::draw_op::TONE_RECT if i + 7 <= words.len() => {
+                    if !logical_rect(words[i + 1], words[i + 2]).intersect(clip).is_empty() {
+                        self.software_op(ui, destination, surface, clip, &words[i..i + 7], stats);
+                    }
+                    i += 7;
+                }
                 spec::draw_op::SCISSOR if i + 3 <= words.len() => {
                     if depth >= stack.len() {
                         return None;
@@ -1943,6 +1949,37 @@ mod tests {
         assert_eq!(ppa.fills, 2);
         assert_eq!(output[0], pack_rgb565(255, 0, 0));
         assert_ne!(output[2 * 8 + 2], output[2 * 8 + 5]);
+    }
+
+    #[test]
+    fn destination_tone_uses_ordered_software_fallback() {
+        let mut ui = Ui::new();
+        ui.set_viewport(4.0, 2.0);
+        let words = [
+            spec::draw_op::RECT,
+            xy_word(0, 0),
+            wh_word(4, 2),
+            0xff28_5078,
+            spec::draw_op::TONE_RECT,
+            xy_word(1, 0),
+            wh_word(2, 2),
+            20,
+            (-30i32) as u32,
+            255,
+            128,
+        ];
+        let mut expected = vec![0u16; 8];
+        pocketjs_core::raster::render_scaled_rgb565(&ui, &words, &mut expected, 1);
+        let mut output = vec![0u16; 8];
+        let mut ppa = MockPpa::default();
+        let stats = renderer()
+            .render(&ui, &words, &mut output, 4, 2, &mut ppa)
+            .unwrap();
+
+        assert_eq!(output, expected);
+        assert_eq!(stats.software_ops, 1);
+        assert_eq!(output[0], pack_rgb565(120, 80, 40));
+        assert_ne!(output[1], output[0]);
     }
 
     #[test]

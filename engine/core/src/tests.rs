@@ -201,7 +201,7 @@ fn decode_wh(word: u32) -> (i32, i32) {
 /// Walk a DrawList asserting the pinned CPU-clip invariant: every coordinate
 /// in [0, SCREEN_W] x [0, SCREEN_H], rect extents in range, scissors
 /// balanced, only known ops. Returns per-op counts (indexed by op code).
-fn validate_drawlist(words: &[u32]) -> [u32; 13] {
+fn validate_drawlist(words: &[u32]) -> [u32; 14] {
     let (sw, sh) = (spec::SCREEN_W as i32, spec::SCREEN_H as i32);
     let xy_ok = |w: u32| {
         let (x, y) = decode_xy(w);
@@ -213,7 +213,7 @@ fn validate_drawlist(words: &[u32]) -> [u32; 13] {
         let (w, h) = decode_wh(whw);
         assert!(x + w <= sw && y + h <= sh, "rect exceeds screen: {x},{y} {w}x{h}");
     };
-    let mut counts = [0u32; 13];
+    let mut counts = [0u32; 14];
     let mut depth = 0i32;
     let mut i = 0usize;
     while i < words.len() {
@@ -300,6 +300,11 @@ fn validate_drawlist(words: &[u32]) -> [u32; 13] {
                 assert!(words[i + 12] <= 3, "bad image blend mode");
                 i += 17;
             }
+            spec::draw_op::TONE_RECT => {
+                rect_ok(words[i + 1], words[i + 2]);
+                assert!(words[i + 6] <= 255, "bad tone gray");
+                i += 7;
+            }
             spec::draw_op::TEXT_RUN => {
                 // Native-text op: origin is f32 (exempt from the i16 clip
                 // guarantee), box width is finite and non-negative, and the
@@ -346,6 +351,7 @@ fn tex_tri_runs(words: &[u32]) -> Vec<(u32, usize)> {
             }
             spec::draw_op::TEX_QUAD => { previous_was_tex_tri = false; i += 9; }
             spec::draw_op::TEX_QUAD_EFFECT => { previous_was_tex_tri = false; i += 14; }
+            spec::draw_op::TONE_RECT => { previous_was_tex_tri = false; i += 7; }
             spec::draw_op::SURFACE_QUAD => { previous_was_tex_tri = false; i += 9; }
             spec::draw_op::SCISSOR => { previous_was_tex_tri = false; i += 3; }
             spec::draw_op::SCISSOR_POP => { previous_was_tex_tri = false; i += 1; }
@@ -415,6 +421,54 @@ fn transformed_images_keep_blend_and_tone_on_textured_triangles() {
     let counts = validate_drawlist(&perspective.draw().words);
     assert_eq!(counts[spec::draw_op::TEX_TRI as usize], 0);
     assert!(counts[spec::draw_op::TEX_TRI_EFFECT as usize] >= 2);
+}
+
+#[test]
+fn view_tone_filters_its_panel_before_children() {
+    let mut ui = Ui::new();
+    ui.set_viewport(8.0, 8.0);
+    let panel = ui.create_node(spec::NodeType::View as u8);
+    ui.set_prop(panel, spec::prop::WIDTH, 8.0);
+    ui.set_prop(panel, spec::prop::HEIGHT, 8.0);
+    ui.set_prop(panel, spec::prop::BG_COLOR, abgr(120, 80, 40, 255) as f64);
+    ui.set_prop(panel, spec::prop::TONE_R, 20.0);
+    ui.set_prop(panel, spec::prop::TONE_G, -30.0);
+    ui.set_prop(panel, spec::prop::TONE_GRAY, 255.0);
+    ui.insert_before(spec::ROOT_ID, panel, 0);
+
+    let child = ui.create_node(spec::NodeType::View as u8);
+    ui.set_prop(child, spec::prop::POS_TYPE, spec::PosType::Absolute as u32 as f64);
+    ui.set_prop(child, spec::prop::WIDTH, 2.0);
+    ui.set_prop(child, spec::prop::HEIGHT, 2.0);
+    ui.set_prop(child, spec::prop::BG_COLOR, abgr(200, 0, 0, 255) as f64);
+    ui.insert_before(panel, child, 0);
+
+    let words = ui.draw().words.clone();
+    let counts = validate_drawlist(&words);
+    assert_eq!(counts[spec::draw_op::TONE_RECT as usize], 1);
+    let panel_at = words
+        .windows(4)
+        .position(|op| op[0] == spec::draw_op::RECT && op[3] == abgr(120, 80, 40, 255))
+        .unwrap();
+    let tone_at = words
+        .iter()
+        .position(|word| *word == spec::draw_op::TONE_RECT)
+        .unwrap();
+    let child_at = words
+        .windows(4)
+        .position(|op| op[0] == spec::draw_op::RECT && op[3] == abgr(200, 0, 0, 255))
+        .unwrap();
+    assert!(panel_at < tone_at && tone_at < child_at);
+
+    let mut pixels = alloc::vec![0; 8 * 8 * 4];
+    crate::raster::render(&ui, &words, &mut pixels);
+    assert_eq!(&pixels[..4], &[200, 0, 0, 255], "child is not filtered");
+    let panel_pixel = (4 * 8 + 4) * 4;
+    assert_eq!(
+        &pixels[panel_pixel..panel_pixel + 4],
+        &[100, 50, 80, 255],
+        "panel is gray-toned once before child paint"
+    );
 }
 
 // ---- tests ---------------------------------------------------------------------

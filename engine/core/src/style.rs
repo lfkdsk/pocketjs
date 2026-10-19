@@ -313,7 +313,8 @@ pub struct Resolved {
     /// Explicit animated-sprite reference clock for this subtree. u32::MAX
     /// means inherit, or use the legacy host-vblank clock at the root.
     pub sprite_clock: u32,
-    /// Image-only effects; default values leave the historical paint path untouched.
+    /// Image blend/tone and axis-aligned View destination tone. Default
+    /// values leave the historical paint path untouched.
     pub blend_mode: u32,
     pub tone: [i32; 4],
 }

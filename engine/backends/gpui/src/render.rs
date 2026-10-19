@@ -276,6 +276,15 @@ impl GpuiRenderer {
                     self.paint_tex_quad(ui, &words[*i + 1..*i + 9], origin, window);
                     *i += 14;
                 }
+                spec::draw_op::TONE_RECT => {
+                    // GPUI exposes no destination-read paint primitive. Keep
+                    // the stream synchronized so children and later siblings
+                    // still render; software and RGB565 backends apply tone.
+                    if *i + 7 > words.len() {
+                        return;
+                    }
+                    *i += 7;
+                }
                 spec::draw_op::SURFACE_QUAD => {
                     let full = Bounds::new(
                         point(

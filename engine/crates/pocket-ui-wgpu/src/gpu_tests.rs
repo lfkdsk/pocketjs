@@ -222,6 +222,29 @@ fn gpu_drawlist_composition_and_resource_lifecycle() {
             &expected,
             0,
         );
+        let tone = [
+            op::RECT,
+            packed(0, 0),
+            packed(16, 16),
+            0xff40_3020,
+            op::TONE_RECT,
+            packed(0, 0),
+            packed(16, 16),
+            0,
+            0,
+            0,
+            0,
+            op::RECT,
+            packed(3, 3),
+            packed(5, 5),
+            0xff20_e040,
+        ];
+        raster::render_scaled(&ui, &tone, &mut expected, scale);
+        close(
+            &draw(&gpu, &mut renderer, &ui, &tone, &out, scale),
+            &expected,
+            0,
+        );
         ui.free_texture(handle);
         // Every image format, then a freed handle followed by a solid rectangle.
         for (psm, data) in [

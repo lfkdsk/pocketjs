@@ -1339,6 +1339,13 @@ impl<'a> Walker<'a> {
             }
         }
 
+        // A View's tone filters its own painted panel and whatever was
+        // already behind a transparent View, then leaves text and children
+        // untouched. Images use the source-local texture effect op instead.
+        if node.node_type == spec::NodeType::View as u8 && r.tone != [0; 4] {
+            self.emit_tone_rect(dl, &world, l.w, l.h, r.tone, &clip);
+        }
+
         // -- text run ----------------------------------------------------------
         if node.node_type == spec::NodeType::Text as u8 {
             self.emit_text(dl, slot, node, &r, &world, op, &clip, l.w, in_transform);
@@ -2693,6 +2700,44 @@ impl<'a> Walker<'a> {
                 clip,
             );
         }
+    }
+
+    /// Apply destination tone inside an axis-aligned View. Transformed image
+    /// tone remains exact through TEX_TRI_EFFECT; destination-read filtering
+    /// deliberately stays rectangular so backends can consume one bounded op.
+    fn emit_tone_rect(
+        &self,
+        dl: &mut DrawList,
+        world: &Affine,
+        w: f32,
+        h: f32,
+        tone: [i32; 4],
+        clip: &Clip,
+    ) {
+        if tone == [0; 4] || !world.is_axis_aligned() || w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let (x0, y0) = world.apply(0.0, 0.0);
+        let (x1, y1) = world.apply(w, h);
+        let visible = Clip {
+            x0: x0.max(clip.x0),
+            y0: y0.max(clip.y0),
+            x1: x1.min(clip.x1),
+            y1: y1.min(clip.y1),
+        };
+        if visible.is_empty()
+            || roundf(visible.x1 - visible.x0) <= 0.0
+            || roundf(visible.y1 - visible.y0) <= 0.0
+        {
+            return;
+        }
+        dl.words.push(spec::draw_op::TONE_RECT);
+        dl.words.push(xy_word(visible.x0, visible.y0));
+        dl.words.push(wh_word(
+            visible.x1 - visible.x0,
+            visible.y1 - visible.y0,
+        ));
+        dl.words.extend(tone.map(|value| value as u32));
     }
 
     /// Emit an image TEX_QUAD (axis-aligned only; rotated images are

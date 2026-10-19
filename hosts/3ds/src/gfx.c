@@ -50,6 +50,7 @@
 #define DRAW_TEX_TRI 8u
 #define DRAW_TEX_QUAD_EFFECT 11u
 #define DRAW_TEX_TRI_EFFECT 12u
+#define DRAW_TONE_RECT 13u
 
 /* contracts/spec/spec.ts GradDir. ToTop is 0 and ToBottom is 1 — swapping the
  * two inverts every vertical gradient, which the other backends cannot hit
@@ -640,6 +641,13 @@ static void build(
           push_quad(x, y, x + w, y + h, 0.0f, 0.0f, 1.0f, 1.0f, colors);
         }
         index += 6;
+        break;
+      }
+      case DRAW_TONE_RECT: {
+        /* PICA's fixed pipeline cannot read the active color target. Keep
+         * decoding so children and later siblings remain visible. */
+        if (index + 7 > length) return;
+        index += 7;
         break;
       }
       case DRAW_GLYPH_RUN: {

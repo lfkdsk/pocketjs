@@ -466,6 +466,7 @@ impl Renderer {
                 spec::draw_op::TEX_QUAD_EFFECT => 14,
                 spec::draw_op::TEX_TRI => 12,
                 spec::draw_op::TEX_TRI_EFFECT => 17,
+                spec::draw_op::TONE_RECT => 7,
                 spec::draw_op::SCISSOR => 3,
                 spec::draw_op::SCISSOR_POP => 1,
                 _ => break,
@@ -737,6 +738,11 @@ impl Renderer {
                         );
                     }
                     index += len;
+                }
+                spec::draw_op::TONE_RECT if index + 7 <= words.len() => {
+                    // The fixed GL painter has no destination-texture pass;
+                    // consume the appended op so following draws survive.
+                    index += 7;
                 }
                 spec::draw_op::TEX_TRI | spec::draw_op::TEX_TRI_EFFECT => {
                     let len = if words[index] == spec::draw_op::TEX_TRI_EFFECT {

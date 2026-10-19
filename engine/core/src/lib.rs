@@ -1250,6 +1250,7 @@ impl Ui {
                 x if x == spec::draw_op::TRI => 7,
                 x if x == spec::draw_op::TEX_TRI => 12,
                 x if x == spec::draw_op::TEX_TRI_EFFECT => 17,
+                x if x == spec::draw_op::TONE_RECT => 7,
                 x if x == spec::draw_op::TEXT_RUN => {
                     let Some(bytes) = words.get(i + 7) else { break };
                     8 + (*bytes as usize).div_ceil(4)

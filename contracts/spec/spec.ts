@@ -429,10 +429,11 @@ export const PROP = {
   //                    subtree. The nearest non-negative value wins; -1
   //                    inherits, or uses host-vblank timing at the root.
   blendMode: 145, //    i32 image-only: 0 normal, 1 add, 2 multiply, 3 screen
-  toneR: 146, //        i32 image-only signed offset -255..255
-  toneG: 147, //        i32 image-only signed offset -255..255
-  toneB: 148, //        i32 image-only signed offset -255..255
-  toneGray: 149, //     i32 image-only desaturation 0..255
+  toneR: 146, //        i32 image/View signed offset -255..255
+  toneG: 147, //        i32 image/View signed offset -255..255
+  toneB: 148, //        i32 image/View signed offset -255..255
+  toneGray: 149, //     i32 image/View HSL desaturation 0..255; View tone
+  //                    filters pixels already painted inside its axis-aligned box
 } as const;
 
 export type PropName = keyof typeof PROP;
@@ -1467,6 +1468,11 @@ export const FONT_FLAG_BOLD = 1 << 0;
 //                           toneR, toneG, toneB, toneGray with the same
 //                           meanings as TEX_QUAD_EFFECT. Only emitted for
 //                           transformed images with non-default effects.
+//   TONE_RECT  (7 words):  op, xy, wh, toneR, toneG, toneB, toneGray. Applies
+//                           RPG Maker MZ HSL gray and signed tone in place to
+//                           pixels already painted in the clipped rectangle;
+//                           destination alpha is preserved. Emitted before a
+//                           View's children so panel text remains unfiltered.
 //   TEXT_RUN    (8 + ceil(n/4) words):
 //                           op,
 //                           word1: bits 0-7 fontSlot,
@@ -1514,6 +1520,8 @@ export const DRAW_OP = {
   textRun: 9,
   surfaceQuad: 10,
   texQuadEffect: 11,
+  texTriEffect: 12,
+  toneRect: 13,
 } as const;
 
 // ---------------------------------------------------------------------------

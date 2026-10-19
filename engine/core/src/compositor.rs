@@ -27,6 +27,7 @@ pub fn draw_op_len(words: &[u32], at: usize) -> Option<usize> {
         crate::spec::draw_op::TRI => 7,
         crate::spec::draw_op::TEX_TRI => 12,
         crate::spec::draw_op::TEX_TRI_EFFECT => 17,
+        crate::spec::draw_op::TONE_RECT => 7,
         crate::spec::draw_op::TEXT_RUN => 8 + (*words.get(at + 7)? as usize).div_ceil(4),
         crate::spec::draw_op::SURFACE_QUAD => 9,
         _ => return None,

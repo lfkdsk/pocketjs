@@ -456,7 +456,7 @@ pub mod font_atlas {
 /// Word counts incl. header: RECT 4, GRAD_RECT 6, GLYPH_RUN 3+2n,
 /// TEX_QUAD 9, SCISSOR 3, SCISSOR_POP 1, TRI 7, TEX_TRI 12,
 /// TEXT_RUN 8+ceil(bytes/4), SURFACE_QUAD 9, TEX_QUAD_EFFECT 14,
-/// TEX_TRI_EFFECT 17.
+/// TEX_TRI_EFFECT 17, TONE_RECT 7.
 pub mod draw_op {
     pub const RECT: u32 = 1;
     pub const GRAD_RECT: u32 = 2;
@@ -470,6 +470,7 @@ pub mod draw_op {
     pub const SURFACE_QUAD: u32 = 10;
     pub const TEX_QUAD_EFFECT: u32 = 11;
     pub const TEX_TRI_EFFECT: u32 = 12;
+    pub const TONE_RECT: u32 = 13;
 }
 
 /// .pak container constants (byte-compatible with dreamcart's format;

@@ -653,6 +653,15 @@ impl UiRenderer {
                     // consume the appended payload so later ops survive.
                     i += len;
                 }
+                spec::draw_op::TONE_RECT => {
+                    // The fixed wgpu pipeline cannot sample the destination
+                    // attachment. Consume the extension without truncating
+                    // later geometry; software/RGB565 paths are exact.
+                    if i + 7 > words.len() {
+                        break;
+                    }
+                    i += 7;
+                }
                 spec::draw_op::SCISSOR => {
                     if i + 3 > words.len() {
                         break;
