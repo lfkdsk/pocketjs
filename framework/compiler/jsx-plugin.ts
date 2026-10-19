@@ -477,6 +477,28 @@ function isNodeModuleFile(path: string): boolean {
   return path.replace(/\\/g, "/").includes("/node_modules/");
 }
 
+/** Paths returned from a Bun build plugin are URL-like bundler identities, not
+ * native filesystem display paths. Bun <=1.3.14 can panic on Windows when an
+ * onResolve fallback carries a native absolute path into path.pretty
+ * (oven-sh/bun#26798), so affected paths use forward slashes at the plugin
+ * boundary. */
+export function bunPluginPath(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
+/** Bun's affected Windows resolver also panics when an onResolve callback
+ * returns undefined and normal resolution crosses a workspace node_modules
+ * link. Resolve that fallback explicitly there; other hosts retain Bun's
+ * normal resolution path and therefore byte-identical output. */
+function windowsPluginFallback(spec: string, resolveDir: string): string | undefined {
+  if (process.platform !== "win32") return undefined;
+  try {
+    return bunPluginPath(Bun.resolveSync(spec, resolveDir));
+  } catch {
+    return undefined;
+  }
+}
+
 export function frameworkVariantPath(path: string, framework: PocketFramework): string {
   if (framework === "solid" || isNodeModuleFile(path) || path.endsWith(".d.ts")) return path;
   const variant = path.replace(/(\.tsx?)$/, `${FRAMEWORKS[framework].outputSuffix}$1`);
@@ -697,9 +719,11 @@ export function jsxPlugin(
           const mock = resolveSolidAotMock(args.importer, args.path, opts.entry);
           if (mock === undefined) {
             const path = resolveSolidAotModel(args.importer, args.path, opts.entry);
-            return path ? { path } : undefined;
+            if (path) return { path: bunPluginPath(path) };
+            const fallback = windowsPluginFallback(args.path, args.resolveDir);
+            return fallback ? { path: fallback } : undefined;
           }
-          const path = resolveSolidAotModel(args.importer, args.path, opts.entry)!;
+          const path = bunPluginPath(resolveSolidAotModel(args.importer, args.path, opts.entry)!);
           declarationMocks.set(path, mock);
           return { path, namespace: "solid-aot-declarations" };
         });

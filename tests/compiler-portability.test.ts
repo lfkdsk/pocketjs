@@ -9,6 +9,7 @@ import {
   RENDERER_PATH,
   RENDERER_SOLID_PATH,
   RENDERER_VUE_VAPOR_PATH,
+  bunPluginPath,
   frameworkVariantPath,
   jsxPlugin,
   packagePath,
@@ -55,6 +56,15 @@ describe("compiler filesystem portability", () => {
       expect(components).not.toBeNull();
       expectNativeFile(components!);
     }
+  });
+
+  test("Bun plugin paths use forward slashes on every host", () => {
+    expect(bunPluginPath(String.raw`D:\a\pocketjs\node_modules\opentype.js\dist\opentype.min.mjs`))
+      .toBe("D:/a/pocketjs/node_modules/opentype.js/dist/opentype.min.mjs");
+    expect(bunPluginPath(String.raw`\\server\share\package\index.js`))
+      .toBe("//server/share/package/index.js");
+    expect(bunPluginPath("/workspace/package/index.js"))
+      .toBe("/workspace/package/index.js");
   });
 
   test("the transform cache accepts compiler output on the native filesystem", async () => {
